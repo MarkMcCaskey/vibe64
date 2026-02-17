@@ -6,6 +6,18 @@
 ///
 /// For initial emulation, we just provide the memory and register stubs.
 
+/// Result of writing to an RSP register — tells the bus what action to take.
+pub enum SpRegWrite {
+    /// No special action needed.
+    None,
+    /// RSP task was started (caller should process display list).
+    TaskStarted,
+    /// DMA: RDRAM → SP MEM (read into DMEM/IMEM).
+    DmaRead,
+    /// DMA: SP MEM → RDRAM (write from DMEM/IMEM).
+    DmaWrite,
+}
+
 pub struct Rsp {
     /// 4 KB Data Memory
     pub dmem: [u8; 4096],
@@ -21,6 +33,14 @@ pub struct Rsp {
     pub semaphore: u32,
     /// SP_PC (12-bit, IMEM offset)
     pub pc: u32,
+    /// SP_MEM_ADDR — bit 12 selects IMEM vs DMEM, bits 0-11 offset
+    pub dma_mem_addr: u32,
+    /// SP_DRAM_ADDR — RDRAM address for DMA
+    pub dma_dram_addr: u32,
+    /// Pending DMA length info (from SP_RD_LEN or SP_WR_LEN write)
+    pub dma_len: u32,
+    pub dma_count: u32,
+    pub dma_skip: u32,
     /// Debug: count of RSP task starts (auto-completed)
     pub start_count: u32,
 }
@@ -35,6 +55,11 @@ impl Rsp {
             dma_busy: 0,
             semaphore: 0,
             pc: 0,
+            dma_mem_addr: 0,
+            dma_dram_addr: 0,
+            dma_len: 0,
+            dma_count: 0,
+            dma_skip: 0,
             start_count: 0,
         }
     }
@@ -80,6 +105,9 @@ impl Rsp {
 
     pub fn read_reg_u32(&self, addr: u32) -> u32 {
         match addr & 0x0F_FFFF {
+            0x4_0000 => self.dma_mem_addr,
+            0x4_0004 => self.dma_dram_addr,
+            0x4_0008 | 0x4_000C => 0, // SP_RD_LEN / SP_WR_LEN (write-only, reads return 0)
             0x4_0010 => self.status,
             0x4_0014 => self.dma_full,
             0x4_0018 => self.dma_busy,
@@ -93,12 +121,35 @@ impl Rsp {
         }
     }
 
-    pub fn write_reg_u32(&mut self, addr: u32, val: u32, mi: &mut super::mi::Mi) {
+    /// Write to RSP registers. Returns action for the bus to perform.
+    pub fn write_reg_u32(&mut self, addr: u32, val: u32, mi: &mut super::mi::Mi) -> SpRegWrite {
         match addr & 0x0F_FFFF {
-            0x4_0010 => self.write_status(val, mi),
-            0x4_001C => self.semaphore = 0, // Writing clears semaphore
-            0x8_0000 => self.pc = val & 0xFFC,
-            _ => {}
+            0x4_0000 => { self.dma_mem_addr = val & 0x1FFF; SpRegWrite::None }
+            0x4_0004 => { self.dma_dram_addr = val & 0x00FF_FFFF; SpRegWrite::None }
+            0x4_0008 => {
+                // SP_RD_LEN write: trigger DMA RDRAM → SP MEM
+                self.dma_len = (val & 0xFFF) + 1;
+                self.dma_count = ((val >> 12) & 0xFF) + 1;
+                self.dma_skip = (val >> 20) & 0xFFF;
+                SpRegWrite::DmaRead
+            }
+            0x4_000C => {
+                // SP_WR_LEN write: trigger DMA SP MEM → RDRAM
+                self.dma_len = (val & 0xFFF) + 1;
+                self.dma_count = ((val >> 12) & 0xFF) + 1;
+                self.dma_skip = (val >> 20) & 0xFFF;
+                SpRegWrite::DmaWrite
+            }
+            0x4_0010 => {
+                if self.write_status(val, mi) {
+                    SpRegWrite::TaskStarted
+                } else {
+                    SpRegWrite::None
+                }
+            }
+            0x4_001C => { self.semaphore = 0; SpRegWrite::None }
+            0x8_0000 => { self.pc = val & 0xFFC; SpRegWrite::None }
+            _ => SpRegWrite::None,
         }
     }
 
@@ -106,8 +157,8 @@ impl Rsp {
     ///
     /// When the game clears the HALT bit (starts the RSP), we auto-complete:
     /// immediately re-halt and raise the SP interrupt so the game thinks
-    /// the RSP finished its task. This is a stub until we implement RSP HLE.
-    fn write_status(&mut self, val: u32, mi: &mut super::mi::Mi) {
+    /// the RSP finished its task. Returns true if a task was started.
+    fn write_status(&mut self, val: u32, mi: &mut super::mi::Mi) -> bool {
         let was_halted = self.status & 0x01 != 0;
 
         // Process set/clear pairs
@@ -138,6 +189,8 @@ impl Rsp {
             mi.set_interrupt(super::mi::MiInterrupt::SP);
             mi.set_interrupt(super::mi::MiInterrupt::DP);
             self.start_count += 1;
+            return true;
         }
+        false
     }
 }

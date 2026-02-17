@@ -1,7 +1,9 @@
 pub mod ai;
+pub mod gbi;
 pub mod mi;
 pub mod pi;
 pub mod rdp;
+pub mod renderer;
 pub mod ri;
 pub mod rsp;
 pub mod si;

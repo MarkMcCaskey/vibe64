@@ -162,12 +162,37 @@ fn main() {
         eprintln!("  VI: ctrl={:#010X} origin={:#010X} width={} h_video={:#010X}",
             n64.bus.vi.ctrl, n64.bus.vi.origin, n64.bus.vi.width, n64.bus.vi.h_video);
 
+        eprintln!("  Renderer: {} fills, {} tex_rects ({} skipped), {} tris",
+            n64.bus.renderer.fill_rect_count,
+            n64.bus.renderer.tex_rect_count,
+            n64.bus.renderer.tex_rect_skip,
+            n64.bus.renderer.tri_count);
+
         let origin = n64.bus.vi.origin as usize;
         let rdram = n64.rdram_data();
         let fb_size = 320 * 240 * 2;
         if origin > 0 && origin + fb_size < rdram.len() {
             let nonzero = (0..fb_size).filter(|&i| rdram[origin + i] != 0).count();
             eprintln!("  Framebuffer: {}% non-zero at RDRAM[{:#X}]", nonzero * 100 / fb_size, origin);
+        }
+
+        // Save framebuffer as PPM screenshot for visual inspection
+        if origin > 0 && origin + fb_size < rdram.len() {
+            let mut ppm_bytes = b"P6\n320 240\n255\n".to_vec();
+            for y in 0..240 {
+                for x in 0..320 {
+                    let off = origin + (y * 320 + x) * 2;
+                    let pixel = u16::from_be_bytes([rdram[off], rdram[off + 1]]);
+                    let r = ((pixel >> 11) & 0x1F) as u8;
+                    let g = ((pixel >> 6) & 0x1F) as u8;
+                    let b = ((pixel >> 1) & 0x1F) as u8;
+                    ppm_bytes.push((r << 3) | (r >> 2));
+                    ppm_bytes.push((g << 3) | (g >> 2));
+                    ppm_bytes.push((b << 3) | (b >> 2));
+                }
+            }
+            std::fs::write("framebuffer.ppm", &ppm_bytes).ok();
+            eprintln!("  Saved framebuffer.ppm");
         }
 
         n64.cpu.dump_unimpl_summary();

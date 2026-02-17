@@ -46,6 +46,11 @@ impl Rdram {
         &self.data
     }
 
+    /// Mutable access to RDRAM data (for renderer writing to framebuffer).
+    pub fn data_mut(&mut self) -> &mut [u8] {
+        &mut self.data
+    }
+
     pub fn write_u32(&mut self, addr: u32, val: u32) {
         let index = (addr as usize) & (RDRAM_SIZE - 1);
         let bytes = val.to_be_bytes();

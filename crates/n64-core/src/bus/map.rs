@@ -6,6 +6,7 @@ use crate::rcp::ai::Ai;
 use crate::rcp::mi::Mi;
 use crate::rcp::pi::Pi;
 use crate::rcp::rdp::Rdp;
+use crate::rcp::renderer::Renderer;
 use crate::rcp::ri::Ri;
 use crate::rcp::rsp::Rsp;
 use crate::rcp::si::Si;
@@ -25,6 +26,7 @@ pub struct Interconnect {
     pub rsp: Rsp,
     pub rdp: Rdp,
     pub pif: Pif,
+    pub renderer: Renderer,
     /// ISViewer debug output buffer (512 bytes at physical 0x13FF0020)
     is_viewer_buf: [u8; 512],
 }
@@ -43,6 +45,7 @@ impl Interconnect {
             rsp: Rsp::new(),
             rdp: Rdp::new(),
             pif: Pif::new(),
+            renderer: Renderer::new(),
             is_viewer_buf: [0u8; 512],
         }
     }
@@ -88,6 +91,94 @@ impl Interconnect {
         if self.pi.tick_dma() {
             self.mi.set_interrupt(crate::rcp::mi::MiInterrupt::PI);
         }
+    }
+
+    /// Process an RSP task: read OSTask from DMEM, and for graphics
+    /// tasks, walk the display list through the HLE renderer.
+    fn process_rsp_task(&mut self) {
+        use crate::rcp::gbi;
+
+        // Read OSTask fields from DMEM
+        let task_type = self.rsp.read_dmem_u32(gbi::TASK_TYPE);
+
+        if task_type == gbi::M_GFXTASK {
+            let data_ptr = self.rsp.read_dmem_u32(gbi::TASK_DATA_PTR);
+
+            // Convert virtual address to physical
+            let phys_addr = match data_ptr {
+                0x8000_0000..=0x9FFF_FFFF => data_ptr - 0x8000_0000,
+                0xA000_0000..=0xBFFF_FFFF => data_ptr - 0xA000_0000,
+                _ => data_ptr & 0x00FF_FFFF,
+            };
+
+            log::debug!(
+                "RSP GFX task #{}: display list at {:#010X} (phys {:#010X})",
+                self.rsp.start_count, data_ptr, phys_addr
+            );
+
+            // Walk display list, rendering into RDRAM
+            let rdram = self.rdram.data_mut();
+            gbi::process_display_list(&mut self.renderer, rdram, phys_addr);
+
+            log::debug!(
+                "  Rendered: {} fill rects, {} tex rects, {} tris",
+                self.renderer.fill_rect_count,
+                self.renderer.tex_rect_count,
+                self.renderer.tri_count,
+            );
+        }
+        // Audio tasks (M_AUDTASK) are silently ignored for now
+    }
+
+    /// SP DMA Read: RDRAM → SP MEM (load microcode/data into DMEM or IMEM).
+    fn sp_dma_read(&mut self) {
+        let is_imem = self.rsp.dma_mem_addr & 0x1000 != 0;
+        let mut mem_off = (self.rsp.dma_mem_addr & 0xFFF) as usize;
+        let mut dram_addr = self.rsp.dma_dram_addr & 0x00FF_FFFF;
+        let line_len = self.rsp.dma_len as usize;
+
+        let mem = if is_imem { &mut self.rsp.imem } else { &mut self.rsp.dmem };
+
+        for _ in 0..self.rsp.dma_count {
+            for i in 0..line_len {
+                let src = (dram_addr as usize + i) & 0x7F_FFFF;
+                mem[(mem_off + i) & 0xFFF] = self.rdram.data()[src];
+            }
+            mem_off = (mem_off + line_len) & 0xFFF;
+            dram_addr = dram_addr.wrapping_add(line_len as u32 + self.rsp.dma_skip);
+        }
+
+        log::trace!(
+            "SP DMA read: RDRAM[{:#010X}] → {}[{:#05X}], len={:#X}, lines={}",
+            self.rsp.dma_dram_addr, if is_imem { "IMEM" } else { "DMEM" },
+            self.rsp.dma_mem_addr & 0xFFF, line_len, self.rsp.dma_count,
+        );
+    }
+
+    /// SP DMA Write: SP MEM → RDRAM (save microcode output to RDRAM).
+    fn sp_dma_write(&mut self) {
+        let is_imem = self.rsp.dma_mem_addr & 0x1000 != 0;
+        let mut mem_off = (self.rsp.dma_mem_addr & 0xFFF) as usize;
+        let mut dram_addr = self.rsp.dma_dram_addr & 0x00FF_FFFF;
+        let line_len = self.rsp.dma_len as usize;
+
+        let mem = if is_imem { &self.rsp.imem } else { &self.rsp.dmem };
+
+        for _ in 0..self.rsp.dma_count {
+            for i in 0..line_len {
+                let byte = mem[(mem_off + i) & 0xFFF];
+                let dst = (dram_addr as usize + i) & 0x7F_FFFF;
+                self.rdram.data_mut()[dst] = byte;
+            }
+            mem_off = (mem_off + line_len) & 0xFFF;
+            dram_addr = dram_addr.wrapping_add(line_len as u32 + self.rsp.dma_skip);
+        }
+
+        log::trace!(
+            "SP DMA write: {}[{:#05X}] → RDRAM[{:#010X}], len={:#X}, lines={}",
+            if is_imem { "IMEM" } else { "DMEM" }, self.rsp.dma_mem_addr & 0xFFF,
+            self.rsp.dma_dram_addr, line_len, self.rsp.dma_count,
+        );
     }
 
     /// SI DMA Read: PIF RAM → RDRAM (game reads controller state).
@@ -219,7 +310,15 @@ impl Bus for Interconnect {
             0x03F0_0000..=0x03FF_FFFF => {} // RDRAM registers (stubbed)
             0x0400_0000..=0x0400_0FFF => self.rsp.write_dmem_u32(addr & 0xFFF, val),
             0x0400_1000..=0x0400_1FFF => self.rsp.write_imem_u32(addr & 0xFFF, val),
-            0x0404_0000..=0x040F_FFFF => self.rsp.write_reg_u32(addr, val, &mut self.mi),
+            0x0404_0000..=0x040F_FFFF => {
+                use crate::rcp::rsp::SpRegWrite;
+                match self.rsp.write_reg_u32(addr, val, &mut self.mi) {
+                    SpRegWrite::TaskStarted => self.process_rsp_task(),
+                    SpRegWrite::DmaRead => self.sp_dma_read(),
+                    SpRegWrite::DmaWrite => self.sp_dma_write(),
+                    SpRegWrite::None => {}
+                }
+            }
             0x0410_0000..=0x041F_FFFF => self.rdp.write_reg_u32(addr, val),
             0x0430_0000..=0x043F_FFFF => self.mi.write_u32(addr, val),
             0x0440_0000..=0x044F_FFFF => self.vi.write_u32(addr, val, &mut self.mi),
