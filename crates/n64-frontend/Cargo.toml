@@ -7,3 +7,7 @@ edition = "2021"
 n64-core = { path = "../n64-core" }
 env_logger = "0.11"
 log = "0.4"
+pixels = "0.15"
+winit = "0.30"
+ratatui = "0.29"
+crossterm = "0.28"

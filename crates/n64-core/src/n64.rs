@@ -87,6 +87,12 @@ impl N64 {
         })
     }
 
+    /// Video info for the frontend: pixel format, framebuffer dimensions.
+    pub fn vi_pixel_format(&self) -> u32 { self.bus.vi.ctrl & 0x3 }
+    pub fn vi_origin(&self) -> u32 { self.bus.vi.origin }
+    pub fn vi_width(&self) -> u32 { self.bus.vi.width }
+    pub fn rdram_data(&self) -> &[u8] { self.bus.rdram.data() }
+
     /// Run one frame (~93.75 MHz / 60 fps ≈ 1,562,500 cycles).
     pub fn run_frame(&mut self) {
         const CYCLES_PER_FRAME: u64 = 93_750_000 / 60;

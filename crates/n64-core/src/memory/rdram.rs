@@ -35,6 +35,11 @@ impl Rdram {
         self.data[index] = val;
     }
 
+    /// Raw access to RDRAM data (for framebuffer reading, DMA, etc.)
+    pub fn data(&self) -> &[u8] {
+        &self.data
+    }
+
     pub fn write_u32(&mut self, addr: u32, val: u32) {
         let index = (addr as usize) & (RDRAM_SIZE - 1);
         let bytes = val.to_be_bytes();
