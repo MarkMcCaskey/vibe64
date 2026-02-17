@@ -47,10 +47,34 @@ impl Mi {
 
     pub fn write_u32(&mut self, addr: u32, val: u32) {
         match addr & 0x0F_FFFF {
-            0x00 => self.mode = val,
+            0x00 => self.write_mode(val),
             0x0C => self.write_mask(val),
             _ => {}
         }
+    }
+
+    /// MI_MODE write: set/clear pairs + DP interrupt clear.
+    ///
+    /// Bit 7: clear init mode, Bit 8: set init mode
+    /// Bit 9: clear ebus test, Bit 10: set ebus test
+    /// Bit 11: clear DP interrupt
+    /// Bit 12: clear RDRAM reg, Bit 13: set RDRAM reg
+    fn write_mode(&mut self, val: u32) {
+        // Init length (bits 6:0)
+        self.mode = (self.mode & !0x7F) | (val & 0x7F);
+
+        if val & (1 << 7) != 0 { self.mode &= !(1 << 7); }  // Clear init mode
+        if val & (1 << 8) != 0 { self.mode |= 1 << 7; }      // Set init mode
+        if val & (1 << 9) != 0 { self.mode &= !(1 << 8); }   // Clear ebus test
+        if val & (1 << 10) != 0 { self.mode |= 1 << 8; }     // Set ebus test
+
+        // Bit 11: Clear DP interrupt
+        if val & (1 << 11) != 0 {
+            self.clear_interrupt(MiInterrupt::DP);
+        }
+
+        if val & (1 << 12) != 0 { self.mode &= !(1 << 9); }  // Clear RDRAM reg
+        if val & (1 << 13) != 0 { self.mode |= 1 << 9; }     // Set RDRAM reg
     }
 
     pub fn set_interrupt(&mut self, irq: MiInterrupt) {

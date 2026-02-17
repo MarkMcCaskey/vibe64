@@ -131,6 +131,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let use_tui = args.iter().any(|a| a == "--tui");
     let use_test = args.iter().any(|a| a == "--test");
+    let use_diag = args.iter().any(|a| a == "--diag");
     let rom_path = args.iter()
         .skip(1)
         .find(|a| !a.starts_with("--"))
@@ -148,9 +149,33 @@ fn main() {
         }
     };
 
-    if use_test {
+    if use_diag {
+        let total_steps = 50_000_000u64;
+        eprintln!("=== Boot diagnostic ({}M steps) ===", total_steps / 1_000_000);
+
+        for _ in 0..total_steps {
+            n64.step_one();
+        }
+
+        eprintln!("  DMAs={} RSP_tasks={} PC={:#010X}",
+            n64.bus.pi.dma_count, n64.bus.rsp.start_count, n64.cpu.pc as u32);
+        eprintln!("  VI: ctrl={:#010X} origin={:#010X} width={} h_video={:#010X}",
+            n64.bus.vi.ctrl, n64.bus.vi.origin, n64.bus.vi.width, n64.bus.vi.h_video);
+
+        let origin = n64.bus.vi.origin as usize;
+        let rdram = n64.rdram_data();
+        let fb_size = 320 * 240 * 2;
+        if origin > 0 && origin + fb_size < rdram.len() {
+            let nonzero = (0..fb_size).filter(|&i| rdram[origin + i] != 0).count();
+            eprintln!("  Framebuffer: {}% non-zero at RDRAM[{:#X}]", nonzero * 100 / fb_size, origin);
+        }
+
+        n64.cpu.dump_unimpl_summary();
+        return;
+    } else if use_test {
         // Test mode: run until r30 is set (5M cycles max)
         let result = n64.run_until_r30(5_000_000);
+        n64.cpu.dump_unimpl_summary();
         if result == 0 {
             eprintln!("TIMEOUT: r30 never set (tests didn't finish)");
             std::process::exit(2);

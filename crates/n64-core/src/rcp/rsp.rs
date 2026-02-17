@@ -21,6 +21,8 @@ pub struct Rsp {
     pub semaphore: u32,
     /// SP_PC (12-bit, IMEM offset)
     pub pc: u32,
+    /// Debug: count of RSP task starts (auto-completed)
+    pub start_count: u32,
 }
 
 impl Rsp {
@@ -33,6 +35,7 @@ impl Rsp {
             dma_busy: 0,
             semaphore: 0,
             pc: 0,
+            start_count: 0,
         }
     }
 
@@ -126,11 +129,15 @@ impl Rsp {
         }
 
         // Auto-complete: if the game just un-halted the RSP, pretend
-        // the task finished instantly (re-halt + SP interrupt).
+        // the task finished instantly (re-halt + SP interrupt + DP interrupt).
+        // The N64 OS scheduler waits for both SP and DP interrupts before
+        // signaling the game thread that a graphics task is complete.
         if was_halted && (self.status & 0x01 == 0) {
             log::trace!("RSP auto-complete: task started, immediately finishing");
             self.status |= 0x01 | 0x02; // Set halt + broke
             mi.set_interrupt(super::mi::MiInterrupt::SP);
+            mi.set_interrupt(super::mi::MiInterrupt::DP);
+            self.start_count += 1;
         }
     }
 }
