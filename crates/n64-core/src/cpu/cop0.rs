@@ -85,6 +85,13 @@ impl Cop0 {
         }
     }
 
+    /// Decrement Random register (wraps from Wired back to 31)
+    pub fn decrement_random(&mut self) {
+        let wired = self.regs[Self::WIRED] & 0x1F;
+        let random = self.regs[Self::RANDOM] & 0x1F;
+        self.regs[Self::RANDOM] = if random <= wired { 31 } else { random - 1 };
+    }
+
     /// Set IP2 in Cause (external RCP interrupt from MI)
     pub fn set_ip2(&mut self) {
         self.regs[Self::CAUSE] |= 1 << 10;

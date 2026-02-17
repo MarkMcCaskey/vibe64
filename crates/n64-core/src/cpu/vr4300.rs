@@ -3,6 +3,7 @@ use crate::cpu::cop0::Cop0;
 use crate::cpu::cop1::Cop1;
 use crate::cpu::exceptions::ExceptionCode;
 use crate::cpu::instruction::Instruction;
+use crate::cpu::tlb::Tlb;
 
 /// NEC VR4300 CPU — the N64's main processor.
 ///
@@ -33,6 +34,9 @@ pub struct Vr4300 {
     /// COP1: Floating Point Unit
     pub cop1: Cop1,
 
+    /// 32-entry TLB for virtual→physical address translation
+    pub tlb: Tlb,
+
     /// Is the CPU currently in a branch delay slot?
     pub in_delay_slot: bool,
 
@@ -50,6 +54,7 @@ impl Vr4300 {
             lo: 0,
             cop0: Cop0::new(),
             cop1: Cop1::new(),
+            tlb: Tlb::new(),
             in_delay_slot: false,
             ll_bit: false,
         };
@@ -94,8 +99,9 @@ impl Vr4300 {
         // 5. r0 is hardwired to 0 — enforce after every instruction
         self.gpr[0] = 0;
 
-        // 6. Increment COP0 Count register (1 per 2 PCycles)
+        // 6. Increment COP0 Count register (1 per 2 PCycles) and decrement Random
         self.cop0.increment_count();
+        self.cop0.decrement_random();
 
         // 7. Check for timer interrupt (Count == Compare)
         self.cop0.check_timer_interrupt();
@@ -155,12 +161,19 @@ impl Vr4300 {
     pub fn translate_address(&self, vaddr: u64) -> u32 {
         let addr32 = vaddr as u32;
         match addr32 {
-            0x8000_0000..=0x9FFF_FFFF => addr32 - 0x8000_0000,
-            0xA000_0000..=0xBFFF_FFFF => addr32 - 0xA000_0000,
-            // TLB mapped segments — stub for now
+            0x8000_0000..=0x9FFF_FFFF => addr32 - 0x8000_0000, // kseg0: direct, cached
+            0xA000_0000..=0xBFFF_FFFF => addr32 - 0xA000_0000, // kseg1: direct, uncached
             _ => {
-                log::warn!("TLB translate not implemented for {:#018X}", vaddr);
-                addr32 & 0x1FFF_FFFF
+                // kuseg, ksseg, kseg3 — all TLB mapped
+                let asid = self.cop0.regs[Cop0::ENTRY_HI] as u8;
+                match self.tlb.lookup(vaddr, asid) {
+                    Some(paddr) => paddr,
+                    None => {
+                        // TLB miss — should raise exception, for now fallback
+                        log::trace!("TLB miss for {:#018X}", vaddr);
+                        addr32 & 0x1FFF_FFFF
+                    }
+                }
             }
         }
     }

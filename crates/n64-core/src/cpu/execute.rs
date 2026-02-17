@@ -133,10 +133,10 @@ impl Vr4300 {
             0x10..=0x1F => {
                 // CO (Coprocessor Operation)
                 match instr.funct() {
-                    0x01 => {} // TLBR — stub
-                    0x02 => {} // TLBWI — stub
-                    0x06 => {} // TLBWR — stub
-                    0x08 => {} // TLBP — stub
+                    0x01 => self.op_tlbr(),
+                    0x02 => self.op_tlbwi(),
+                    0x06 => self.op_tlbwr(),
+                    0x08 => self.op_tlbp(),
                     0x18 => self.op_eret(),
                     _ => log::warn!("Unimplemented COP0 CO funct={:#04X}", instr.funct()),
                 }
@@ -601,6 +601,62 @@ impl Vr4300 {
         }
         self.next_pc = self.pc.wrapping_add(4);
         self.ll_bit = false;
+    }
+
+    // ─── TLB Instructions ─────────────────────────────────────────
+
+    /// TLBR: Read TLB entry at Index into COP0 registers
+    fn op_tlbr(&mut self) {
+        let index = (self.cop0.regs[Cop0::INDEX] & 0x1F) as usize;
+        let entry = &self.tlb.entries[index];
+        self.cop0.regs[Cop0::PAGE_MASK] = entry.page_mask as u64;
+        self.cop0.regs[Cop0::ENTRY_HI] = entry.entry_hi;
+        self.cop0.regs[Cop0::ENTRY_LO0] = entry.entry_lo0;
+        self.cop0.regs[Cop0::ENTRY_LO1] = entry.entry_lo1;
+    }
+
+    /// TLBWI: Write COP0 registers into TLB entry at Index
+    fn op_tlbwi(&mut self) {
+        let index = (self.cop0.regs[Cop0::INDEX] & 0x1F) as usize;
+        self.tlb.entries[index].page_mask = self.cop0.regs[Cop0::PAGE_MASK] as u32;
+        self.tlb.entries[index].entry_hi = self.cop0.regs[Cop0::ENTRY_HI];
+        self.tlb.entries[index].entry_lo0 = self.cop0.regs[Cop0::ENTRY_LO0];
+        self.tlb.entries[index].entry_lo1 = self.cop0.regs[Cop0::ENTRY_LO1];
+    }
+
+    /// TLBWR: Write COP0 registers into TLB entry at Random
+    fn op_tlbwr(&mut self) {
+        let wired = self.cop0.regs[Cop0::WIRED] as usize & 0x1F;
+        let random = self.cop0.regs[Cop0::RANDOM] as usize & 0x1F;
+        let index = if random > wired { random } else { wired };
+        self.tlb.entries[index].page_mask = self.cop0.regs[Cop0::PAGE_MASK] as u32;
+        self.tlb.entries[index].entry_hi = self.cop0.regs[Cop0::ENTRY_HI];
+        self.tlb.entries[index].entry_lo0 = self.cop0.regs[Cop0::ENTRY_LO0];
+        self.tlb.entries[index].entry_lo1 = self.cop0.regs[Cop0::ENTRY_LO1];
+    }
+
+    /// TLBP: Probe TLB for matching entry, write index to Index register
+    fn op_tlbp(&mut self) {
+        let entry_hi = self.cop0.regs[Cop0::ENTRY_HI];
+        let asid = entry_hi as u8;
+
+        // Search all 32 entries for a VPN match
+        self.cop0.regs[Cop0::INDEX] = 0x8000_0000; // Set P bit (not found)
+        for i in 0..32 {
+            let entry = &self.tlb.entries[i];
+            let mask = (entry.page_mask as u64) | 0x1FFF;
+            let vpn_mask = !mask;
+
+            if (entry_hi & vpn_mask) != (entry.entry_hi & vpn_mask) {
+                continue;
+            }
+            let global = (entry.entry_lo0 & 1) != 0 && (entry.entry_lo1 & 1) != 0;
+            if !global && (entry.entry_hi as u8) != asid {
+                continue;
+            }
+            self.cop0.regs[Cop0::INDEX] = i as u64; // Clear P bit, set index
+            break;
+        }
     }
 
     // ─── Load Linked / Store Conditional ────────────────────────
