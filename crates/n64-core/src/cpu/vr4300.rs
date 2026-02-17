@@ -1,6 +1,7 @@
 use crate::bus::Bus;
 use crate::cpu::cop0::Cop0;
 use crate::cpu::cop1::Cop1;
+use crate::cpu::exceptions::ExceptionCode;
 use crate::cpu::instruction::Instruction;
 
 /// NEC VR4300 CPU — the N64's main processor.
@@ -99,12 +100,49 @@ impl Vr4300 {
         // 7. Check for timer interrupt (Count == Compare)
         self.cop0.check_timer_interrupt();
 
-        // 8. Check external interrupts
+        // 8. Latch external interrupt line: IP2 reflects MI state each step
         if bus.pending_interrupts() {
             self.cop0.set_ip2();
+        } else {
+            self.cop0.clear_ip2();
+        }
+
+        // 9. Take interrupt if conditions are met (IE=1, EXL=0, ERL=0, unmasked IP)
+        if self.cop0.interrupt_pending() {
+            self.take_exception(ExceptionCode::Interrupt);
         }
 
         1 // simplified cycle count for interpreter
+    }
+
+    /// Take an exception: save state and jump to the exception handler.
+    ///
+    /// EPC = PC of the instruction that was about to execute (self.pc at this point,
+    /// since step() has already advanced past the current instruction).
+    /// Sets EXL in Status (disabling further interrupts), writes exception code
+    /// to Cause, and vectors to the appropriate handler address.
+    pub fn take_exception(&mut self, code: ExceptionCode) {
+        // EPC = the next instruction that *would* have executed
+        self.cop0.regs[Cop0::EPC] = self.pc;
+
+        // Set exception code in Cause[6:2], preserving other bits (IP, BD, etc.)
+        let cause = self.cop0.regs[Cop0::CAUSE] as u32;
+        let cause = (cause & !0x7C) | ((code as u32) << 2);
+        self.cop0.regs[Cop0::CAUSE] = cause as i32 as i64 as u64;
+
+        // Set EXL (bit 1) — exception level, disables interrupts
+        self.cop0.regs[Cop0::STATUS] |= 0x02;
+
+        // Exception vector depends on BEV bit (Status[22])
+        let bev = (self.cop0.regs[Cop0::STATUS] >> 22) & 1;
+        let vector = if bev != 0 {
+            0xFFFF_FFFF_BFC0_0200u64 // Boot exception vectors (in PIF ROM)
+        } else {
+            0xFFFF_FFFF_8000_0180u64 // Normal exception vector (in RDRAM)
+        };
+
+        self.pc = vector;
+        self.next_pc = vector.wrapping_add(4);
     }
 
     /// Translate a 64-bit virtual address to a 32-bit physical address.

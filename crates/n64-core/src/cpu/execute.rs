@@ -27,6 +27,7 @@ impl Vr4300 {
             0x0E => self.op_xori(instr),
             0x0F => self.op_lui(instr),
             0x10 => self.execute_cop0(instr, bus),
+            0x11 => self.execute_cop1(instr, bus, current_pc),
             0x14 => self.op_beql(instr, current_pc),
             0x15 => self.op_bnel(instr, current_pc),
             0x16 => self.op_blezl(instr, current_pc),
@@ -42,7 +43,13 @@ impl Vr4300 {
             0x29 => self.op_sh(instr, bus),
             0x2B => self.op_sw(instr, bus),
             0x2F => self.op_cache(instr),
+            0x30 => self.op_ll(instr, bus),
+            0x31 => self.op_lwc1(instr, bus),
+            0x35 => self.op_ldc1(instr, bus),
             0x37 => self.op_ld(instr, bus),
+            0x38 => self.op_sc(instr, bus),
+            0x39 => self.op_swc1(instr, bus),
+            0x3D => self.op_sdc1(instr, bus),
             0x3F => self.op_sd(instr, bus),
             _ => log::warn!(
                 "Unimplemented opcode {:#04X} at PC={:#018X} (raw={:#010X})",
@@ -584,18 +591,314 @@ impl Vr4300 {
     }
 
     fn op_eret(&mut self) {
-        // Exception Return: PC = EPC, clear EXL
         let status = self.cop0.regs[Cop0::STATUS];
         if status & 0x04 != 0 {
-            // ERL set: return to ErrorEPC
             self.pc = self.cop0.regs[Cop0::ERROR_EPC];
-            self.cop0.regs[Cop0::STATUS] &= !0x04; // clear ERL
+            self.cop0.regs[Cop0::STATUS] &= !0x04;
         } else {
-            // Normal: return to EPC
             self.pc = self.cop0.regs[Cop0::EPC];
-            self.cop0.regs[Cop0::STATUS] &= !0x02; // clear EXL
+            self.cop0.regs[Cop0::STATUS] &= !0x02;
         }
         self.next_pc = self.pc.wrapping_add(4);
         self.ll_bit = false;
+    }
+
+    // ─── Load Linked / Store Conditional ────────────────────────
+
+    fn op_ll(&mut self, instr: Instruction, bus: &impl Bus) {
+        let addr = self.load_addr(instr);
+        self.gpr[instr.rt()] = bus.read_u32(addr) as i32 as i64 as u64;
+        self.ll_bit = true;
+    }
+
+    fn op_sc(&mut self, instr: Instruction, bus: &mut impl Bus) {
+        if self.ll_bit {
+            let addr = self.load_addr(instr);
+            bus.write_u32(addr, self.gpr[instr.rt()] as u32);
+            self.gpr[instr.rt()] = 1; // success
+        } else {
+            self.gpr[instr.rt()] = 0; // failed
+        }
+        self.ll_bit = false;
+    }
+
+    // ─── COP1 (FPU) Load/Store ──────────────────────────────────
+
+    fn op_lwc1(&mut self, instr: Instruction, bus: &impl Bus) {
+        let addr = self.load_addr(instr);
+        let val = bus.read_u32(addr);
+        self.cop1.fpr[instr.rt()] = val as u64;
+    }
+
+    fn op_swc1(&mut self, instr: Instruction, bus: &mut impl Bus) {
+        let addr = self.load_addr(instr);
+        bus.write_u32(addr, self.cop1.fpr[instr.rt()] as u32);
+    }
+
+    fn op_ldc1(&mut self, instr: Instruction, bus: &impl Bus) {
+        let addr = self.load_addr(instr);
+        self.cop1.fpr[instr.rt()] = bus.read_u64(addr);
+    }
+
+    fn op_sdc1(&mut self, instr: Instruction, bus: &mut impl Bus) {
+        let addr = self.load_addr(instr);
+        bus.write_u64(addr, self.cop1.fpr[instr.rt()]);
+    }
+
+    // ─── COP1 (FPU) Execution ───────────────────────────────────
+
+    fn execute_cop1(&mut self, instr: Instruction, _bus: &mut impl Bus, current_pc: u64) {
+        let fmt = instr.rs();
+        match fmt {
+            0x00 => { // MFC1: GPR[rt] = FPR[rd] (low 32 bits)
+                self.gpr[instr.rt()] = self.cop1.fpr[instr.rd()] as i32 as i64 as u64;
+            }
+            0x01 => { // DMFC1: GPR[rt] = FPR[rd] (full 64 bits)
+                self.gpr[instr.rt()] = self.cop1.fpr[instr.rd()];
+            }
+            0x02 => { // CFC1: GPR[rt] = FCR[rd]
+                let val = match instr.rd() {
+                    0 => self.cop1.fcr0,
+                    31 => self.cop1.fcr31,
+                    _ => 0,
+                };
+                self.gpr[instr.rt()] = val as i32 as i64 as u64;
+            }
+            0x04 => { // MTC1: FPR[rd] = GPR[rt] (low 32 bits)
+                self.cop1.fpr[instr.rd()] = self.gpr[instr.rt()] as u32 as u64;
+            }
+            0x05 => { // DMTC1: FPR[rd] = GPR[rt] (full 64 bits)
+                self.cop1.fpr[instr.rd()] = self.gpr[instr.rt()];
+            }
+            0x06 => { // CTC1: FCR[rd] = GPR[rt]
+                match instr.rd() {
+                    31 => self.cop1.fcr31 = self.gpr[instr.rt()] as u32,
+                    _ => {}
+                }
+            }
+            0x08 => { // BC1: branch on FPU condition
+                let cond = self.cop1.condition();
+                match instr.rt() {
+                    0x00 => self.branch(!cond, instr, current_pc),        // BC1F
+                    0x01 => self.branch(cond, instr, current_pc),         // BC1T
+                    0x02 => self.branch_likely(!cond, instr, current_pc), // BC1FL
+                    0x03 => self.branch_likely(cond, instr, current_pc),  // BC1TL
+                    _ => {}
+                }
+            }
+            0x10 => self.cop1_single(instr, current_pc),
+            0x11 => self.cop1_double(instr, current_pc),
+            0x14 => self.cop1_w(instr, current_pc),
+            0x15 => self.cop1_l(instr, current_pc),
+            _ => log::warn!("Unimplemented COP1 rs/fmt={:#04X}", fmt),
+        }
+    }
+
+    // ─── COP1 Single-Precision (fmt=0x10) ────────────────────────
+
+    fn cop1_single(&mut self, instr: Instruction, _current_pc: u64) {
+        let fs = instr.rd();
+        let ft = instr.rt();
+        let fd = instr.sa();
+
+        match instr.funct() {
+            0x00 => { // ADD.S
+                let result = self.cop1.read_f32(fs) + self.cop1.read_f32(ft);
+                self.cop1.write_f32(fd, result);
+            }
+            0x01 => { // SUB.S
+                let result = self.cop1.read_f32(fs) - self.cop1.read_f32(ft);
+                self.cop1.write_f32(fd, result);
+            }
+            0x02 => { // MUL.S
+                let result = self.cop1.read_f32(fs) * self.cop1.read_f32(ft);
+                self.cop1.write_f32(fd, result);
+            }
+            0x03 => { // DIV.S
+                let result = self.cop1.read_f32(fs) / self.cop1.read_f32(ft);
+                self.cop1.write_f32(fd, result);
+            }
+            0x04 => { // SQRT.S
+                self.cop1.write_f32(fd, self.cop1.read_f32(fs).sqrt());
+            }
+            0x05 => { // ABS.S
+                self.cop1.write_f32(fd, self.cop1.read_f32(fs).abs());
+            }
+            0x06 => { // MOV.S — copy raw bits, avoid float canonicalization
+                self.cop1.fpr[fd] = self.cop1.fpr[fs] & 0xFFFF_FFFF;
+            }
+            0x07 => { // NEG.S
+                self.cop1.write_f32(fd, -self.cop1.read_f32(fs));
+            }
+            0x08 => { // ROUND.L.S
+                self.cop1.fpr[fd] = (self.cop1.read_f32(fs).round_ties_even() as i64) as u64;
+            }
+            0x09 => { // TRUNC.L.S
+                self.cop1.fpr[fd] = (self.cop1.read_f32(fs).trunc() as i64) as u64;
+            }
+            0x0A => { // CEIL.L.S
+                self.cop1.fpr[fd] = (self.cop1.read_f32(fs).ceil() as i64) as u64;
+            }
+            0x0B => { // FLOOR.L.S
+                self.cop1.fpr[fd] = (self.cop1.read_f32(fs).floor() as i64) as u64;
+            }
+            0x0C => { // ROUND.W.S
+                self.cop1.fpr[fd] = (self.cop1.read_f32(fs).round_ties_even() as i32 as u32) as u64;
+            }
+            0x0D => { // TRUNC.W.S
+                self.cop1.fpr[fd] = (self.cop1.read_f32(fs).trunc() as i32 as u32) as u64;
+            }
+            0x0E => { // CEIL.W.S
+                self.cop1.fpr[fd] = (self.cop1.read_f32(fs).ceil() as i32 as u32) as u64;
+            }
+            0x0F => { // FLOOR.W.S
+                self.cop1.fpr[fd] = (self.cop1.read_f32(fs).floor() as i32 as u32) as u64;
+            }
+            0x21 => { // CVT.D.S
+                self.cop1.write_f64(fd, self.cop1.read_f32(fs) as f64);
+            }
+            0x24 => { // CVT.W.S
+                self.cop1.fpr[fd] = (self.cop1.read_f32(fs).round_ties_even() as i32 as u32) as u64;
+            }
+            0x25 => { // CVT.L.S
+                self.cop1.fpr[fd] = (self.cop1.read_f32(fs).round_ties_even() as i64) as u64;
+            }
+            0x30..=0x3F => self.cop1_compare_s(instr),
+            _ => log::warn!("Unimplemented COP1.S funct={:#04X}", instr.funct()),
+        }
+    }
+
+    // ─── COP1 Double-Precision (fmt=0x11) ────────────────────────
+
+    fn cop1_double(&mut self, instr: Instruction, _current_pc: u64) {
+        let fs = instr.rd();
+        let ft = instr.rt();
+        let fd = instr.sa();
+
+        match instr.funct() {
+            0x00 => { // ADD.D
+                let result = self.cop1.read_f64(fs) + self.cop1.read_f64(ft);
+                self.cop1.write_f64(fd, result);
+            }
+            0x01 => { // SUB.D
+                let result = self.cop1.read_f64(fs) - self.cop1.read_f64(ft);
+                self.cop1.write_f64(fd, result);
+            }
+            0x02 => { // MUL.D
+                let result = self.cop1.read_f64(fs) * self.cop1.read_f64(ft);
+                self.cop1.write_f64(fd, result);
+            }
+            0x03 => { // DIV.D
+                let result = self.cop1.read_f64(fs) / self.cop1.read_f64(ft);
+                self.cop1.write_f64(fd, result);
+            }
+            0x04 => { // SQRT.D
+                self.cop1.write_f64(fd, self.cop1.read_f64(fs).sqrt());
+            }
+            0x05 => { // ABS.D
+                self.cop1.write_f64(fd, self.cop1.read_f64(fs).abs());
+            }
+            0x06 => { // MOV.D — copy raw 64-bit bits
+                self.cop1.fpr[fd] = self.cop1.fpr[fs];
+            }
+            0x07 => { // NEG.D
+                self.cop1.write_f64(fd, -self.cop1.read_f64(fs));
+            }
+            0x08 => { // ROUND.L.D
+                self.cop1.fpr[fd] = (self.cop1.read_f64(fs).round_ties_even() as i64) as u64;
+            }
+            0x09 => { // TRUNC.L.D
+                self.cop1.fpr[fd] = (self.cop1.read_f64(fs).trunc() as i64) as u64;
+            }
+            0x0A => { // CEIL.L.D
+                self.cop1.fpr[fd] = (self.cop1.read_f64(fs).ceil() as i64) as u64;
+            }
+            0x0B => { // FLOOR.L.D
+                self.cop1.fpr[fd] = (self.cop1.read_f64(fs).floor() as i64) as u64;
+            }
+            0x0C => { // ROUND.W.D
+                self.cop1.fpr[fd] = (self.cop1.read_f64(fs).round_ties_even() as i32 as u32) as u64;
+            }
+            0x0D => { // TRUNC.W.D
+                self.cop1.fpr[fd] = (self.cop1.read_f64(fs).trunc() as i32 as u32) as u64;
+            }
+            0x0E => { // CEIL.W.D
+                self.cop1.fpr[fd] = (self.cop1.read_f64(fs).ceil() as i32 as u32) as u64;
+            }
+            0x0F => { // FLOOR.W.D
+                self.cop1.fpr[fd] = (self.cop1.read_f64(fs).floor() as i32 as u32) as u64;
+            }
+            0x20 => { // CVT.S.D
+                self.cop1.write_f32(fd, self.cop1.read_f64(fs) as f32);
+            }
+            0x24 => { // CVT.W.D
+                self.cop1.fpr[fd] = (self.cop1.read_f64(fs).round_ties_even() as i32 as u32) as u64;
+            }
+            0x25 => { // CVT.L.D
+                self.cop1.fpr[fd] = (self.cop1.read_f64(fs).round_ties_even() as i64) as u64;
+            }
+            0x30..=0x3F => self.cop1_compare_d(instr),
+            _ => log::warn!("Unimplemented COP1.D funct={:#04X}", instr.funct()),
+        }
+    }
+
+    // ─── COP1 Word Integer (fmt=0x14) ───────────────────────────
+
+    fn cop1_w(&mut self, instr: Instruction, _current_pc: u64) {
+        let fs = instr.rd();
+        let fd = instr.sa();
+        let int_val = self.cop1.fpr[fs] as i32;
+
+        match instr.funct() {
+            0x20 => { // CVT.S.W
+                self.cop1.write_f32(fd, int_val as f32);
+            }
+            0x21 => { // CVT.D.W
+                self.cop1.write_f64(fd, int_val as f64);
+            }
+            _ => log::warn!("Unimplemented COP1.W funct={:#04X}", instr.funct()),
+        }
+    }
+
+    // ─── COP1 Long Integer (fmt=0x15) ───────────────────────────
+
+    fn cop1_l(&mut self, instr: Instruction, _current_pc: u64) {
+        let fs = instr.rd();
+        let fd = instr.sa();
+        let int_val = self.cop1.fpr[fs] as i64;
+
+        match instr.funct() {
+            0x20 => { // CVT.S.L
+                self.cop1.write_f32(fd, int_val as f32);
+            }
+            0x21 => { // CVT.D.L
+                self.cop1.write_f64(fd, int_val as f64);
+            }
+            _ => log::warn!("Unimplemented COP1.L funct={:#04X}", instr.funct()),
+        }
+    }
+
+    // ─── COP1 Compare Helpers ───────────────────────────────────
+
+    fn cop1_compare_s(&mut self, instr: Instruction) {
+        let a = self.cop1.read_f32(instr.rd());
+        let b = self.cop1.read_f32(instr.rt());
+        let unordered = a.is_nan() || b.is_nan();
+        let cond = instr.funct() & 0x0F;
+        let result = ((cond & 0x01) != 0 && unordered)
+                  || ((cond & 0x02) != 0 && !unordered && a == b)
+                  || ((cond & 0x04) != 0 && !unordered && a < b);
+        self.cop1.set_condition(result);
+    }
+
+    fn cop1_compare_d(&mut self, instr: Instruction) {
+        let a = self.cop1.read_f64(instr.rd());
+        let b = self.cop1.read_f64(instr.rt());
+        let unordered = a.is_nan() || b.is_nan();
+        let cond = instr.funct() & 0x0F;
+        let result = ((cond & 0x01) != 0 && unordered)
+                  || ((cond & 0x02) != 0 && !unordered && a == b)
+                  || ((cond & 0x04) != 0 && !unordered && a < b);
+        self.cop1.set_condition(result);
     }
 }
