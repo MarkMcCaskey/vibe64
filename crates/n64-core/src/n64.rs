@@ -32,17 +32,52 @@ impl N64 {
             header.entry_point
         );
 
+        // Detect CIC variant from boot code
+        let cic = cart::cic::detect(&rom_data);
+        log::info!("Detected CIC: {}", cic);
+
+        let entry_point = header.entry_point;
         let cart = Cartridge::new(rom_data, header);
         let mut bus = Interconnect::new(cart);
 
-        // Simulate PIF boot: copy first 4KB of ROM into RSP DMEM.
-        // The IPL3 bootloader starts at DMEM offset 0x40.
-        let boot_code_len = 0x1000.min(bus.cart.data.len());
-        let boot_code: Vec<u8> = bus.cart.data[..boot_code_len].to_vec();
+        // HLE boot: instead of running the IPL3 bootloader (which is
+        // encrypted for CIC-6105), do what it would have done:
+        //
+        // 1. Copy first 4KB of ROM to RSP DMEM (some games reference this)
+        // 2. Copy 1MB of game code from ROM[0x1000] to RDRAM[0x0000]
+        // 3. Set PC to the ROM header's entry point
+        //
+        // The IPL3 normally does step 2 via PI DMA, then jumps to entry.
+        // We skip the crypto and just do the memcpy directly.
+
+        // Load ROM header + boot code into DMEM (some games read back from it)
+        let boot_len = 0x1000.min(bus.cart.data.len());
+        let boot_code: Vec<u8> = bus.cart.data[..boot_len].to_vec();
         bus.rsp.load_to_dmem(0, &boot_code);
 
+        // Copy game code: ROM[0x1000..] → RDRAM[entry_point physical]
+        // The IPL3 copies game code to the entry point's physical address.
+        // entry_point is virtual (e.g., 0x80000400 → physical 0x00000400)
+        let game_start = 0x1000usize;
+        let rdram_dest = (entry_point & 0x1FFF_FFFF) as usize;
+        let copy_len = (bus.cart.data.len() - game_start).min(0x10_0000); // up to 1MB
+        for i in 0..copy_len {
+            let byte = bus.cart.data[game_start + i];
+            bus.rdram.write_u8((rdram_dest + i) as u32, byte);
+        }
+        log::info!(
+            "HLE boot: copied {:#X} bytes from ROM[{:#X}] to RDRAM[{:#X}]",
+            copy_len, game_start, rdram_dest
+        );
+
         let mut cpu = Vr4300::new();
-        cpu.setup_post_pif_boot();
+        // Entry point from ROM header (typically 0x80000400)
+        cpu.pc = entry_point as i32 as i64 as u64; // sign-extend to 64-bit
+        cpu.next_pc = cpu.pc.wrapping_add(4);
+        cart::cic::apply_initial_regs(cic, &mut cpu.gpr);
+
+        // COP0 state that the IPL3 would have left
+        cpu.cop0.regs[crate::cpu::cop0::Cop0::STATUS] = 0x3400_0000; // CU0+CU1 enabled
 
         Ok(Self {
             cpu,

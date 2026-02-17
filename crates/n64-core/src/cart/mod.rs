@@ -1,3 +1,4 @@
+pub mod cic;
 pub mod rom;
 
 /// Cartridge — holds the ROM data.
