@@ -90,24 +90,47 @@ impl Rsp {
         }
     }
 
-    pub fn write_reg_u32(&mut self, addr: u32, val: u32) {
+    pub fn write_reg_u32(&mut self, addr: u32, val: u32, mi: &mut super::mi::Mi) {
         match addr & 0x0F_FFFF {
-            0x4_0010 => {
-                // SP_STATUS write: set/clear pairs
-                if val & 0x01 != 0 { self.status &= !0x01; } // Clear halt
-                if val & 0x02 != 0 { self.status |= 0x01; }  // Set halt
-                if val & 0x04 != 0 { self.status &= !0x02; } // Clear broke
-                // Bits 3-24: clear/set various flags
-                if val & 0x08 != 0 {
-                    // Clear SP interrupt
-                }
-                if val & 0x10 != 0 {
-                    // Set SP interrupt
-                }
-            }
+            0x4_0010 => self.write_status(val, mi),
             0x4_001C => self.semaphore = 0, // Writing clears semaphore
             0x8_0000 => self.pc = val & 0xFFC,
             _ => {}
+        }
+    }
+
+    /// SP_STATUS write: set/clear flag pairs.
+    ///
+    /// When the game clears the HALT bit (starts the RSP), we auto-complete:
+    /// immediately re-halt and raise the SP interrupt so the game thinks
+    /// the RSP finished its task. This is a stub until we implement RSP HLE.
+    fn write_status(&mut self, val: u32, mi: &mut super::mi::Mi) {
+        let was_halted = self.status & 0x01 != 0;
+
+        // Process set/clear pairs
+        if val & 0x01 != 0 { self.status &= !0x01; } // Clear halt
+        if val & 0x02 != 0 { self.status |= 0x01; }  // Set halt
+        if val & 0x04 != 0 { self.status &= !0x02; } // Clear broke
+        if val & 0x08 != 0 { mi.clear_interrupt(super::mi::MiInterrupt::SP); }
+        if val & 0x10 != 0 { mi.set_interrupt(super::mi::MiInterrupt::SP); }
+        // Bits 5-24: clear/set signal flags (sig0..sig7)
+        for i in 0..8u32 {
+            let clear_bit = 5 + i * 2;
+            let set_bit = 6 + i * 2;
+            if clear_bit < 25 {
+                if val & (1 << clear_bit) != 0 { self.status &= !(1 << (7 + i)); }
+            }
+            if set_bit < 25 {
+                if val & (1 << set_bit) != 0 { self.status |= 1 << (7 + i); }
+            }
+        }
+
+        // Auto-complete: if the game just un-halted the RSP, pretend
+        // the task finished instantly (re-halt + SP interrupt).
+        if was_halted && (self.status & 0x01 == 0) {
+            log::trace!("RSP auto-complete: task started, immediately finishing");
+            self.status |= 0x01 | 0x02; // Set halt + broke
+            mi.set_interrupt(super::mi::MiInterrupt::SP);
         }
     }
 }

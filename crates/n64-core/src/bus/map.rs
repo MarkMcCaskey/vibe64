@@ -25,6 +25,8 @@ pub struct Interconnect {
     pub rsp: Rsp,
     pub rdp: Rdp,
     pub pif: Pif,
+    /// ISViewer debug output buffer (512 bytes at physical 0x13FF0020)
+    is_viewer_buf: [u8; 512],
 }
 
 impl Interconnect {
@@ -41,6 +43,7 @@ impl Interconnect {
             rsp: Rsp::new(),
             rdp: Rdp::new(),
             pif: Pif::new(),
+            is_viewer_buf: [0u8; 512],
         }
     }
 
@@ -59,6 +62,65 @@ impl Interconnect {
         self.mi.set_interrupt(crate::rcp::mi::MiInterrupt::PI);
         self.notify_dma_write(dram_addr, len);
         self.pi.pending_dma_len = 0;
+    }
+
+    /// SI DMA Read: PIF RAM → RDRAM (game reads controller state).
+    /// Processes PIF commands first, then copies 64 bytes.
+    fn si_dma_read(&mut self) {
+        self.pif.process_commands();
+        let dram_addr = self.si.dram_addr & 0x00FF_FFFF;
+        for i in 0..64u32 {
+            let byte = self.pif.ram[i as usize];
+            self.rdram.write_u8(dram_addr + i, byte);
+        }
+        self.mi.set_interrupt(crate::rcp::mi::MiInterrupt::SI);
+    }
+
+    /// SI DMA Write: RDRAM → PIF RAM (game sends commands to PIF).
+    /// Copies 64 bytes then processes PIF commands.
+    fn si_dma_write(&mut self) {
+        let dram_addr = self.si.dram_addr & 0x00FF_FFFF;
+        for i in 0..64u32 {
+            self.pif.ram[i as usize] = self.rdram.read_u8(dram_addr + i);
+        }
+        self.pif.process_commands();
+        self.mi.set_interrupt(crate::rcp::mi::MiInterrupt::SI);
+    }
+
+    /// ISViewer read: return buffer contents or zero.
+    fn is_viewer_read(&self, addr: u32) -> u32 {
+        match addr {
+            0x13FF_0004 => 0x4953_5664, // Magic "ISVd" — indicates ISViewer present
+            _ => 0,
+        }
+    }
+
+    /// ISViewer write: buffer stores or length-trigger flush.
+    fn is_viewer_write(&mut self, addr: u32, val: u32) {
+        match addr {
+            // Write to buffer region (byte-by-byte via write_u8 → write_u32)
+            0x13FF_0020..=0x13FF_021F => {
+                let offset = (addr - 0x13FF_0020) as usize;
+                let bytes = val.to_be_bytes();
+                for (i, &b) in bytes.iter().enumerate() {
+                    if offset + i < 512 {
+                        self.is_viewer_buf[offset + i] = b;
+                    }
+                }
+            }
+            // Length trigger: flush buffer contents to stdout
+            0x13FF_0014 => {
+                let len = (val as usize).min(512);
+                if len > 0 {
+                    let text = &self.is_viewer_buf[..len];
+                    if let Ok(s) = std::str::from_utf8(text) {
+                        print!("{}", s);
+                    }
+                    self.is_viewer_buf[..len].fill(0);
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -89,6 +151,8 @@ impl Bus for Interconnect {
             0x0460_0000..=0x046F_FFFF => self.pi.read_u32(addr),
             0x0470_0000..=0x047F_FFFF => self.ri.read_u32(addr),
             0x0480_0000..=0x048F_FFFF => self.si.read_u32(addr),
+            // ISViewer debug port (must be checked before cart range)
+            0x13FF_0000..=0x13FF_0FFF => self.is_viewer_read(addr),
             0x1000_0000..=0x1FBF_FFFF => self.cart.read_u32(addr),
             0x1FC0_0000..=0x1FC0_07BF => self.pif.read_boot_rom_u32(addr),
             0x1FC0_07C0..=0x1FC0_07FF => self.pif.read_ram_u32(addr),
@@ -127,7 +191,7 @@ impl Bus for Interconnect {
             0x03F0_0000..=0x03FF_FFFF => {} // RDRAM registers (stubbed)
             0x0400_0000..=0x0400_0FFF => self.rsp.write_dmem_u32(addr & 0xFFF, val),
             0x0400_1000..=0x0400_1FFF => self.rsp.write_imem_u32(addr & 0xFFF, val),
-            0x0404_0000..=0x040F_FFFF => self.rsp.write_reg_u32(addr, val),
+            0x0404_0000..=0x040F_FFFF => self.rsp.write_reg_u32(addr, val, &mut self.mi),
             0x0410_0000..=0x041F_FFFF => self.rdp.write_reg_u32(addr, val),
             0x0430_0000..=0x043F_FFFF => self.mi.write_u32(addr, val),
             0x0440_0000..=0x044F_FFFF => self.vi.write_u32(addr, val, &mut self.mi),
@@ -139,7 +203,22 @@ impl Bus for Interconnect {
                 }
             }
             0x0470_0000..=0x047F_FFFF => self.ri.write_u32(addr, val),
-            0x0480_0000..=0x048F_FFFF => self.si.write_u32(addr, val),
+            0x0480_0000..=0x048F_FFFF => {
+                use crate::rcp::si::SiDmaRequest;
+                let req = self.si.write_u32(addr, val);
+                match req {
+                    SiDmaRequest::Read => self.si_dma_read(),
+                    SiDmaRequest::Write => self.si_dma_write(),
+                    SiDmaRequest::None => {
+                        // SI_STATUS write — clear SI interrupt
+                        if addr & 0x0F_FFFF == 0x18 {
+                            self.mi.clear_interrupt(crate::rcp::mi::MiInterrupt::SI);
+                        }
+                    }
+                }
+            }
+            // ISViewer debug port (must be checked before cart range)
+            0x13FF_0000..=0x13FF_0FFF => self.is_viewer_write(addr, val),
             0x1FC0_07C0..=0x1FC0_07FF => self.pif.write_ram_u32(addr, val),
             _ => {
                 log::warn!("Unhandled bus write32: {:#010X} = {:#010X}", addr, val);

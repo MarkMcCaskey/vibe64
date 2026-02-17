@@ -291,7 +291,11 @@ impl Vr4300 {
     }
 
     fn op_sra(&mut self, instr: Instruction) {
-        let result = (self.gpr[instr.rt()] as i32) >> instr.sa();
+        // Shift the full 64-bit value, then truncate to 32 bits.
+        // On real hardware, bits [31+sa : sa] of the 64-bit register
+        // become the 32-bit result (bit 32 can "fall into" the window).
+        let shifted = self.gpr[instr.rt()] >> instr.sa();
+        let result = shifted as i32;
         self.gpr[instr.rd()] = result as i64 as u64;
     }
 
@@ -309,7 +313,8 @@ impl Vr4300 {
 
     fn op_srav(&mut self, instr: Instruction) {
         let shift = self.gpr[instr.rs()] & 0x1F;
-        let result = (self.gpr[instr.rt()] as i32) >> shift;
+        let shifted = self.gpr[instr.rt()] >> shift;
+        let result = shifted as i32;
         self.gpr[instr.rd()] = result as i64 as u64;
     }
 

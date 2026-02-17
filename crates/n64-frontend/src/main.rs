@@ -41,6 +41,7 @@ impl ApplicationHandler for App {
 
         self.window = Some(window);
         self.pixels = Some(pixels);
+        window.request_redraw();
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -129,16 +130,17 @@ fn main() {
 
     let args: Vec<String> = std::env::args().collect();
     let use_tui = args.iter().any(|a| a == "--tui");
+    let use_test = args.iter().any(|a| a == "--test");
     let rom_path = args.iter()
         .skip(1)
         .find(|a| !a.starts_with("--"))
         .map(PathBuf::from)
         .unwrap_or_else(|| {
-            eprintln!("Usage: n64-frontend [--tui] <rom_path>");
+            eprintln!("Usage: n64-frontend [--tui|--test] <rom_path>");
             std::process::exit(1);
         });
 
-    let n64 = match n64_core::N64::new(&rom_path) {
+    let mut n64 = match n64_core::N64::new(&rom_path) {
         Ok(n64) => n64,
         Err(e) => {
             eprintln!("Failed to load ROM: {}", e);
@@ -146,7 +148,19 @@ fn main() {
         }
     };
 
-    if use_tui {
+    if use_test {
+        // Test mode: run until r30 is set (5M cycles max)
+        let result = n64.run_until_r30(5_000_000);
+        if result == 0 {
+            eprintln!("TIMEOUT: r30 never set (tests didn't finish)");
+            std::process::exit(2);
+        } else if result == 0xFFFF_FFFF_FFFF_FFFF {
+            println!("PASS");
+        } else {
+            eprintln!("FAIL: test #{}", result);
+            std::process::exit(1);
+        }
+    } else if use_tui {
         tui::run(n64);
     } else {
         let event_loop = EventLoop::new().expect("create event loop");

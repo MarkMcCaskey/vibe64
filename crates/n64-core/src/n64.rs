@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use crate::bus::map::Interconnect;
+use crate::bus::Bus;
 use crate::cart::{self, Cartridge};
 use crate::cpu::Vr4300;
 use crate::jit::{ExecutionEngine, Interpreter};
@@ -105,5 +106,32 @@ impl N64 {
             // Tick the VI (scanline timing → VI interrupt)
             self.bus.vi.tick(elapsed, &mut self.bus.mi);
         }
+    }
+
+    /// Run until r30 becomes non-zero or max_cycles is reached.
+    /// Returns r30 value (0 = timeout, -1 = pass, >0 = failed test number).
+    pub fn run_until_r30(&mut self, max_cycles: u64) -> u64 {
+        let end = self.cycles + max_cycles;
+        while self.cycles < end {
+            let elapsed = self.engine.execute(&mut self.cpu, &mut self.bus);
+            self.cycles += elapsed;
+            self.bus.vi.tick(elapsed, &mut self.bus.mi);
+
+            if self.cpu.gpr[30] != 0 {
+                // Dump CPU state on failure for debugging
+                if self.cpu.gpr[30] != 0xFFFF_FFFF_FFFF_FFFF {
+                    eprintln!("  r3(actual)  = {:#018X}", self.cpu.gpr[3]);
+                    eprintln!("  r4(expected)= {:#018X}", self.cpu.gpr[4]);
+                    eprintln!("  r8(sa)      = {:#018X}", self.cpu.gpr[8]);
+                    // r6 = regargpointer, dereference to get input
+                    let ptr = self.cpu.translate_address(self.cpu.gpr[6]);
+                    let input_hi = self.bus.read_u32(ptr) as u64;
+                    let input_lo = self.bus.read_u32(ptr + 4) as u64;
+                    eprintln!("  input       = {:#018X}", (input_hi << 32) | input_lo);
+                }
+                return self.cpu.gpr[30];
+            }
+        }
+        0 // timeout
     }
 }
