@@ -1,0 +1,9 @@
+[package]
+name = "n64-frontend"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+n64-core = { path = "../n64-core" }
+env_logger = "0.11"
+log = "0.4"
