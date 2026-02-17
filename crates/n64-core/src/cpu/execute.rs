@@ -1,5 +1,6 @@
 use crate::bus::Bus;
 use crate::cpu::cop0::Cop0;
+use crate::cpu::exceptions::ExceptionCode;
 use crate::cpu::instruction::Instruction;
 use crate::cpu::vr4300::Vr4300;
 
@@ -10,7 +11,7 @@ impl Vr4300 {
     /// advancement), needed for branch target calculations.
     pub fn execute(&mut self, instr: Instruction, bus: &mut impl Bus, current_pc: u64) {
         match instr.opcode() {
-            0x00 => self.execute_special(instr, bus),
+            0x00 => self.execute_special(instr, bus, current_pc),
             0x01 => self.execute_regimm(instr, current_pc),
             0x02 => self.op_j(instr, current_pc),
             0x03 => self.op_jal(instr, current_pc),
@@ -26,22 +27,31 @@ impl Vr4300 {
             0x0D => self.op_ori(instr),
             0x0E => self.op_xori(instr),
             0x0F => self.op_lui(instr),
-            0x10 => self.execute_cop0(instr, bus),
+            0x10 => self.execute_cop0(instr, bus, current_pc),
             0x11 => self.execute_cop1(instr, bus, current_pc),
             0x14 => self.op_beql(instr, current_pc),
             0x15 => self.op_bnel(instr, current_pc),
             0x16 => self.op_blezl(instr, current_pc),
             0x17 => self.op_bgtzl(instr, current_pc),
+            0x18 => self.op_daddiu(instr), // DADDI (TODO: trap on overflow)
             0x19 => self.op_daddiu(instr),
+            0x1A => self.op_ldl(instr, bus),
+            0x1B => self.op_ldr(instr, bus),
             0x20 => self.op_lb(instr, bus),
             0x21 => self.op_lh(instr, bus),
+            0x22 => self.op_lwl(instr, bus),
             0x23 => self.op_lw(instr, bus),
             0x24 => self.op_lbu(instr, bus),
             0x25 => self.op_lhu(instr, bus),
+            0x26 => self.op_lwr(instr, bus),
             0x27 => self.op_lwu(instr, bus),
             0x28 => self.op_sb(instr, bus),
             0x29 => self.op_sh(instr, bus),
+            0x2A => self.op_swl(instr, bus),
             0x2B => self.op_sw(instr, bus),
+            0x2C => self.op_sdl(instr, bus),
+            0x2D => self.op_sdr(instr, bus),
+            0x2E => self.op_swr(instr, bus),
             0x2F => self.op_cache(instr),
             0x30 => self.op_ll(instr, bus),
             0x31 => self.op_lwc1(instr, bus),
@@ -51,14 +61,14 @@ impl Vr4300 {
             0x39 => self.op_swc1(instr, bus),
             0x3D => self.op_sdc1(instr, bus),
             0x3F => self.op_sd(instr, bus),
-            _ => log::warn!(
-                "Unimplemented opcode {:#04X} at PC={:#018X} (raw={:#010X})",
-                instr.opcode(), current_pc, instr.raw()
+            _ => self.unimpl(
+                format!("opcode={:#04X}", instr.opcode()),
+                current_pc, instr.raw(),
             ),
         }
     }
 
-    fn execute_special(&mut self, instr: Instruction, _bus: &mut impl Bus) {
+    fn execute_special(&mut self, instr: Instruction, _bus: &mut impl Bus, current_pc: u64) {
         match instr.funct() {
             0x00 => self.op_sll(instr),
             0x02 => self.op_srl(instr),
@@ -68,7 +78,28 @@ impl Vr4300 {
             0x07 => self.op_srav(instr),
             0x08 => self.op_jr(instr),
             0x09 => self.op_jalr(instr),
-            0x0D => {} // BREAK — stub
+            0x0C => {
+                // SYSCALL: EPC must point to the SYSCALL instruction itself
+                self.pc = current_pc;
+                self.next_pc = current_pc.wrapping_add(4);
+                self.take_exception(crate::cpu::exceptions::ExceptionCode::Syscall);
+            }
+            0x0D => {
+                // BREAK: EPC must point to the BREAK instruction itself
+                self.pc = current_pc;
+                self.next_pc = current_pc.wrapping_add(4);
+                self.take_exception(crate::cpu::exceptions::ExceptionCode::Breakpoint);
+            }
+            0x0A => { // MOVZ: if rt == 0, rd = rs
+                if self.gpr[instr.rt()] == 0 {
+                    self.gpr[instr.rd()] = self.gpr[instr.rs()];
+                }
+            }
+            0x0B => { // MOVN: if rt != 0, rd = rs
+                if self.gpr[instr.rt()] != 0 {
+                    self.gpr[instr.rd()] = self.gpr[instr.rs()];
+                }
+            }
             0x0F => {} // SYNC — pipeline barrier, no-op for interpreter
             0x10 => self.op_mfhi(instr),
             0x11 => self.op_mthi(instr),
@@ -97,14 +128,62 @@ impl Vr4300 {
             0x2B => self.op_sltu(instr),
             0x2C => self.op_dadd(instr),
             0x2D => self.op_daddu(instr),
+            0x2E => { // DSUB (TODO: trap on overflow)
+                self.gpr[instr.rd()] = self.gpr[instr.rs()].wrapping_sub(self.gpr[instr.rt()]);
+            }
             0x2F => self.op_dsubu(instr),
+            0x30 => { // TGE: trap if rs >= rt (signed)
+                if (self.gpr[instr.rs()] as i64) >= (self.gpr[instr.rt()] as i64) {
+                    self.pc = current_pc;
+                    self.next_pc = current_pc.wrapping_add(4);
+                    self.take_exception(crate::cpu::exceptions::ExceptionCode::Trap);
+                }
+            }
+            0x31 => { // TGEU: trap if rs >= rt (unsigned)
+                if self.gpr[instr.rs()] >= self.gpr[instr.rt()] {
+                    self.pc = current_pc;
+                    self.next_pc = current_pc.wrapping_add(4);
+                    self.take_exception(crate::cpu::exceptions::ExceptionCode::Trap);
+                }
+            }
+            0x32 => { // TLT: trap if rs < rt (signed)
+                if (self.gpr[instr.rs()] as i64) < (self.gpr[instr.rt()] as i64) {
+                    self.pc = current_pc;
+                    self.next_pc = current_pc.wrapping_add(4);
+                    self.take_exception(crate::cpu::exceptions::ExceptionCode::Trap);
+                }
+            }
+            0x33 => { // TLTU: trap if rs < rt (unsigned)
+                if self.gpr[instr.rs()] < self.gpr[instr.rt()] {
+                    self.pc = current_pc;
+                    self.next_pc = current_pc.wrapping_add(4);
+                    self.take_exception(crate::cpu::exceptions::ExceptionCode::Trap);
+                }
+            }
+            0x34 => { // TEQ: trap if rs == rt
+                if self.gpr[instr.rs()] == self.gpr[instr.rt()] {
+                    self.pc = current_pc;
+                    self.next_pc = current_pc.wrapping_add(4);
+                    self.take_exception(crate::cpu::exceptions::ExceptionCode::Trap);
+                }
+            }
+            0x36 => { // TNE: trap if rs != rt
+                if self.gpr[instr.rs()] != self.gpr[instr.rt()] {
+                    self.pc = current_pc;
+                    self.next_pc = current_pc.wrapping_add(4);
+                    self.take_exception(crate::cpu::exceptions::ExceptionCode::Trap);
+                }
+            }
             0x38 => self.op_dsll(instr),
             0x3A => self.op_dsrl(instr),
             0x3B => self.op_dsra(instr),
             0x3C => self.op_dsll32(instr),
             0x3E => self.op_dsrl32(instr),
             0x3F => self.op_dsra32(instr),
-            _ => log::warn!("Unimplemented SPECIAL funct={:#04X}", instr.funct()),
+            _ => self.unimpl(
+                format!("SPECIAL funct={:#04X}", instr.funct()),
+                current_pc, instr.raw(),
+            ),
         }
     }
 
@@ -114,19 +193,71 @@ impl Vr4300 {
             0x01 => self.op_bgez(instr, current_pc),
             0x02 => self.op_bltzl(instr, current_pc),
             0x03 => self.op_bgezl(instr, current_pc),
+            0x08 => { // TGEI: trap if rs >= sign_ext(imm)
+                if (self.gpr[instr.rs()] as i64) >= (instr.imm() as i16 as i64) {
+                    self.pc = current_pc;
+                    self.next_pc = current_pc.wrapping_add(4);
+                    self.take_exception(crate::cpu::exceptions::ExceptionCode::Trap);
+                }
+            }
+            0x09 => { // TGEIU
+                if self.gpr[instr.rs()] >= instr.imm_sign_ext() {
+                    self.pc = current_pc;
+                    self.next_pc = current_pc.wrapping_add(4);
+                    self.take_exception(crate::cpu::exceptions::ExceptionCode::Trap);
+                }
+            }
+            0x0A => { // TLTI
+                if (self.gpr[instr.rs()] as i64) < (instr.imm() as i16 as i64) {
+                    self.pc = current_pc;
+                    self.next_pc = current_pc.wrapping_add(4);
+                    self.take_exception(crate::cpu::exceptions::ExceptionCode::Trap);
+                }
+            }
+            0x0B => { // TLTIU
+                if self.gpr[instr.rs()] < instr.imm_sign_ext() {
+                    self.pc = current_pc;
+                    self.next_pc = current_pc.wrapping_add(4);
+                    self.take_exception(crate::cpu::exceptions::ExceptionCode::Trap);
+                }
+            }
+            0x0C => { // TEQI
+                if self.gpr[instr.rs()] == instr.imm_sign_ext() {
+                    self.pc = current_pc;
+                    self.next_pc = current_pc.wrapping_add(4);
+                    self.take_exception(crate::cpu::exceptions::ExceptionCode::Trap);
+                }
+            }
+            0x0E => { // TNEI
+                if self.gpr[instr.rs()] != instr.imm_sign_ext() {
+                    self.pc = current_pc;
+                    self.next_pc = current_pc.wrapping_add(4);
+                    self.take_exception(crate::cpu::exceptions::ExceptionCode::Trap);
+                }
+            }
             0x10 => self.op_bltzal(instr, current_pc),
             0x11 => self.op_bgezal(instr, current_pc),
-            _ => log::warn!("Unimplemented REGIMM rt={:#04X}", instr.rt()),
+            _ => self.unimpl(
+                format!("REGIMM rt={:#04X}", instr.rt()),
+                current_pc, instr.raw(),
+            ),
         }
     }
 
-    fn execute_cop0(&mut self, instr: Instruction, _bus: &mut impl Bus) {
+    fn execute_cop0(&mut self, instr: Instruction, _bus: &mut impl Bus, current_pc: u64) {
         match instr.rs() {
-            0x00 => { // MFC0: rt = cop0[rd]
+            0x00 => { // MFC0: rt = cop0[rd] (sign-extended 32-bit)
                 let val = self.cop0.read_reg(instr.rd()) as i32 as u64;
                 self.gpr[instr.rt()] = val;
             }
+            0x01 => { // DMFC0: rt = cop0[rd] (full 64-bit)
+                self.gpr[instr.rt()] = self.cop0.read_reg(instr.rd());
+            }
             0x04 => { // MTC0: cop0[rd] = rt
+                let val = self.gpr[instr.rt()];
+                self.cop0.write_reg(instr.rd(), val);
+            }
+            0x05 => { // DMTC0: cop0[rd] = rt (full 64-bit)
                 let val = self.gpr[instr.rt()];
                 self.cop0.write_reg(instr.rd(), val);
             }
@@ -138,10 +269,16 @@ impl Vr4300 {
                     0x06 => self.op_tlbwr(),
                     0x08 => self.op_tlbp(),
                     0x18 => self.op_eret(),
-                    _ => log::warn!("Unimplemented COP0 CO funct={:#04X}", instr.funct()),
+                    _ => self.unimpl(
+                        format!("COP0 CO funct={:#04X}", instr.funct()),
+                        current_pc, instr.raw(),
+                    ),
                 }
             }
-            _ => log::warn!("Unimplemented COP0 rs={:#04X}", instr.rs()),
+            _ => self.unimpl(
+                format!("COP0 rs={:#04X}", instr.rs()),
+                current_pc, instr.raw(),
+            ),
         }
     }
 
@@ -159,12 +296,14 @@ impl Vr4300 {
         if condition {
             self.next_pc = self.branch_target(instr, current_pc);
         }
+        self.in_delay_slot = true;
     }
 
     /// "Likely" branch: if NOT taken, nullify the delay slot.
     fn branch_likely(&mut self, condition: bool, instr: Instruction, current_pc: u64) {
         if condition {
             self.next_pc = self.branch_target(instr, current_pc);
+            self.in_delay_slot = true;
         } else {
             // Skip the delay slot by advancing PC past it
             self.pc = self.next_pc;
@@ -508,85 +647,229 @@ impl Vr4300 {
 
     fn op_j(&mut self, instr: Instruction, pc: u64) {
         self.next_pc = (pc & 0xFFFF_FFFF_F000_0000) | ((instr.target() as u64) << 2);
+        self.in_delay_slot = true;
     }
 
     fn op_jal(&mut self, instr: Instruction, pc: u64) {
         self.gpr[31] = pc.wrapping_add(8); // return address (skip delay slot)
         self.next_pc = (pc & 0xFFFF_FFFF_F000_0000) | ((instr.target() as u64) << 2);
+        self.in_delay_slot = true;
     }
 
     fn op_jr(&mut self, instr: Instruction) {
         self.next_pc = self.gpr[instr.rs()];
+        self.in_delay_slot = true;
     }
 
     fn op_jalr(&mut self, instr: Instruction) {
         let return_addr = self.pc; // already advanced past delay slot
         self.next_pc = self.gpr[instr.rs()];
         self.gpr[instr.rd()] = return_addr;
+        self.in_delay_slot = true;
+    }
+
+    // ─── Memory address translation for loads/stores ───────────
+
+    /// Compute and translate a load address. Returns None on TLB miss
+    /// (sets tlb_miss flag so step() can take the exception).
+    fn load_addr(&mut self, instr: Instruction) -> Option<u32> {
+        let vaddr = self.gpr[instr.rs()].wrapping_add(instr.imm_sign_ext());
+        match self.try_translate(vaddr) {
+            Some(paddr) => Some(paddr),
+            None => {
+                if self.tlb_miss.is_none() {
+                    self.tlb_miss = Some((vaddr, ExceptionCode::TlbLoad));
+                }
+                None
+            }
+        }
+    }
+
+    /// Compute and translate a store address. Returns None on TLB miss.
+    fn store_addr(&mut self, instr: Instruction) -> Option<u32> {
+        let vaddr = self.gpr[instr.rs()].wrapping_add(instr.imm_sign_ext());
+        match self.try_translate(vaddr) {
+            Some(paddr) => Some(paddr),
+            None => {
+                if self.tlb_miss.is_none() {
+                    self.tlb_miss = Some((vaddr, ExceptionCode::TlbStore));
+                }
+                None
+            }
+        }
     }
 
     // ─── Loads ──────────────────────────────────────────────────
 
-    fn load_addr(&self, instr: Instruction) -> u32 {
-        let vaddr = self.gpr[instr.rs()].wrapping_add(instr.imm_sign_ext());
-        self.translate_address(vaddr)
-    }
-
     fn op_lb(&mut self, instr: Instruction, bus: &impl Bus) {
-        let addr = self.load_addr(instr);
+        let Some(addr) = self.load_addr(instr) else { return };
         self.gpr[instr.rt()] = bus.read_u8(addr) as i8 as i64 as u64;
     }
 
     fn op_lbu(&mut self, instr: Instruction, bus: &impl Bus) {
-        let addr = self.load_addr(instr);
+        let Some(addr) = self.load_addr(instr) else { return };
         self.gpr[instr.rt()] = bus.read_u8(addr) as u64;
     }
 
     fn op_lh(&mut self, instr: Instruction, bus: &impl Bus) {
-        let addr = self.load_addr(instr);
+        let Some(addr) = self.load_addr(instr) else { return };
         self.gpr[instr.rt()] = bus.read_u16(addr) as i16 as i64 as u64;
     }
 
     fn op_lhu(&mut self, instr: Instruction, bus: &impl Bus) {
-        let addr = self.load_addr(instr);
+        let Some(addr) = self.load_addr(instr) else { return };
         self.gpr[instr.rt()] = bus.read_u16(addr) as u64;
     }
 
     fn op_lw(&mut self, instr: Instruction, bus: &impl Bus) {
-        let addr = self.load_addr(instr);
+        let Some(addr) = self.load_addr(instr) else { return };
         self.gpr[instr.rt()] = bus.read_u32(addr) as i32 as i64 as u64;
     }
 
     fn op_lwu(&mut self, instr: Instruction, bus: &impl Bus) {
-        let addr = self.load_addr(instr);
+        let Some(addr) = self.load_addr(instr) else { return };
         self.gpr[instr.rt()] = bus.read_u32(addr) as u64;
     }
 
     fn op_ld(&mut self, instr: Instruction, bus: &impl Bus) {
-        let addr = self.load_addr(instr);
+        let Some(addr) = self.load_addr(instr) else { return };
         self.gpr[instr.rt()] = bus.read_u64(addr);
     }
 
     // ─── Stores ─────────────────────────────────────────────────
 
     fn op_sb(&mut self, instr: Instruction, bus: &mut impl Bus) {
-        let addr = self.load_addr(instr);
+        let Some(addr) = self.store_addr(instr) else { return };
         bus.write_u8(addr, self.gpr[instr.rt()] as u8);
     }
 
     fn op_sh(&mut self, instr: Instruction, bus: &mut impl Bus) {
-        let addr = self.load_addr(instr);
+        let Some(addr) = self.store_addr(instr) else { return };
         bus.write_u16(addr, self.gpr[instr.rt()] as u16);
     }
 
     fn op_sw(&mut self, instr: Instruction, bus: &mut impl Bus) {
-        let addr = self.load_addr(instr);
+        let Some(addr) = self.store_addr(instr) else { return };
         bus.write_u32(addr, self.gpr[instr.rt()] as u32);
     }
 
     fn op_sd(&mut self, instr: Instruction, bus: &mut impl Bus) {
-        let addr = self.load_addr(instr);
+        let Some(addr) = self.store_addr(instr) else { return };
         bus.write_u64(addr, self.gpr[instr.rt()]);
+    }
+
+    // ─── Unaligned loads/stores (big-endian) ────────────────────
+
+    fn op_lwl(&mut self, instr: Instruction, bus: &impl Bus) {
+        let Some(addr) = self.load_addr(instr) else { return };
+        let word = bus.read_u32(addr & !3);
+        let old = self.gpr[instr.rt()] as u32;
+        let result = match addr & 3 {
+            0 => word,
+            1 => (word << 8) | (old & 0x0000_00FF),
+            2 => (word << 16) | (old & 0x0000_FFFF),
+            3 => (word << 24) | (old & 0x00FF_FFFF),
+            _ => unreachable!(),
+        };
+        self.gpr[instr.rt()] = result as i32 as i64 as u64;
+    }
+
+    fn op_lwr(&mut self, instr: Instruction, bus: &impl Bus) {
+        let Some(addr) = self.load_addr(instr) else { return };
+        let word = bus.read_u32(addr & !3);
+        let old = self.gpr[instr.rt()] as u32;
+        let result = match addr & 3 {
+            0 => (old & 0xFFFF_FF00) | (word >> 24),
+            1 => (old & 0xFFFF_0000) | (word >> 16),
+            2 => (old & 0xFF00_0000) | (word >> 8),
+            3 => word,
+            _ => unreachable!(),
+        };
+        self.gpr[instr.rt()] = result as i32 as i64 as u64;
+    }
+
+    fn op_swl(&mut self, instr: Instruction, bus: &mut impl Bus) {
+        let Some(addr) = self.store_addr(instr) else { return };
+        let aligned = addr & !3;
+        let old = bus.read_u32(aligned);
+        let rt = self.gpr[instr.rt()] as u32;
+        let new_word = match addr & 3 {
+            0 => rt,
+            1 => (old & 0xFF00_0000) | (rt >> 8),
+            2 => (old & 0xFFFF_0000) | (rt >> 16),
+            3 => (old & 0xFFFF_FF00) | (rt >> 24),
+            _ => unreachable!(),
+        };
+        bus.write_u32(aligned, new_word);
+    }
+
+    fn op_swr(&mut self, instr: Instruction, bus: &mut impl Bus) {
+        let Some(addr) = self.store_addr(instr) else { return };
+        let aligned = addr & !3;
+        let old = bus.read_u32(aligned);
+        let rt = self.gpr[instr.rt()] as u32;
+        let new_word = match addr & 3 {
+            0 => (rt << 24) | (old & 0x00FF_FFFF),
+            1 => (rt << 16) | (old & 0x0000_FFFF),
+            2 => (rt << 8) | (old & 0x0000_00FF),
+            3 => rt,
+            _ => unreachable!(),
+        };
+        bus.write_u32(aligned, new_word);
+    }
+
+    fn op_ldl(&mut self, instr: Instruction, bus: &impl Bus) {
+        let Some(addr) = self.load_addr(instr) else { return };
+        let dword = bus.read_u64(addr & !7);
+        let old = self.gpr[instr.rt()];
+        let shift = (addr & 7) * 8;
+        let result = if shift == 0 {
+            dword
+        } else {
+            (dword << shift) | (old & ((1u64 << shift) - 1))
+        };
+        self.gpr[instr.rt()] = result;
+    }
+
+    fn op_ldr(&mut self, instr: Instruction, bus: &impl Bus) {
+        let Some(addr) = self.load_addr(instr) else { return };
+        let dword = bus.read_u64(addr & !7);
+        let old = self.gpr[instr.rt()];
+        let shift = (7 - (addr & 7)) * 8;
+        let result = if shift == 0 {
+            dword
+        } else {
+            (dword >> shift) | (old & !((1u64 << (64 - shift)) - 1))
+        };
+        self.gpr[instr.rt()] = result;
+    }
+
+    fn op_sdl(&mut self, instr: Instruction, bus: &mut impl Bus) {
+        let Some(addr) = self.store_addr(instr) else { return };
+        let aligned = addr & !7;
+        let old = bus.read_u64(aligned);
+        let rt = self.gpr[instr.rt()];
+        let shift = (addr & 7) * 8;
+        let result = if shift == 0 {
+            rt
+        } else {
+            (rt >> shift) | (old & !((1u64 << (64 - shift)) - 1))
+        };
+        bus.write_u64(aligned, result);
+    }
+
+    fn op_sdr(&mut self, instr: Instruction, bus: &mut impl Bus) {
+        let Some(addr) = self.store_addr(instr) else { return };
+        let aligned = addr & !7;
+        let old = bus.read_u64(aligned);
+        let rt = self.gpr[instr.rt()];
+        let shift = (7 - (addr & 7)) * 8;
+        let result = if shift == 0 {
+            rt
+        } else {
+            (rt << shift) | (old & ((1u64 << shift) - 1))
+        };
+        bus.write_u64(aligned, result);
     }
 
     // ─── Special ────────────────────────────────────────────────
@@ -627,6 +910,9 @@ impl Vr4300 {
         self.tlb.entries[index].entry_hi = self.cop0.regs[Cop0::ENTRY_HI];
         self.tlb.entries[index].entry_lo0 = self.cop0.regs[Cop0::ENTRY_LO0];
         self.tlb.entries[index].entry_lo1 = self.cop0.regs[Cop0::ENTRY_LO1];
+        log::debug!("TLBWI [{}]: hi={:#018X} lo0={:#018X} lo1={:#018X} mask={:#010X}",
+            index, self.cop0.regs[Cop0::ENTRY_HI], self.cop0.regs[Cop0::ENTRY_LO0],
+            self.cop0.regs[Cop0::ENTRY_LO1], self.cop0.regs[Cop0::PAGE_MASK]);
     }
 
     /// TLBWR: Write COP0 registers into TLB entry at Random
@@ -638,6 +924,9 @@ impl Vr4300 {
         self.tlb.entries[index].entry_hi = self.cop0.regs[Cop0::ENTRY_HI];
         self.tlb.entries[index].entry_lo0 = self.cop0.regs[Cop0::ENTRY_LO0];
         self.tlb.entries[index].entry_lo1 = self.cop0.regs[Cop0::ENTRY_LO1];
+        log::debug!("TLBWR [{}]: hi={:#018X} lo0={:#018X} lo1={:#018X} mask={:#010X}",
+            index, self.cop0.regs[Cop0::ENTRY_HI], self.cop0.regs[Cop0::ENTRY_LO0],
+            self.cop0.regs[Cop0::ENTRY_LO1], self.cop0.regs[Cop0::PAGE_MASK]);
     }
 
     /// TLBP: Probe TLB for matching entry, write index to Index register
@@ -667,14 +956,14 @@ impl Vr4300 {
     // ─── Load Linked / Store Conditional ────────────────────────
 
     fn op_ll(&mut self, instr: Instruction, bus: &impl Bus) {
-        let addr = self.load_addr(instr);
+        let Some(addr) = self.load_addr(instr) else { return };
         self.gpr[instr.rt()] = bus.read_u32(addr) as i32 as i64 as u64;
         self.ll_bit = true;
     }
 
     fn op_sc(&mut self, instr: Instruction, bus: &mut impl Bus) {
         if self.ll_bit {
-            let addr = self.load_addr(instr);
+            let Some(addr) = self.store_addr(instr) else { return };
             bus.write_u32(addr, self.gpr[instr.rt()] as u32);
             self.gpr[instr.rt()] = 1; // success
         } else {
@@ -686,23 +975,23 @@ impl Vr4300 {
     // ─── COP1 (FPU) Load/Store ──────────────────────────────────
 
     fn op_lwc1(&mut self, instr: Instruction, bus: &impl Bus) {
-        let addr = self.load_addr(instr);
+        let Some(addr) = self.load_addr(instr) else { return };
         let val = bus.read_u32(addr);
         self.cop1.fpr[instr.rt()] = val as u64;
     }
 
     fn op_swc1(&mut self, instr: Instruction, bus: &mut impl Bus) {
-        let addr = self.load_addr(instr);
+        let Some(addr) = self.store_addr(instr) else { return };
         bus.write_u32(addr, self.cop1.fpr[instr.rt()] as u32);
     }
 
     fn op_ldc1(&mut self, instr: Instruction, bus: &impl Bus) {
-        let addr = self.load_addr(instr);
+        let Some(addr) = self.load_addr(instr) else { return };
         self.cop1.fpr[instr.rt()] = bus.read_u64(addr);
     }
 
     fn op_sdc1(&mut self, instr: Instruction, bus: &mut impl Bus) {
-        let addr = self.load_addr(instr);
+        let Some(addr) = self.store_addr(instr) else { return };
         bus.write_u64(addr, self.cop1.fpr[instr.rt()]);
     }
 
@@ -751,13 +1040,16 @@ impl Vr4300 {
             0x11 => self.cop1_double(instr, current_pc),
             0x14 => self.cop1_w(instr, current_pc),
             0x15 => self.cop1_l(instr, current_pc),
-            _ => log::warn!("Unimplemented COP1 rs/fmt={:#04X}", fmt),
+            _ => self.unimpl(
+                format!("COP1 rs/fmt={:#04X}", fmt),
+                current_pc, instr.raw(),
+            ),
         }
     }
 
     // ─── COP1 Single-Precision (fmt=0x10) ────────────────────────
 
-    fn cop1_single(&mut self, instr: Instruction, _current_pc: u64) {
+    fn cop1_single(&mut self, instr: Instruction, current_pc: u64) {
         let fs = instr.rd();
         let ft = instr.rt();
         let fd = instr.sa();
@@ -825,13 +1117,16 @@ impl Vr4300 {
                 self.cop1.fpr[fd] = (self.cop1.read_f32(fs).round_ties_even() as i64) as u64;
             }
             0x30..=0x3F => self.cop1_compare_s(instr),
-            _ => log::warn!("Unimplemented COP1.S funct={:#04X}", instr.funct()),
+            _ => self.unimpl(
+                format!("COP1.S funct={:#04X}", instr.funct()),
+                current_pc, instr.raw(),
+            ),
         }
     }
 
     // ─── COP1 Double-Precision (fmt=0x11) ────────────────────────
 
-    fn cop1_double(&mut self, instr: Instruction, _current_pc: u64) {
+    fn cop1_double(&mut self, instr: Instruction, current_pc: u64) {
         let fs = instr.rd();
         let ft = instr.rt();
         let fd = instr.sa();
@@ -899,13 +1194,16 @@ impl Vr4300 {
                 self.cop1.fpr[fd] = (self.cop1.read_f64(fs).round_ties_even() as i64) as u64;
             }
             0x30..=0x3F => self.cop1_compare_d(instr),
-            _ => log::warn!("Unimplemented COP1.D funct={:#04X}", instr.funct()),
+            _ => self.unimpl(
+                format!("COP1.D funct={:#04X}", instr.funct()),
+                current_pc, instr.raw(),
+            ),
         }
     }
 
     // ─── COP1 Word Integer (fmt=0x14) ───────────────────────────
 
-    fn cop1_w(&mut self, instr: Instruction, _current_pc: u64) {
+    fn cop1_w(&mut self, instr: Instruction, current_pc: u64) {
         let fs = instr.rd();
         let fd = instr.sa();
         let int_val = self.cop1.fpr[fs] as i32;
@@ -917,13 +1215,16 @@ impl Vr4300 {
             0x21 => { // CVT.D.W
                 self.cop1.write_f64(fd, int_val as f64);
             }
-            _ => log::warn!("Unimplemented COP1.W funct={:#04X}", instr.funct()),
+            _ => self.unimpl(
+                format!("COP1.W funct={:#04X}", instr.funct()),
+                current_pc, instr.raw(),
+            ),
         }
     }
 
     // ─── COP1 Long Integer (fmt=0x15) ───────────────────────────
 
-    fn cop1_l(&mut self, instr: Instruction, _current_pc: u64) {
+    fn cop1_l(&mut self, instr: Instruction, current_pc: u64) {
         let fs = instr.rd();
         let fd = instr.sa();
         let int_val = self.cop1.fpr[fs] as i64;
@@ -935,7 +1236,10 @@ impl Vr4300 {
             0x21 => { // CVT.D.L
                 self.cop1.write_f64(fd, int_val as f64);
             }
-            _ => log::warn!("Unimplemented COP1.L funct={:#04X}", instr.funct()),
+            _ => self.unimpl(
+                format!("COP1.L funct={:#04X}", instr.funct()),
+                current_pc, instr.raw(),
+            ),
         }
     }
 

@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use crate::bus::Bus;
 use crate::cpu::cop0::Cop0;
 use crate::cpu::cop1::Cop1;
@@ -42,6 +44,14 @@ pub struct Vr4300 {
 
     /// LLBit for Load Linked / Store Conditional (atomic operations)
     pub ll_bit: bool,
+
+    /// Pending TLB miss from a load/store during instruction execution.
+    /// Checked by step() after execute() to take TLB exception.
+    pub tlb_miss: Option<(u64, ExceptionCode)>,
+
+    /// Track unimplemented opcode hits: key = "CATEGORY:0xNN", value = hit count.
+    /// Logs each unique opcode once on first encounter.
+    pub unimpl_opcodes: HashMap<String, u64>,
 }
 
 impl Vr4300 {
@@ -57,6 +67,8 @@ impl Vr4300 {
             tlb: Tlb::new(),
             in_delay_slot: false,
             ll_bit: false,
+            tlb_miss: None,
+            unimpl_opcodes: HashMap::new(),
         };
 
         // COP0 initial state after cold reset
@@ -79,10 +91,55 @@ impl Vr4300 {
         self.gpr[29] = 0xA400_1FF0; // sp: top of DMEM
     }
 
+    /// Record an unimplemented opcode. Logs once per unique key, then silently counts.
+    pub fn unimpl(&mut self, key: String, pc: u64, raw: u32) {
+        let count = self.unimpl_opcodes.entry(key.clone()).or_insert(0);
+        if *count == 0 {
+            log::error!("UNIMPLEMENTED {} at PC={:#018X} (raw={:#010X})", key, pc, raw);
+        }
+        *count += 1;
+    }
+
+    /// Dump summary of all unimplemented opcodes encountered.
+    pub fn dump_unimpl_summary(&self) {
+        if self.unimpl_opcodes.is_empty() {
+            return;
+        }
+        let mut entries: Vec<_> = self.unimpl_opcodes.iter().collect();
+        entries.sort_by(|a, b| b.1.cmp(a.1));
+        eprintln!("=== Unimplemented opcode summary ===");
+        for (key, count) in &entries {
+            eprintln!("  {:30} hit {} time(s)", key, count);
+        }
+    }
+
     /// Execute one instruction. Returns number of cycles consumed.
     pub fn step(&mut self, bus: &mut impl Bus) -> u64 {
+        // Save and clear delay slot flag. execute() will set it for branches.
+        let was_delay_slot = self.in_delay_slot;
+        self.in_delay_slot = false;
+
         // 1. Translate virtual PC to physical address
-        let phys_addr = self.translate_address(self.pc);
+        let phys_addr = match self.try_translate(self.pc) {
+            Some(addr) => addr,
+            None => {
+                // TLB miss on instruction fetch
+                let faulting_pc = self.pc;
+                let epc = if was_delay_slot {
+                    faulting_pc.wrapping_sub(4) // branch instruction
+                } else {
+                    faulting_pc
+                };
+                self.take_tlb_exception(ExceptionCode::TlbLoad, faulting_pc, epc);
+                if was_delay_slot {
+                    self.cop0.regs[Cop0::CAUSE] |= 1u64 << 31; // BD bit
+                }
+                self.cop0.increment_count();
+                self.cop0.decrement_random();
+                self.cop0.check_timer_interrupt();
+                return 1;
+            }
+        };
 
         // 2. Fetch instruction
         let opcode = bus.read_u32(phys_addr);
@@ -96,25 +153,45 @@ impl Vr4300 {
         // 4. Execute
         self.execute(instr, bus, current_pc);
 
-        // 5. r0 is hardwired to 0 — enforce after every instruction
+        // 5. Check for TLB miss during data access (set by load/store ops)
+        if let Some((bad_vaddr, code)) = self.tlb_miss.take() {
+            let epc = if was_delay_slot {
+                current_pc.wrapping_sub(4) // branch instruction
+            } else {
+                current_pc
+            };
+            self.take_tlb_exception(code, bad_vaddr, epc);
+            if was_delay_slot {
+                self.cop0.regs[Cop0::CAUSE] |= 1u64 << 31; // BD bit
+            }
+            self.gpr[0] = 0;
+            self.cop0.increment_count();
+            self.cop0.decrement_random();
+            self.cop0.check_timer_interrupt();
+            return 1;
+        }
+
+        // 6. r0 is hardwired to 0 — enforce after every instruction
         self.gpr[0] = 0;
 
-        // 6. Increment COP0 Count register (1 per 2 PCycles) and decrement Random
+        // 7. Increment COP0 Count register (1 per 2 PCycles) and decrement Random
         self.cop0.increment_count();
         self.cop0.decrement_random();
 
-        // 7. Check for timer interrupt (Count == Compare)
+        // 8. Check for timer interrupt (Count == Compare)
         self.cop0.check_timer_interrupt();
 
-        // 8. Latch external interrupt line: IP2 reflects MI state each step
+        // 9. Latch external interrupt line: IP2 reflects MI state each step
         if bus.pending_interrupts() {
             self.cop0.set_ip2();
         } else {
             self.cop0.clear_ip2();
         }
 
-        // 9. Take interrupt if conditions are met (IE=1, EXL=0, ERL=0, unmasked IP)
-        if self.cop0.interrupt_pending() {
+        // 10. Take interrupt if conditions are met.
+        //     Skip if a branch was just executed — the delay slot must
+        //     execute first (branch + delay slot are atomic on MIPS).
+        if !self.in_delay_slot && self.cop0.interrupt_pending() {
             self.take_exception(ExceptionCode::Interrupt);
         }
 
@@ -151,30 +228,81 @@ impl Vr4300 {
         self.next_pc = vector.wrapping_add(4);
     }
 
-    /// Translate a 64-bit virtual address to a 32-bit physical address.
-    ///
-    /// MIPS segments:
-    ///   kseg0 (0x8000_0000..0x9FFF_FFFF): direct map, cached
-    ///   kseg1 (0xA000_0000..0xBFFF_FFFF): direct map, uncached
-    ///   kuseg (0x0000_0000..0x7FFF_FFFF): TLB mapped
-    ///   ksseg/kseg2 (0xC000_0000+):       TLB mapped
-    pub fn translate_address(&self, vaddr: u64) -> u32 {
+    /// Try to translate a virtual address. Returns None on TLB miss.
+    /// Used by step() and load/store ops to detect TLB exceptions.
+    pub fn try_translate(&self, vaddr: u64) -> Option<u32> {
         let addr32 = vaddr as u32;
         match addr32 {
-            0x8000_0000..=0x9FFF_FFFF => addr32 - 0x8000_0000, // kseg0: direct, cached
-            0xA000_0000..=0xBFFF_FFFF => addr32 - 0xA000_0000, // kseg1: direct, uncached
+            0x8000_0000..=0x9FFF_FFFF => Some(addr32 - 0x8000_0000),
+            0xA000_0000..=0xBFFF_FFFF => Some(addr32 - 0xA000_0000),
             _ => {
-                // kuseg, ksseg, kseg3 — all TLB mapped
                 let asid = self.cop0.regs[Cop0::ENTRY_HI] as u8;
-                match self.tlb.lookup(vaddr, asid) {
-                    Some(paddr) => paddr,
-                    None => {
-                        // TLB miss — should raise exception, for now fallback
-                        log::trace!("TLB miss for {:#018X}", vaddr);
-                        addr32 & 0x1FFF_FFFF
+                self.tlb.lookup(vaddr, asid).or_else(|| {
+                    // Identity-map kuseg addresses within RDRAM (0-8MB).
+                    // The N64 OS normally sets up a wired TLB entry for this
+                    // during boot (__osTlbInit), but some games (CIC-6105)
+                    // rely on this mapping being present before the game's
+                    // own TLB init runs. Providing it here as a fallback
+                    // avoids the chicken-and-egg problem.
+                    if addr32 < 0x0080_0000 {
+                        Some(addr32)
+                    } else {
+                        None
                     }
-                }
+                })
             }
         }
+    }
+
+    /// Translate a virtual address with fallback for debug/diagnostic use.
+    /// On TLB miss, returns addr & 0x1FFFFFFF instead of None.
+    pub fn translate_address(&self, vaddr: u64) -> u32 {
+        self.try_translate(vaddr).unwrap_or_else(|| vaddr as u32 & 0x1FFF_FFFF)
+    }
+
+    /// Take a TLB exception (Refill or Invalid).
+    ///
+    /// Sets BadVAddr, Context, EntryHi, Cause, EPC, and vectors to
+    /// the appropriate handler. TLB Refill uses vector 0x80000000
+    /// when EXL=0 (most common case), otherwise falls back to 0x80000180.
+    fn take_tlb_exception(&mut self, code: ExceptionCode, bad_vaddr: u64, victim_pc: u64) {
+        // Set TLB-specific COP0 registers
+        self.cop0.regs[Cop0::BAD_VADDR] = bad_vaddr;
+
+        // Context: preserve PTEBase[63:23], set VPN2[22:4], zero [3:0]
+        let vpn2 = (bad_vaddr >> 13) & 0x7_FFFF;
+        let pte_base = self.cop0.regs[Cop0::CONTEXT] & 0xFFFF_FFFF_FF80_0000;
+        self.cop0.regs[Cop0::CONTEXT] = pte_base | (vpn2 << 4);
+
+        // EntryHi: VPN2 from bad_vaddr, preserve current ASID
+        let asid = self.cop0.regs[Cop0::ENTRY_HI] & 0xFF;
+        self.cop0.regs[Cop0::ENTRY_HI] = (bad_vaddr & 0xFFFF_FFFF_FFFF_E000) | asid;
+
+        // Check EXL before setting it — determines exception vector
+        let exl_was_set = (self.cop0.regs[Cop0::STATUS] & 0x02) != 0;
+
+        // Set exception code in Cause[6:2]
+        let cause = self.cop0.regs[Cop0::CAUSE] as u32;
+        let cause = (cause & !0x7C) | ((code as u32) << 2);
+        self.cop0.regs[Cop0::CAUSE] = cause as i32 as i64 as u64;
+
+        // EPC = faulting instruction (only if EXL was clear)
+        if !exl_was_set {
+            self.cop0.regs[Cop0::EPC] = victim_pc;
+        }
+
+        // Set EXL (bit 1) — disables further exceptions
+        self.cop0.regs[Cop0::STATUS] |= 0x02;
+
+        // Vector: TLB Refill (0x80000000) when EXL was clear, else general (0x80000180)
+        let bev = (self.cop0.regs[Cop0::STATUS] >> 22) & 1;
+        let vector = if exl_was_set {
+            if bev != 0 { 0xFFFF_FFFF_BFC0_0380u64 } else { 0xFFFF_FFFF_8000_0180u64 }
+        } else {
+            if bev != 0 { 0xFFFF_FFFF_BFC0_0000u64 } else { 0xFFFF_FFFF_8000_0000u64 }
+        };
+
+        self.pc = vector;
+        self.next_pc = vector.wrapping_add(4);
     }
 }
