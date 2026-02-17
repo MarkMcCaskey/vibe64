@@ -38,22 +38,6 @@ pub enum RomError {
     TooSmall(usize),
 }
 
-// TODO(human): Implement these three functions:
-//
-// 1. detect_format(magic: [u8; 4]) -> Result<RomFormat, RomError>
-//    Match the magic bytes against the three known formats.
-//
-// 2. normalize(data: &mut Vec<u8>, format: RomFormat)
-//    Byte-swap the ROM data in-place to big-endian (z64) format.
-//    BigEndian: do nothing
-//    ByteSwapped: swap every pair of bytes
-//    LittleEndian: reverse every 4-byte word
-//
-// 3. parse_header(data: &[u8], format: RomFormat) -> Result<RomHeader, RomError>
-//    Parse the 64-byte header. After normalization, data is big-endian.
-//    Use u32::from_be_bytes() to read 32-bit fields.
-//    Offsets: see doc/n64_architecture.md "ROM Header" section.
-
 /// Load a ROM from disk: detect format, normalize, parse header.
 pub fn load_rom(path: &Path) -> Result<(RomHeader, Vec<u8>), RomError> {
     let mut file = File::open(path)?;
@@ -81,14 +65,55 @@ pub fn load_rom(path: &Path) -> Result<(RomHeader, Vec<u8>), RomError> {
     Ok((header, data))
 }
 
-pub fn detect_format(_magic: [u8; 4]) -> Result<RomFormat, RomError> {
-    todo!("Implement ROM format detection from magic bytes")
+pub fn detect_format(magic: [u8; 4]) -> Result<RomFormat, RomError> {
+    match magic {
+        [0x80, 0x37, 0x12, 0x40] => Ok(RomFormat::BigEndian),
+        [0x37, 0x80, 0x40, 0x12] => Ok(RomFormat::ByteSwapped),
+        [0x40, 0x12, 0x37, 0x80] => Ok(RomFormat::LittleEndian),
+        _ => Err(RomError::UnknownFormat(magic[0], magic[1], magic[2], magic[3])),
+    }
+
 }
 
-pub fn normalize(_data: &mut Vec<u8>, _format: RomFormat) {
-    todo!("Implement byte-swap normalization to big-endian")
+pub fn normalize(data: &mut Vec<u8>, format: RomFormat) {
+    match format {
+        RomFormat::BigEndian => (),
+        RomFormat::ByteSwapped => {
+            for chunk in data.chunks_exact_mut(2) {
+                chunk.swap(0, 1);
+            }
+        }
+        RomFormat::LittleEndian => {
+            for chunk in data.chunks_exact_mut(4) {
+                chunk.swap(0, 3);
+                chunk.swap(1, 2);
+            }
+        }
+    }
+
 }
 
-pub fn parse_header(_data: &[u8], _format: RomFormat) -> Result<RomHeader, RomError> {
-    todo!("Implement ROM header parsing")
+pub fn parse_header(data: &[u8], format: RomFormat) -> Result<RomHeader, RomError> {
+    // 0x00: PI BSD DOM1 config (contains magic bytes — skip)
+    let clock_rate = u32::from_be_bytes(data[0x04..0x08].try_into().unwrap());
+    let entry_point = u32::from_be_bytes(data[0x08..0x0C].try_into().unwrap());
+    let release = u32::from_be_bytes(data[0x0C..0x10].try_into().unwrap());
+    let crc1 = u32::from_be_bytes(data[0x10..0x14].try_into().unwrap());
+    let crc2 = u32::from_be_bytes(data[0x14..0x18].try_into().unwrap());
+    let name_bytes = &data[0x20..0x34];
+    let name = String::from_utf8_lossy(name_bytes).trim_end_matches('\0').trim().to_string();
+    let game_code: [u8; 4] = data[0x38..0x3C].try_into().unwrap();
+    let version = data[0x3C];
+
+    Ok(RomHeader {
+        format,
+        clock_rate,
+        entry_point,
+        release,
+        crc1,
+        crc2,
+        name,
+        game_code,
+        version,
+    })
 }
