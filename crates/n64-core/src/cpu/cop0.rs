@@ -69,6 +69,10 @@ impl Cop0 {
                 let preserved = self.regs[Self::CAUSE] & !0x0000_0300;
                 self.regs[Self::CAUSE] = preserved | writable;
             }
+            Self::WIRED => {
+                log::debug!("MTC0 Wired = {}", val & 0x1F);
+                self.regs[index] = val;
+            }
             _ => self.regs[index] = val,
         }
     }

@@ -18,6 +18,7 @@ pub enum SiDmaRequest {
 pub struct Si {
     pub dram_addr: u32,
     pub status: u32,
+    pub dma_count: u32,
 }
 
 impl Si {
@@ -25,6 +26,7 @@ impl Si {
         Self {
             dram_addr: 0,
             status: 0,
+            dma_count: 0,
         }
     }
 

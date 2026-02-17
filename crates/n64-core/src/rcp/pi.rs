@@ -4,8 +4,10 @@
 /// Writing to PI_WR_LEN triggers a DMA transfer.
 /// Registers at physical 0x0460_0000.
 ///
-/// This is the critical path for loading game data.
-/// Also the natural JIT invalidation intercept point.
+/// DMA data is copied immediately (so CPU reads see the data),
+/// but the completion interrupt is delayed to model real hardware
+/// timing. The N64 OS relies on having several instructions
+/// between PI_WR_LEN write and the PI completion interrupt.
 
 use super::mi::{Mi, MiInterrupt};
 
@@ -15,6 +17,13 @@ pub struct Pi {
     pub status: u32,
     /// Pending DMA length (set when PI_WR_LEN is written, consumed by Interconnect)
     pub pending_dma_len: u32,
+    /// Cycles remaining until DMA completion interrupt fires.
+    /// While > 0, PI_STATUS bit 0 (DMA busy) is set.
+    pub dma_busy_cycles: u64,
+    /// Debug: count of completed DMA transfers
+    pub dma_count: u32,
+    /// Debug: log of recent DMA destinations [(dram_addr, cart_addr, len)]
+    pub dma_log: Vec<(u32, u32, u32)>,
     // Bus timing registers (rarely used by games)
     pub dom1_lat: u32,
     pub dom1_pwd: u32,
@@ -33,6 +42,9 @@ impl Pi {
             cart_addr: 0,
             status: 0,
             pending_dma_len: 0,
+            dma_busy_cycles: 0,
+            dma_count: 0,
+            dma_log: Vec::new(),
             dom1_lat: 0,
             dom1_pwd: 0,
             dom1_pgs: 0,
@@ -48,7 +60,10 @@ impl Pi {
         match addr & 0x0F_FFFF {
             0x00 => self.dram_addr,
             0x04 => self.cart_addr,
-            0x10 => self.status,
+            0x10 => {
+                // PI_STATUS: bit 0 = DMA busy, bit 1 = I/O busy
+                if self.dma_busy_cycles > 0 { 0x01 } else { 0x00 }
+            }
             0x14 => self.dom1_lat,
             0x18 => self.dom1_pwd,
             0x1C => self.dom1_pgs,
@@ -63,6 +78,7 @@ impl Pi {
 
     /// Write to PI registers. Returns true if a DMA should be triggered.
     pub fn write_u32(&mut self, addr: u32, val: u32, mi: &mut Mi) -> bool {
+        log::debug!("PI write: reg={:#04X} val={:#010X}", addr & 0x0F_FFFF, val);
         match addr & 0x0F_FFFF {
             0x00 => {
                 self.dram_addr = val & 0x00FF_FFFF;
@@ -71,6 +87,12 @@ impl Pi {
             0x04 => {
                 self.cart_addr = val;
                 false
+            }
+            0x08 => {
+                // PI_RD_LEN: RDRAM → Cart DMA (for SRAM/Flash saves)
+                log::debug!("PI RD_LEN (RDRAM→Cart): RDRAM[{:#010X}] → Cart[{:#010X}], len={:#X}",
+                    self.dram_addr, self.cart_addr, (val & 0x00FF_FFFF) + 1);
+                false // TODO: implement RDRAM→Cart DMA for saves
             }
             0x0C => {
                 // PI_WR_LEN: writing triggers Cart → RDRAM DMA
@@ -94,5 +116,17 @@ impl Pi {
             0x30 => { self.dom2_rls = val & 0x03; false }
             _ => false,
         }
+    }
+
+    /// Tick the PI DMA timer. Call once per CPU cycle.
+    /// Returns true when the DMA completes (caller should raise PI interrupt).
+    pub fn tick_dma(&mut self) -> bool {
+        if self.dma_busy_cycles > 0 {
+            self.dma_busy_cycles -= 1;
+            if self.dma_busy_cycles == 0 {
+                return true; // DMA complete — raise interrupt
+            }
+        }
+        false
     }
 }

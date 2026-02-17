@@ -49,6 +49,11 @@ impl Interconnect {
 
     /// Perform PI DMA: copy data from cartridge ROM to RDRAM.
     /// Called when a game writes to PI_WR_LEN.
+    ///
+    /// Data is copied immediately (so CPU reads see it right away),
+    /// but the completion interrupt is delayed to model real hardware
+    /// timing. The N64 OS DMA handler needs several instructions
+    /// between writing PI_WR_LEN and receiving the completion interrupt.
     pub fn pi_dma_to_rdram(&mut self) {
         let cart_addr = self.pi.cart_addr & 0x0FFF_FFFF;
         let dram_addr = self.pi.dram_addr & 0x00FF_FFFF;
@@ -59,9 +64,30 @@ impl Interconnect {
             self.rdram.write_u8(dram_addr.wrapping_add(i), byte);
         }
 
-        self.mi.set_interrupt(crate::rcp::mi::MiInterrupt::PI);
+        log::debug!(
+            "PI DMA #{}: ROM[{:#010X}] → RDRAM[{:#010X}], len={:#X}",
+            self.pi.dma_count + 1, cart_addr, dram_addr, len
+        );
+
+        // Delay the completion interrupt. Real PI DMA runs at ~5MB/s
+        // (~50 cycles per 32-bit word). We use a minimum of 100 cycles
+        // so the OS DMA handler has time to update its queue state
+        // before the interrupt fires.
+        let delay = (len as u64 / 2).max(100);
+        self.pi.dma_busy_cycles = delay;
+
         self.notify_dma_write(dram_addr, len);
+        self.pi.dma_log.push((dram_addr, cart_addr, len));
         self.pi.pending_dma_len = 0;
+        self.pi.dma_count += 1;
+    }
+
+    /// Tick PI DMA timer. Call once per CPU cycle.
+    /// Raises PI interrupt in MI when DMA completes.
+    pub fn tick_pi_dma(&mut self) {
+        if self.pi.tick_dma() {
+            self.mi.set_interrupt(crate::rcp::mi::MiInterrupt::PI);
+        }
     }
 
     /// SI DMA Read: PIF RAM → RDRAM (game reads controller state).
@@ -74,6 +100,7 @@ impl Interconnect {
             self.rdram.write_u8(dram_addr + i, byte);
         }
         self.mi.set_interrupt(crate::rcp::mi::MiInterrupt::SI);
+        self.si.dma_count += 1;
     }
 
     /// SI DMA Write: RDRAM → PIF RAM (game sends commands to PIF).
@@ -85,6 +112,7 @@ impl Interconnect {
         }
         self.pif.process_commands();
         self.mi.set_interrupt(crate::rcp::mi::MiInterrupt::SI);
+        self.si.dma_count += 1;
     }
 
     /// ISViewer read: return buffer contents or zero.

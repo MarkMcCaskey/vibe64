@@ -4,6 +4,8 @@
 /// Mapped at physical address 0x0000_0000.
 pub struct Rdram {
     data: Vec<u8>,
+    /// Debug: track highest address written above 0xA0000
+    pub debug_high_write: u32,
 }
 
 const RDRAM_SIZE: usize = 8 * 1024 * 1024; // 8 MB (Expansion Pak)
@@ -12,6 +14,7 @@ impl Rdram {
     pub fn new() -> Self {
         Self {
             data: vec![0u8; RDRAM_SIZE],
+            debug_high_write: 0,
         }
     }
 
@@ -33,6 +36,9 @@ impl Rdram {
     pub fn write_u8(&mut self, addr: u32, val: u8) {
         let index = (addr as usize) & (RDRAM_SIZE - 1);
         self.data[index] = val;
+        if addr > 0xA0000 && addr > self.debug_high_write {
+            self.debug_high_write = addr;
+        }
     }
 
     /// Raw access to RDRAM data (for framebuffer reading, DMA, etc.)
@@ -44,5 +50,8 @@ impl Rdram {
         let index = (addr as usize) & (RDRAM_SIZE - 1);
         let bytes = val.to_be_bytes();
         self.data[index..index + 4].copy_from_slice(&bytes);
+        if addr > 0xA0000 && addr > self.debug_high_write {
+            self.debug_high_write = addr;
+        }
     }
 }

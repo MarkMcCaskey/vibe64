@@ -71,6 +71,23 @@ impl N64 {
             copy_len, game_start, rdram_dest
         );
 
+        // OS boot parameters — the IPL3 writes these to low RDRAM.
+        // The N64 OS reads them during initialization (__osInitialize).
+        bus.rdram.write_u32(0x300, 1);          // osTvType: 1=NTSC
+        bus.rdram.write_u32(0x304, 0);          // osRomType: 0=cartridge
+        bus.rdram.write_u32(0x308, 0xB000_0000); // osRomBase: cart in kseg1
+        bus.rdram.write_u32(0x30C, 0);          // osResetType: 0=cold boot
+        bus.rdram.write_u32(0x310, match cic {   // osCicId
+            cart::cic::CicVariant::Cic6101 => 1,
+            cart::cic::CicVariant::Cic6102 => 2,
+            cart::cic::CicVariant::Cic6103 => 3,
+            cart::cic::CicVariant::Cic6105 => 5,
+            cart::cic::CicVariant::Cic6106 => 6,
+            cart::cic::CicVariant::Unknown => 2, // default to 6102
+        });
+        bus.rdram.write_u32(0x314, 0);          // osVersion
+        bus.rdram.write_u32(0x318, 0x0080_0000); // osMemSize: 8MB (expansion pak)
+
         let mut cpu = Vr4300::new();
         // Entry point from ROM header (typically 0x80000400)
         cpu.pc = entry_point as i32 as i64 as u64; // sign-extend to 64-bit
@@ -94,6 +111,16 @@ impl N64 {
     pub fn vi_width(&self) -> u32 { self.bus.vi.width }
     pub fn rdram_data(&self) -> &[u8] { self.bus.rdram.data() }
 
+    /// Execute a single CPU instruction and tick peripherals.
+    /// Returns cycles consumed (always 1 for interpreter).
+    pub fn step_one(&mut self) -> u64 {
+        let elapsed = self.engine.execute(&mut self.cpu, &mut self.bus);
+        self.cycles += elapsed;
+        self.bus.vi.tick(elapsed, &mut self.bus.mi);
+        self.bus.tick_pi_dma();
+        elapsed
+    }
+
     /// Run one frame (~93.75 MHz / 60 fps ≈ 1,562,500 cycles).
     pub fn run_frame(&mut self) {
         const CYCLES_PER_FRAME: u64 = 93_750_000 / 60;
@@ -103,9 +130,56 @@ impl N64 {
             let elapsed = self.engine.execute(&mut self.cpu, &mut self.bus);
             self.cycles += elapsed;
 
-            // Tick the VI (scanline timing → VI interrupt)
             self.bus.vi.tick(elapsed, &mut self.bus.mi);
+            self.bus.tick_pi_dma();
         }
+    }
+
+    /// Run one frame with instruction tracing after a trigger condition.
+    /// When PI DMA count reaches `trigger_dma`, start capturing instructions.
+    /// Returns captured trace (PC, opcode pairs), limited to `max_trace` entries.
+    pub fn run_frame_trace(&mut self, trigger_dma: u32, max_trace: usize) -> Vec<(u64, u32)> {
+        const CYCLES_PER_FRAME: u64 = 93_750_000 / 60;
+        let mut trace = Vec::new();
+        let mut tracing = self.bus.pi.dma_count >= trigger_dma;
+
+        let target = self.cycles + CYCLES_PER_FRAME;
+        while self.cycles < target {
+            if tracing && trace.len() < max_trace {
+                let phys = self.cpu.translate_address(self.cpu.pc);
+                let opcode = self.bus.read_u32(phys);
+                trace.push((self.cpu.pc, opcode));
+            }
+
+            let elapsed = self.engine.execute(&mut self.cpu, &mut self.bus);
+            self.cycles += elapsed;
+            self.bus.vi.tick(elapsed, &mut self.bus.mi);
+            self.bus.tick_pi_dma();
+
+            if !tracing && self.bus.pi.dma_count >= trigger_dma {
+                tracing = true;
+            }
+        }
+        trace
+    }
+
+    /// Run one frame, stopping if PC (masked to 32 bits) enters the given range.
+    /// Returns Some(pc) if triggered, None if frame completed normally.
+    pub fn run_frame_trap(&mut self, trap_start: u32, trap_end: u32) -> Option<u64> {
+        const CYCLES_PER_FRAME: u64 = 93_750_000 / 60;
+
+        let target = self.cycles + CYCLES_PER_FRAME;
+        while self.cycles < target {
+            let pc32 = self.cpu.pc as u32;
+            if pc32 >= trap_start && pc32 < trap_end {
+                return Some(self.cpu.pc);
+            }
+            let elapsed = self.engine.execute(&mut self.cpu, &mut self.bus);
+            self.cycles += elapsed;
+            self.bus.vi.tick(elapsed, &mut self.bus.mi);
+            self.bus.tick_pi_dma();
+        }
+        None
     }
 
     /// Run until r30 becomes non-zero or max_cycles is reached.
@@ -116,6 +190,7 @@ impl N64 {
             let elapsed = self.engine.execute(&mut self.cpu, &mut self.bus);
             self.cycles += elapsed;
             self.bus.vi.tick(elapsed, &mut self.bus.mi);
+            self.bus.tick_pi_dma();
 
             if self.cpu.gpr[30] != 0 {
                 // Dump CPU state on failure for debugging
