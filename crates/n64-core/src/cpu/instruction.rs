@@ -18,26 +18,16 @@ impl Instruction {
         Self(raw)
     }
 
-    // TODO(human): Implement bit-field accessor methods
-    //
-    // You need these accessors:
-    //   opcode() -> u32     : bits [31:26] — primary opcode
-    //   rs()     -> usize   : bits [25:21] — source register
-    //   rt()     -> usize   : bits [20:16] — target register
-    //   rd()     -> usize   : bits [15:11] — destination register
-    //   sa()     -> u32     : bits [10:6]  — shift amount
-    //   funct()  -> u32     : bits [5:0]   — function code (R-type)
-    //   imm()    -> u16     : bits [15:0]  — immediate value (I-type)
-    //   imm_sign_ext() -> u64 : sign-extended immediate
-    //   target() -> u32     : bits [25:0]  — jump target (J-type)
-    //
-    // Hint: use >> (right shift) and & (mask) to extract each field.
-    // Example: opcode is the top 6 bits, so (self.0 >> 26) & 0x3F
-
-    /// Raw opcode value (for debugging)
-    pub fn raw(self) -> u32 {
-        self.0
-    }
+    pub fn opcode(self) -> u32 { (self.0 >> 26) & 0x3F }
+    pub fn rs(self) -> usize { ((self.0 >> 21) & 0x1F) as usize }
+    pub fn rt(self) -> usize { ((self.0 >> 16) & 0x1F) as usize }
+    pub fn rd(self) -> usize { ((self.0 >> 11) & 0x1F) as usize }
+    pub fn sa(self) -> u32 { (self.0 >> 6) & 0x1F }
+    pub fn funct(self) -> u32 { self.0 & 0x3F }
+    pub fn imm(self) -> u16 { self.0 as u16 }
+    pub fn imm_sign_ext(self) -> u64 { self.imm() as i16 as i64 as u64 }
+    pub fn target(self) -> u32 { self.0 & 0x03FF_FFFF }
+    pub fn raw(self) -> u32 { self.0 }
 }
 
 impl std::fmt::Display for Instruction {

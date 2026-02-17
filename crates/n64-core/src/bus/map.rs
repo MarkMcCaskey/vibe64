@@ -63,13 +63,6 @@ impl Interconnect {
 }
 
 impl Bus for Interconnect {
-    // TODO(human): Implement physical address dispatch
-    // See doc/memory_map.md for the complete address map.
-    //
-    // The read_u32/write_u32 methods should match on the physical
-    // address and route to the correct hardware component.
-    // The other widths (u8, u16, u64) can delegate to u32 for now.
-
     fn read_u8(&self, addr: u32) -> u8 {
         let word = self.read_u32(addr & !3);
         let shift = (3 - (addr & 3)) * 8;
@@ -83,8 +76,27 @@ impl Bus for Interconnect {
     }
 
     fn read_u32(&self, addr: u32) -> u32 {
-        log::warn!("Unhandled bus read32: {:#010X}", addr);
-        0
+        match addr {
+            0x0000_0000..=0x03EF_FFFF => self.rdram.read_u32(addr),
+            0x03F0_0000..=0x03FF_FFFF => 0, // RDRAM registers (stubbed)
+            0x0400_0000..=0x0400_0FFF => self.rsp.read_dmem_u32(addr & 0xFFF),
+            0x0400_1000..=0x0400_1FFF => self.rsp.read_imem_u32(addr & 0xFFF),
+            0x0404_0000..=0x040F_FFFF => self.rsp.read_reg_u32(addr),
+            0x0410_0000..=0x041F_FFFF => self.rdp.read_reg_u32(addr),
+            0x0430_0000..=0x043F_FFFF => self.mi.read_u32(addr),
+            0x0440_0000..=0x044F_FFFF => self.vi.read_u32(addr),
+            0x0450_0000..=0x045F_FFFF => self.ai.read_u32(addr),
+            0x0460_0000..=0x046F_FFFF => self.pi.read_u32(addr),
+            0x0470_0000..=0x047F_FFFF => self.ri.read_u32(addr),
+            0x0480_0000..=0x048F_FFFF => self.si.read_u32(addr),
+            0x1000_0000..=0x1FBF_FFFF => self.cart.read_u32(addr),
+            0x1FC0_0000..=0x1FC0_07BF => self.pif.read_boot_rom_u32(addr),
+            0x1FC0_07C0..=0x1FC0_07FF => self.pif.read_ram_u32(addr),
+            _ => {
+                log::warn!("Unhandled bus read32: {:#010X}", addr);
+                0
+            }
+        }
     }
 
     fn read_u64(&self, addr: u32) -> u64 {
@@ -110,7 +122,29 @@ impl Bus for Interconnect {
     }
 
     fn write_u32(&mut self, addr: u32, val: u32) {
-        log::warn!("Unhandled bus write32: {:#010X} = {:#010X}", addr, val);
+        match addr {
+            0x0000_0000..=0x03EF_FFFF => self.rdram.write_u32(addr, val),
+            0x03F0_0000..=0x03FF_FFFF => {} // RDRAM registers (stubbed)
+            0x0400_0000..=0x0400_0FFF => self.rsp.write_dmem_u32(addr & 0xFFF, val),
+            0x0400_1000..=0x0400_1FFF => self.rsp.write_imem_u32(addr & 0xFFF, val),
+            0x0404_0000..=0x040F_FFFF => self.rsp.write_reg_u32(addr, val),
+            0x0410_0000..=0x041F_FFFF => self.rdp.write_reg_u32(addr, val),
+            0x0430_0000..=0x043F_FFFF => self.mi.write_u32(addr, val),
+            0x0440_0000..=0x044F_FFFF => self.vi.write_u32(addr, val, &mut self.mi),
+            0x0450_0000..=0x045F_FFFF => self.ai.write_u32(addr, val),
+            0x0460_0000..=0x046F_FFFF => {
+                let trigger_dma = self.pi.write_u32(addr, val, &mut self.mi);
+                if trigger_dma {
+                    self.pi_dma_to_rdram();
+                }
+            }
+            0x0470_0000..=0x047F_FFFF => self.ri.write_u32(addr, val),
+            0x0480_0000..=0x048F_FFFF => self.si.write_u32(addr, val),
+            0x1FC0_07C0..=0x1FC0_07FF => self.pif.write_ram_u32(addr, val),
+            _ => {
+                log::warn!("Unhandled bus write32: {:#010X} = {:#010X}", addr, val);
+            }
+        }
     }
 
     fn write_u64(&mut self, addr: u32, val: u64) {
