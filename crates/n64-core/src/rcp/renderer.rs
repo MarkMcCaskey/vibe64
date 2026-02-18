@@ -26,13 +26,20 @@ pub struct TileDescriptor {
     pub th: u16,       // T high (10.2 fixed-point)
 }
 
-/// Transformed vertex in screen space.
+/// Transformed vertex with both clip-space and screen-space coordinates.
 #[derive(Clone, Copy, Default)]
 pub struct Vertex {
+    // Screen space (after perspective divide + viewport transform)
     pub x: f32,
     pub y: f32,
     pub z: f32,
-    pub w: f32,
+    pub w: f32,       // 1/clip_w
+    // Clip space (before perspective divide, for near-plane clipping)
+    pub clip_x: f32,
+    pub clip_y: f32,
+    pub clip_z: f32,
+    pub clip_w: f32,
+    // Texture and color attributes
     pub s: f32,
     pub t: f32,
     pub r: u8,
@@ -971,12 +978,14 @@ impl Renderer {
                     z: (cz * inv_w * self.viewport_scale[2] + self.viewport_trans[2])
                         .clamp(0.0, 0xFFFF as f32),
                     w: inv_w,
+                    clip_x: cx, clip_y: cy, clip_z: cz, clip_w: cw,
                     s, t, r, g, b, a,
                 };
             } else {
-                // Vertex at infinity — place off-screen so triangles get clipped
+                // Vertex behind camera — store clip coords for near-plane clipping
                 self.vertex_buffer[idx] = Vertex {
-                    x: -10000.0, y: -10000.0, z: 0.0, w: 0.0,
+                    x: 0.0, y: 0.0, z: 0.0, w: 0.0,
+                    clip_x: cx, clip_y: cy, clip_z: cz, clip_w: cw,
                     s, t, r, g, b, a,
                 };
             }
@@ -1248,13 +1257,71 @@ impl Renderer {
         }
     }
 
-    /// Rasterize a triangle using edge-function (half-space) method.
-    /// Interpolates vertex colors and optionally samples textures.
+    /// Clip a triangle against the near plane and rasterize resulting triangles.
     fn rasterize_triangle(&self, i0: usize, i1: usize, i2: usize, rdram: &mut [u8]) {
-        let v0 = self.vertex_buffer[i0];
-        let v1 = self.vertex_buffer[i1];
-        let v2 = self.vertex_buffer[i2];
+        let verts = [
+            self.vertex_buffer[i0],
+            self.vertex_buffer[i1],
+            self.vertex_buffer[i2],
+        ];
 
+        const NEAR_W: f32 = 0.01;
+
+        // Count how many vertices are in front of the near plane
+        let inside = [
+            verts[0].clip_w > NEAR_W,
+            verts[1].clip_w > NEAR_W,
+            verts[2].clip_w > NEAR_W,
+        ];
+        let inside_count = inside.iter().filter(|&&b| b).count();
+
+        match inside_count {
+            3 => {
+                // All in front — rasterize directly (screen coords already valid)
+                self.rasterize_screen_triangle(verts[0], verts[1], verts[2], rdram);
+            }
+            0 => {
+                // All behind camera — cull entirely
+            }
+            _ => {
+                // Sutherland-Hodgman clip against near plane (W = NEAR_W)
+                let mut output: [Vertex; 4] = [Vertex::default(); 4];
+                let mut count = 0;
+
+                for i in 0..3 {
+                    let curr = verts[i];
+                    let next = verts[(i + 1) % 3];
+                    let curr_in = inside[i];
+                    let next_in = inside[(i + 1) % 3];
+
+                    if curr_in {
+                        output[count] = curr;
+                        count += 1;
+                        if !next_in {
+                            // Edge exits: emit intersection
+                            output[count] = clip_lerp(&curr, &next, NEAR_W, &self.viewport_scale, &self.viewport_trans);
+                            count += 1;
+                        }
+                    } else if next_in {
+                        // Edge enters: emit intersection
+                        output[count] = clip_lerp(&curr, &next, NEAR_W, &self.viewport_scale, &self.viewport_trans);
+                        count += 1;
+                    }
+                }
+
+                if count >= 3 {
+                    self.rasterize_screen_triangle(output[0], output[1], output[2], rdram);
+                }
+                if count >= 4 {
+                    self.rasterize_screen_triangle(output[0], output[2], output[3], rdram);
+                }
+            }
+        }
+    }
+
+    /// Rasterize a triangle using edge-function (half-space) method.
+    /// Takes three vertices already in screen space.
+    fn rasterize_screen_triangle(&self, v0: Vertex, v1: Vertex, v2: Vertex, rdram: &mut [u8]) {
         // Bounding box clipped to scissor
         let scr_ulx = (self.scissor_ulx >> 2) as f32;
         let scr_uly = (self.scissor_uly >> 2) as f32;
@@ -1465,6 +1532,38 @@ fn read_u16(rdram: &[u8], offset: usize) -> u16 {
 ///   - When evaluated at all 3 edges, the signs tell us if p is inside
 ///   - The values give us barycentric coordinates (after dividing by total area)
 ///   - For a CCW triangle, positive means p is to the left of edge v0→v1
+/// Interpolate two vertices at the near-plane intersection (clip_w = near_w).
+/// Computes the parametric t where the edge crosses the plane, interpolates
+/// all attributes, and performs the perspective divide on the result.
+fn clip_lerp(a: &Vertex, b: &Vertex, near_w: f32, vp_scale: &[f32; 3], vp_trans: &[f32; 3]) -> Vertex {
+    let t = (a.clip_w - near_w) / (a.clip_w - b.clip_w);
+    let t = t.clamp(0.0, 1.0);
+    let inv_t = 1.0 - t;
+
+    let cx = a.clip_x * inv_t + b.clip_x * t;
+    let cy = a.clip_y * inv_t + b.clip_y * t;
+    let cz = a.clip_z * inv_t + b.clip_z * t;
+    let cw = a.clip_w * inv_t + b.clip_w * t;
+
+    let s = a.s * inv_t + b.s * t;
+    let tc = a.t * inv_t + b.t * t;
+    let r = (a.r as f32 * inv_t + b.r as f32 * t).clamp(0.0, 255.0) as u8;
+    let g = (a.g as f32 * inv_t + b.g as f32 * t).clamp(0.0, 255.0) as u8;
+    let bl = (a.b as f32 * inv_t + b.b as f32 * t).clamp(0.0, 255.0) as u8;
+    let al = (a.a as f32 * inv_t + b.a as f32 * t).clamp(0.0, 255.0) as u8;
+
+    // Perspective divide + viewport transform for the clipped vertex
+    let inv_w = 1.0 / cw;
+    Vertex {
+        x: cx * inv_w * vp_scale[0] + vp_trans[0],
+        y: cy * inv_w * vp_scale[1] + vp_trans[1],
+        z: (cz * inv_w * vp_scale[2] + vp_trans[2]).clamp(0.0, 0xFFFF as f32),
+        w: inv_w,
+        clip_x: cx, clip_y: cy, clip_z: cz, clip_w: cw,
+        s, t: tc, r, g, b: bl, a: al,
+    }
+}
+
 fn edge_function(v0x: f32, v0y: f32, v1x: f32, v1y: f32, px: f32, py: f32) -> f32 {
     (v1x - v0x) * (py - v0y) - (v1y - v0y) * (px - v0x)
 }
