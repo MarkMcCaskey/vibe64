@@ -19,7 +19,7 @@ pub struct N64 {
     pub cpu: Vr4300,
     pub bus: Interconnect,
     engine: Interpreter,
-    cycles: u64,
+    pub cycles: u64,
 }
 
 impl N64 {
@@ -37,10 +37,21 @@ impl N64 {
         let cic = cart::cic::detect(&rom_data);
         log::info!("Detected CIC: {}", cic);
 
+        // Detect EEPROM type from game code
+        let eeprom_type = detect_eeprom(&header.game_code);
+        log::info!("EEPROM: {:?} (game code: {:?})",
+            match eeprom_type {
+                crate::memory::pif::EepromType::None => "None",
+                crate::memory::pif::EepromType::Eeprom4K => "4Kbit (512 bytes)",
+                crate::memory::pif::EepromType::Eeprom16K => "16Kbit (2048 bytes)",
+            },
+            std::str::from_utf8(&header.game_code).unwrap_or("????"));
+
         let entry_point = header.entry_point;
         let cart = Cartridge::new(rom_data, header);
         let mut bus = Interconnect::new(cart);
         bus.pif.set_cic(cic);
+        bus.pif.set_eeprom(eeprom_type);
 
         // HLE boot: instead of running the IPL3 bootloader (which is
         // encrypted for CIC-6105), do what it would have done:
@@ -215,4 +226,39 @@ impl N64 {
         }
         0 // timeout
     }
+}
+
+/// Detect EEPROM type from the 4-byte game code in the ROM header.
+/// N64 ROMs don't store save type explicitly, so we use a database approach.
+fn detect_eeprom(game_code: &[u8; 4]) -> crate::memory::pif::EepromType {
+    use crate::memory::pif::EepromType;
+    let code = std::str::from_utf8(game_code).unwrap_or("");
+
+    // 16Kbit EEPROM games (common ones)
+    const EEPROM_16K: &[&str] = &[
+        "NZLE", "NZLJ", "NZLP", // Majora's Mask
+        "NCLB", "NCLE", "NCLJ", // Cruis'n World
+        "NYBE",                   // Yoshi's Story
+    ];
+
+    // 4Kbit EEPROM games (most games that use EEPROM)
+    const EEPROM_4K: &[&str] = &[
+        "CZLE", "CZLJ", "CZLP",  // Zelda OoT
+        "NSME", "NSMJ",           // Super Mario 64
+        "NMKE", "NMKJ",           // Mario Kart 64
+        "NSSE",                    // Star Fox 64
+        "NFZE", "NFZJ",           // F-Zero X
+        "NWRE",                    // Wave Race 64
+        "NPME",                    // Paper Mario
+    ];
+
+    for &c in EEPROM_16K {
+        if code == c { return EepromType::Eeprom16K; }
+    }
+    for &c in EEPROM_4K {
+        if code == c { return EepromType::Eeprom4K; }
+    }
+
+    // Default: try 4K EEPROM for unrecognized games (most common save type)
+    EepromType::Eeprom4K
 }

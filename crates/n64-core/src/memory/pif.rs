@@ -41,6 +41,14 @@ pub struct ControllerState {
     pub stick_y: i8,
 }
 
+/// EEPROM type for save data.
+#[derive(Clone, Copy, PartialEq)]
+pub enum EepromType {
+    None,
+    Eeprom4K,   // 512 bytes (64 blocks × 8 bytes)
+    Eeprom16K,  // 2048 bytes (256 blocks × 8 bytes)
+}
+
 pub struct Pif {
     /// PIF Boot ROM (not included — emulators skip PIF boot)
     boot_rom: [u8; 1984],
@@ -50,6 +58,9 @@ pub struct Pif {
     cic: CicVariant,
     /// Controller 1 state (set by frontend)
     pub controller: ControllerState,
+    /// EEPROM save data (accessed via joybus channel 4)
+    pub eeprom: Vec<u8>,
+    pub eeprom_type: EepromType,
 }
 
 impl Pif {
@@ -59,7 +70,20 @@ impl Pif {
             ram: [0u8; 64],
             cic: CicVariant::Unknown,
             controller: ControllerState::default(),
+            eeprom: Vec::new(),
+            eeprom_type: EepromType::None,
         }
+    }
+
+    /// Configure EEPROM type and allocate storage.
+    pub fn set_eeprom(&mut self, etype: EepromType) {
+        self.eeprom_type = etype;
+        let size = match etype {
+            EepromType::None => 0,
+            EepromType::Eeprom4K => 512,
+            EepromType::Eeprom16K => 2048,
+        };
+        self.eeprom = vec![0u8; size];
     }
 
     pub fn set_cic(&mut self, cic: CicVariant) {
@@ -152,16 +176,26 @@ impl Pif {
 
             match cmd {
                 0x00 | 0xFF => {
-                    // Controller info / reset
+                    // Device info / reset
                     if rx >= 3 {
                         if channel == 0 {
-                            // Type: 0x0005 = standard controller (big-endian)
+                            // Type: 0x0005 = standard controller
                             // Status: 0x01 = controller pak present
                             self.ram[rx_start] = 0x00;
                             self.ram[rx_start + 1] = 0x05;
                             self.ram[rx_start + 2] = 0x01;
+                        } else if channel == 4 && self.eeprom_type != EepromType::None {
+                            // EEPROM device info
+                            let type_id: u16 = match self.eeprom_type {
+                                EepromType::Eeprom4K => 0x0080,
+                                EepromType::Eeprom16K => 0x00C0,
+                                EepromType::None => unreachable!(),
+                            };
+                            self.ram[rx_start] = (type_id >> 8) as u8;
+                            self.ram[rx_start + 1] = (type_id & 0xFF) as u8;
+                            self.ram[rx_start + 2] = 0x00;
                         } else {
-                            // No controller: set error flag (bit 7 of rx_len)
+                            // No device: set error flag (bit 7 of rx_len)
                             self.ram[i + 1] = rx_len | 0x80;
                         }
                     }
@@ -177,6 +211,40 @@ impl Pif {
                         } else {
                             self.ram[i + 1] = rx_len | 0x80;
                         }
+                    }
+                }
+                0x04 => {
+                    // EEPROM read block (tx: [cmd, block#], rx: 8 bytes)
+                    if channel == 4 && self.eeprom_type != EepromType::None && tx >= 2 && rx >= 8 {
+                        let block = self.ram[cmd_start + 1] as usize;
+                        let offset = block * 8;
+                        if offset + 8 <= self.eeprom.len() {
+                            for b in 0..8 {
+                                self.ram[rx_start + b] = self.eeprom[offset + b];
+                            }
+                        } else {
+                            // Out of range — return zeros
+                            for b in 0..8 {
+                                self.ram[rx_start + b] = 0;
+                            }
+                        }
+                    } else {
+                        self.ram[i + 1] = rx_len | 0x80;
+                    }
+                }
+                0x05 => {
+                    // EEPROM write block (tx: [cmd, block#, 8 data bytes], rx: 1 status)
+                    if channel == 4 && self.eeprom_type != EepromType::None && tx >= 10 && rx >= 1 {
+                        let block = self.ram[cmd_start + 1] as usize;
+                        let offset = block * 8;
+                        if offset + 8 <= self.eeprom.len() {
+                            for b in 0..8 {
+                                self.eeprom[offset + b] = self.ram[cmd_start + 2 + b];
+                            }
+                        }
+                        self.ram[rx_start] = 0x00; // Success
+                    } else {
+                        self.ram[i + 1] = rx_len | 0x80;
                     }
                 }
                 _ => {

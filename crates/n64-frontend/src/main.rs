@@ -95,6 +95,10 @@ impl ApplicationHandler for App {
                     if key == KeyCode::Escape && pressed {
                         event_loop.exit();
                     }
+                    // P = save screenshot
+                    if key == KeyCode::KeyP && pressed {
+                        save_screenshot(&self.n64);
+                    }
                 }
             }
             WindowEvent::RedrawRequested => {
@@ -115,6 +119,51 @@ impl ApplicationHandler for App {
             _ => {}
         }
     }
+}
+
+/// Save the current N64 framebuffer as a PPM screenshot.
+fn save_screenshot(n64: &n64_core::N64) {
+    let origin = n64.vi_origin() as usize;
+    let width = n64.vi_width().max(1) as usize;
+    let format = n64.vi_pixel_format();
+    let rdram = n64.rdram_data();
+    let fb_size = width * 240 * if format == 3 { 4 } else { 2 };
+
+    eprintln!("Screenshot: origin={:#X} width={} format={}", origin, width, format);
+    eprintln!("  Renderer: color_image_addr={:#X} color_image_width={}",
+        n64.bus.renderer.color_image_addr, n64.bus.renderer.color_image_width);
+
+    if origin == 0 || format < 2 || origin + fb_size >= rdram.len() {
+        eprintln!("  Cannot save: invalid framebuffer");
+        return;
+    }
+
+    let mut ppm = b"P6\n320 240\n255\n".to_vec();
+    for y in 0..240 {
+        for x in 0..320usize {
+            match format {
+                2 => {
+                    let off = origin + (y * width + x) * 2;
+                    let pixel = u16::from_be_bytes([rdram[off], rdram[off + 1]]);
+                    let r = ((pixel >> 11) & 0x1F) as u8;
+                    let g = ((pixel >> 6) & 0x1F) as u8;
+                    let b = ((pixel >> 1) & 0x1F) as u8;
+                    ppm.push((r << 3) | (r >> 2));
+                    ppm.push((g << 3) | (g >> 2));
+                    ppm.push((b << 3) | (b >> 2));
+                }
+                3 => {
+                    let off = origin + (y * width + x) * 4;
+                    ppm.push(rdram[off]);
+                    ppm.push(rdram[off + 1]);
+                    ppm.push(rdram[off + 2]);
+                }
+                _ => { ppm.extend_from_slice(&[0, 0, 0]); }
+            }
+        }
+    }
+    std::fs::write("screenshot.ppm", &ppm).ok();
+    eprintln!("  Saved screenshot.ppm");
 }
 
 /// Read N64 framebuffer from RDRAM and convert to RGBA8888 for display.
@@ -195,14 +244,14 @@ fn main() {
     };
 
     if use_diag {
-        let total_steps = 500_000_000u64;
+        let total_steps = 2_000_000_000u64;
         eprintln!("=== Boot diagnostic ({}M steps) ===", total_steps / 1_000_000);
 
         for _ in 0..total_steps {
             n64.step_one();
         }
 
-        eprintln!("  DMAs={} RSP_tasks={} PC={:#010X}",
+        eprintln!("\n  DMAs={} RSP_tasks={} PC={:#010X}",
             n64.bus.pi.dma_count, n64.bus.rsp.start_count, n64.cpu.pc as u32);
         eprintln!("  VI: ctrl={:#010X} origin={:#010X} width={} h_video={:#010X}",
             n64.bus.vi.ctrl, n64.bus.vi.origin, n64.bus.vi.width, n64.bus.vi.h_video);
@@ -222,6 +271,15 @@ fn main() {
             n64.bus.vi.v_current, n64.bus.vi.v_intr, n64.bus.vi.v_sync);
         eprintln!("  SI: {} DMAs  AI: {} DMAs (dacrate={})",
             n64.bus.si.dma_count, n64.bus.ai.dma_count, n64.bus.ai.dacrate);
+        eprintln!("  VI: x_scale={:#X} y_scale={:#X}",
+            n64.bus.vi.x_scale, n64.bus.vi.y_scale);
+        eprintln!("  Renderer: color_image_addr={:#X} color_image_width={}",
+            n64.bus.renderer.color_image_addr, n64.bus.renderer.color_image_width);
+        eprintln!("  Viewport: scale=({:.1},{:.1},{:.1}) trans=({:.1},{:.1},{:.1})",
+            n64.bus.renderer.viewport_scale[0], n64.bus.renderer.viewport_scale[1],
+            n64.bus.renderer.viewport_scale[2],
+            n64.bus.renderer.viewport_trans[0], n64.bus.renderer.viewport_trans[1],
+            n64.bus.renderer.viewport_trans[2]);
 
         // Show where the CPU is idling
         eprintln!("  Idle PC={:#010X}", n64.cpu.pc as u32);
@@ -248,24 +306,33 @@ fn main() {
             eprintln!("  Framebuffer: {}% non-zero at RDRAM[{:#X}]", nonzero * 100 / fb_size, origin);
         }
 
-        // Save framebuffer as PPM screenshot for visual inspection
-        if origin > 0 && origin + fb_size < rdram.len() {
-            let mut ppm_bytes = b"P6\n320 240\n255\n".to_vec();
-            for y in 0..240 {
-                for x in 0..320 {
-                    let off = origin + (y * 320 + x) * 2;
-                    let pixel = u16::from_be_bytes([rdram[off], rdram[off + 1]]);
-                    let r = ((pixel >> 11) & 0x1F) as u8;
-                    let g = ((pixel >> 6) & 0x1F) as u8;
-                    let b = ((pixel >> 1) & 0x1F) as u8;
-                    ppm_bytes.push((r << 3) | (r >> 2));
-                    ppm_bytes.push((g << 3) | (g >> 2));
-                    ppm_bytes.push((b << 3) | (b >> 2));
+        // Save framebuffers as PPM screenshots for visual inspection
+        let save_ppm = |base: usize, path: &str, rdram: &[u8]| {
+            if base > 0 && base + fb_size < rdram.len() {
+                let mut ppm_bytes = b"P6\n320 240\n255\n".to_vec();
+                for y in 0..240 {
+                    for x in 0..320 {
+                        let off = base + (y * 320 + x) * 2;
+                        let pixel = u16::from_be_bytes([rdram[off], rdram[off + 1]]);
+                        let r = ((pixel >> 11) & 0x1F) as u8;
+                        let g = ((pixel >> 6) & 0x1F) as u8;
+                        let b = ((pixel >> 1) & 0x1F) as u8;
+                        ppm_bytes.push((r << 3) | (r >> 2));
+                        ppm_bytes.push((g << 3) | (g >> 2));
+                        ppm_bytes.push((b << 3) | (b >> 2));
+                    }
                 }
+                std::fs::write(path, &ppm_bytes).ok();
+                let nonzero_px = (0..320*240).filter(|&i| {
+                    let off = base + i * 2;
+                    let pixel = u16::from_be_bytes([rdram[off], rdram[off + 1]]);
+                    pixel >> 1 != 0 // ignore alpha-only pixels
+                }).count();
+                eprintln!("  Saved {} ({} visible pixels)", path, nonzero_px);
             }
-            std::fs::write("framebuffer.ppm", &ppm_bytes).ok();
-            eprintln!("  Saved framebuffer.ppm");
-        }
+        };
+        save_ppm(origin, "framebuffer_vi.ppm", rdram);
+        save_ppm(n64.bus.renderer.color_image_addr as usize, "framebuffer_render.ppm", rdram);
 
         n64.cpu.dump_unimpl_summary();
         return;

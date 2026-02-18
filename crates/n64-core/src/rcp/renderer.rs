@@ -533,28 +533,7 @@ impl Renderer {
                 let texel0 = self.sample_texture(tile_idx, tex_s >> 5, tex_t >> 5, cycle);
                 let color = self.combine_pixel(texel0, [255, 255, 255, 255]);
 
-                // Write pixel
-                match self.color_image_size {
-                    2 => {
-                        let offset = addr + ((y * width + x) as usize) * 2;
-                        if offset + 1 < rdram.len() {
-                            let pixel = pack_rgba5551(color[0], color[1], color[2], color[3]);
-                            let bytes = pixel.to_be_bytes();
-                            rdram[offset] = bytes[0];
-                            rdram[offset + 1] = bytes[1];
-                        }
-                    }
-                    3 => {
-                        let offset = addr + ((y * width + x) as usize) * 4;
-                        if offset + 3 < rdram.len() {
-                            rdram[offset] = color[0];
-                            rdram[offset + 1] = color[1];
-                            rdram[offset + 2] = color[2];
-                            rdram[offset + 3] = color[3];
-                        }
-                    }
-                    _ => {}
-                }
+                self.write_pixel(rdram, x, y, color);
             }
         }
 
@@ -863,6 +842,8 @@ impl Renderer {
         let addr = self.resolve_segment(w1) as usize;
         self.vtx_count += num as u32;
 
+        log::trace!("G_VTX: num={} start={} addr={:#X}", num, start, addr);
+
         for i in 0..num {
             let idx = start + i;
             if idx >= 32 { break; }
@@ -884,10 +865,10 @@ impl Renderer {
                 let ny = rdram[(off + 13) & (rdram.len() - 1)] as i8 as f32;
                 let nz = rdram[(off + 14) & (rdram.len() - 1)] as i8 as f32;
 
-                // Transform normal by modelview upper-3x3
-                let wnx = self.modelview[0][0] * nx + self.modelview[0][1] * ny + self.modelview[0][2] * nz;
-                let wny = self.modelview[1][0] * nx + self.modelview[1][1] * ny + self.modelview[1][2] * nz;
-                let wnz = self.modelview[2][0] * nx + self.modelview[2][1] * ny + self.modelview[2][2] * nz;
+                // Transform normal by modelview upper-3x3 (n * M, row-vector convention)
+                let wnx = nx * self.modelview[0][0] + ny * self.modelview[1][0] + nz * self.modelview[2][0];
+                let wny = nx * self.modelview[0][1] + ny * self.modelview[1][1] + nz * self.modelview[2][1];
+                let wnz = nx * self.modelview[0][2] + ny * self.modelview[1][2] + nz * self.modelview[2][2];
                 let len = (wnx * wnx + wny * wny + wnz * wnz).sqrt();
                 let (wnx, wny, wnz) = if len > 0.001 {
                     (wnx / len, wny / len, wnz / len)
@@ -951,6 +932,15 @@ impl Renderer {
         let v1 = ((w0 >> 8) & 0xFF) as usize / 2;
         let v2 = (w0 & 0xFF) as usize / 2;
         if v0 < 32 && v1 < 32 && v2 < 32 {
+            if self.tri_count < 5 || (self.tri_count >= 1000 && self.tri_count < 1005)
+                || (self.tri_count >= 10000 && self.tri_count < 10005)
+                || (self.tri_count >= 50000 && self.tri_count < 50005) {
+                let a = self.vertex_buffer[v0];
+                let b = self.vertex_buffer[v1];
+                let c = self.vertex_buffer[v2];
+                log::debug!("TRI #{}: ({:.1},{:.1}) ({:.1},{:.1}) ({:.1},{:.1}) w={:.4},{:.4},{:.4}",
+                    self.tri_count, a.x, a.y, b.x, b.y, c.x, c.y, a.w, b.w, c.w);
+            }
             self.rasterize_triangle(v0, v1, v2, rdram);
             self.tri_count += 1;
         }
@@ -965,6 +955,14 @@ impl Renderer {
         let v4 = ((w1 >> 8) & 0xFF) as usize / 2;
         let v5 = (w1 & 0xFF) as usize / 2;
         if v0 < 32 && v1 < 32 && v2 < 32 {
+            if self.tri_count < 5 || (self.tri_count >= 1000 && self.tri_count < 1005)
+                || (self.tri_count >= 50000 && self.tri_count < 50005) {
+                let a = self.vertex_buffer[v0];
+                let b = self.vertex_buffer[v1];
+                let c = self.vertex_buffer[v2];
+                log::debug!("TRI #{}: ({:.1},{:.1}) ({:.1},{:.1}) ({:.1},{:.1})",
+                    self.tri_count, a.x, a.y, b.x, b.y, c.x, c.y);
+            }
             self.rasterize_triangle(v0, v1, v2, rdram);
             self.tri_count += 1;
         }
@@ -978,22 +976,31 @@ impl Renderer {
     pub fn cmd_load_matrix(&mut self, w0: u32, w1: u32, rdram: &[u8]) {
         let addr = self.resolve_segment(w1) as usize;
         let params = w0 & 0xFF;
+        // F3DEX2: push bit is XORed in the macro (stored inverted)
         let push = params & 0x01 == 0;
-        let load = params & 0x02 != 0; // load vs multiply
-        let projection = params & 0x04 == 0;
+        let load = params & 0x02 != 0;
+        let projection = params & 0x04 != 0;
 
         let mat = load_fixed_point_matrix(rdram, addr);
 
+        log::trace!("G_MTX: params={:#04X} push={} load={} proj={} addr={:#X}",
+            params, push, load, projection, addr);
+
         if projection {
-            self.projection = if load { mat } else { mat4_mul(&mat, &self.projection) };
+            if load {
+                self.projection = mat;
+            } else {
+                self.projection = mat4_mul(&self.projection, &mat);
+            }
         } else {
             if push {
                 self.matrix_stack.push(self.modelview);
             }
-            self.modelview = if load { mat } else { mat4_mul(&mat, &self.modelview) };
+            self.modelview = if load { mat } else { mat4_mul(&self.modelview, &mat) };
         }
 
-        self.mvp = mat4_mul(&self.projection, &self.modelview);
+        // N64 uses v * MVP, so MVP = MV * P
+        self.mvp = mat4_mul(&self.modelview, &self.projection);
     }
 
     /// G_POPMTX: Pop the modelview matrix stack.
@@ -1004,7 +1011,7 @@ impl Renderer {
                 self.modelview = mat;
             }
         }
-        self.mvp = mat4_mul(&self.projection, &self.modelview);
+        self.mvp = mat4_mul(&self.modelview, &self.projection);
     }
 
     /// G_GEOMETRYMODE: Set/clear geometry mode flags.
@@ -1055,6 +1062,39 @@ impl Renderer {
         }
     }
 
+    /// Write a pixel to the framebuffer with optional alpha compare.
+    fn write_pixel(&self, rdram: &mut [u8], x: i32, y: i32, color: [u8; 4]) {
+        // Alpha compare: othermode_l bits 0-1
+        // 0 = none, 1 = threshold compare, 2/3 = dither
+        let alpha_compare = self.othermode_l & 0x3;
+        if alpha_compare == 1 && color[3] < self.blend_color[3] {
+            return; // Fail alpha threshold test
+        }
+
+        let addr = self.color_image_addr as usize;
+        let width = self.color_image_width as i32;
+
+        match self.color_image_size {
+            2 => {
+                let offset = addr + ((y * width + x) as usize) * 2;
+                if offset + 1 >= rdram.len() { return; }
+                let pixel = pack_rgba5551(color[0], color[1], color[2], color[3]);
+                let bytes = pixel.to_be_bytes();
+                rdram[offset] = bytes[0];
+                rdram[offset + 1] = bytes[1];
+            }
+            3 => {
+                let offset = addr + ((y * width + x) as usize) * 4;
+                if offset + 3 >= rdram.len() { return; }
+                rdram[offset] = color[0];
+                rdram[offset + 1] = color[1];
+                rdram[offset + 2] = color[2];
+                rdram[offset + 3] = color[3];
+            }
+            _ => {}
+        }
+    }
+
     /// Rasterize a triangle using edge-function (half-space) method.
     /// Interpolates vertex colors and optionally samples textures.
     fn rasterize_triangle(&self, i0: usize, i1: usize, i2: usize, rdram: &mut [u8]) {
@@ -1081,11 +1121,12 @@ impl Renderer {
 
         // Face culling: check geometry_mode flags
         // G_CULL_FRONT = 0x0200, G_CULL_BACK = 0x0400
-        // Positive area = front face (CCW), negative = back face (CW)
+        // In Y-down screen space, the edge function sign is inverted:
+        //   positive area = CW = back face, negative = CCW = front face
         let cull_front = self.geometry_mode & 0x0200 != 0;
         let cull_back = self.geometry_mode & 0x0400 != 0;
-        if cull_back && area < 0.0 { return; }
-        if cull_front && area > 0.0 { return; }
+        if cull_back && area > 0.0 { return; }
+        if cull_front && area < 0.0 { return; }
 
         let inv_area = 1.0 / area;
 
@@ -1155,30 +1196,7 @@ impl Renderer {
                 let shade = [r, g, b, a];
                 let color = self.combine_pixel(texel0, shade);
 
-                // Write pixel to framebuffer
-                match self.color_image_size {
-                    2 => {
-                        let offset = addr + ((y * width + x) as usize) * 2;
-                        if offset + 1 < rdram.len() {
-                            let pixel = pack_rgba5551(
-                                color[0], color[1], color[2], color[3],
-                            );
-                            let bytes = pixel.to_be_bytes();
-                            rdram[offset] = bytes[0];
-                            rdram[offset + 1] = bytes[1];
-                        }
-                    }
-                    3 => {
-                        let offset = addr + ((y * width + x) as usize) * 4;
-                        if offset + 3 < rdram.len() {
-                            rdram[offset] = color[0];
-                            rdram[offset + 1] = color[1];
-                            rdram[offset + 2] = color[2];
-                            rdram[offset + 3] = color[3];
-                        }
-                    }
-                    _ => {}
-                }
+                self.write_pixel(rdram, x, y, color);
             }
         }
     }
@@ -1230,12 +1248,13 @@ fn mat4_mul(a: &[[f32; 4]; 4], b: &[[f32; 4]; 4]) -> [[f32; 4]; 4] {
     result
 }
 
+/// Compute v * M (row-vector × matrix), matching N64 RSP convention.
 fn mat4_mul_vec(m: &[[f32; 4]; 4], v: [f32; 4]) -> [f32; 4] {
     [
-        m[0][0]*v[0] + m[0][1]*v[1] + m[0][2]*v[2] + m[0][3]*v[3],
-        m[1][0]*v[0] + m[1][1]*v[1] + m[1][2]*v[2] + m[1][3]*v[3],
-        m[2][0]*v[0] + m[2][1]*v[1] + m[2][2]*v[2] + m[2][3]*v[3],
-        m[3][0]*v[0] + m[3][1]*v[1] + m[3][2]*v[2] + m[3][3]*v[3],
+        v[0]*m[0][0] + v[1]*m[1][0] + v[2]*m[2][0] + v[3]*m[3][0],
+        v[0]*m[0][1] + v[1]*m[1][1] + v[2]*m[2][1] + v[3]*m[3][1],
+        v[0]*m[0][2] + v[1]*m[1][2] + v[2]*m[2][2] + v[3]*m[3][2],
+        v[0]*m[0][3] + v[1]*m[1][3] + v[2]*m[2][3] + v[3]*m[3][3],
     ]
 }
 

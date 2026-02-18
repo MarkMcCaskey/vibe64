@@ -139,13 +139,14 @@ impl Interconnect {
 
             // Walk display list, rendering into RDRAM
             let rdram = self.rdram.data_mut();
+            let tris_before = self.renderer.tri_count;
             gbi::process_display_list(&mut self.renderer, rdram, phys_addr);
+            let tris_this_dl = self.renderer.tri_count - tris_before;
 
             log::debug!(
-                "  Rendered: {} fill rects, {} tex rects, {} tris",
-                self.renderer.fill_rect_count,
-                self.renderer.tex_rect_count,
-                self.renderer.tri_count,
+                "GFX #{}: {} tris, ci={:#X}",
+                self.rsp.start_count, tris_this_dl,
+                self.renderer.color_image_addr,
             );
         }
         // Audio tasks (M_AUDTASK) are silently ignored for now
@@ -329,7 +330,9 @@ impl Bus for Interconnect {
 
     fn write_u32(&mut self, addr: u32, val: u32) {
         match addr {
-            0x0000_0000..=0x03EF_FFFF => self.rdram.write_u32(addr, val),
+            0x0000_0000..=0x03EF_FFFF => {
+                self.rdram.write_u32(addr, val);
+            }
             0x03F0_0000..=0x03FF_FFFF => {} // RDRAM registers (stubbed)
             0x0400_0000..=0x0400_0FFF => self.rsp.write_dmem_u32(addr & 0xFFF, val),
             0x0400_1000..=0x0400_1FFF => self.rsp.write_imem_u32(addr & 0xFFF, val),

@@ -977,22 +977,39 @@ impl Vr4300 {
     fn op_lwc1(&mut self, instr: Instruction, bus: &impl Bus) {
         let Some(addr) = self.load_addr(instr) else { return };
         let val = bus.read_u32(addr);
+        if self.fpu_trace {
+            eprintln!("  [{:#010X}] LWC1 f{} = [{:#010X}] = {:#010X} ({})",
+                self.pc.wrapping_sub(4), instr.rt(), addr, val, f32::from_bits(val));
+        }
         self.cop1.fpr[instr.rt()] = val as u64;
     }
 
     fn op_swc1(&mut self, instr: Instruction, bus: &mut impl Bus) {
         let Some(addr) = self.store_addr(instr) else { return };
-        bus.write_u32(addr, self.cop1.fpr[instr.rt()] as u32);
+        let val = self.cop1.fpr[instr.rt()] as u32;
+        if self.fpu_trace {
+            eprintln!("  [{:#010X}] SWC1 [{:#010X}] = f{}({:#010X} = {})",
+                self.pc.wrapping_sub(4), addr, instr.rt(), val, f32::from_bits(val));
+        }
+        bus.write_u32(addr, val);
     }
 
     fn op_ldc1(&mut self, instr: Instruction, bus: &impl Bus) {
         let Some(addr) = self.load_addr(instr) else { return };
-        self.cop1.fpr[instr.rt()] = bus.read_u64(addr);
+        let val = bus.read_u64(addr);
+        // FR=0: split 64-bit value into even (low) and odd (high) registers
+        let rt = instr.rt();
+        self.cop1.fpr[rt] = val & 0xFFFF_FFFF;
+        self.cop1.fpr[rt | 1] = (val >> 32) & 0xFFFF_FFFF;
     }
 
     fn op_sdc1(&mut self, instr: Instruction, bus: &mut impl Bus) {
         let Some(addr) = self.store_addr(instr) else { return };
-        bus.write_u64(addr, self.cop1.fpr[instr.rt()]);
+        // FR=0: combine even (low) and odd (high) registers
+        let rt = instr.rt();
+        let low = self.cop1.fpr[rt] as u32 as u64;
+        let high = self.cop1.fpr[rt | 1] as u32 as u64;
+        bus.write_u64(addr, (high << 32) | low);
     }
 
     // ─── COP1 (FPU) Execution ───────────────────────────────────
@@ -1001,10 +1018,19 @@ impl Vr4300 {
         let fmt = instr.rs();
         match fmt {
             0x00 => { // MFC1: GPR[rt] = FPR[rd] (low 32 bits)
-                self.gpr[instr.rt()] = self.cop1.fpr[instr.rd()] as i32 as i64 as u64;
+                let val = self.cop1.fpr[instr.rd()] as i32 as i64 as u64;
+                if self.fpu_trace {
+                    eprintln!("  [{:#010X}] MFC1 r{} = f{}(bits={:#010X} = {})",
+                        current_pc, instr.rt(), instr.rd(),
+                        self.cop1.fpr[instr.rd()] as u32, self.cop1.read_f32(instr.rd()));
+                }
+                self.gpr[instr.rt()] = val;
             }
-            0x01 => { // DMFC1: GPR[rt] = FPR[rd] (full 64 bits)
-                self.gpr[instr.rt()] = self.cop1.fpr[instr.rd()];
+            0x01 => { // DMFC1: GPR[rt] = FPR[rd] (FR=0: combine even/odd pair)
+                let rd = instr.rd();
+                let low = self.cop1.fpr[rd] as u32 as u64;
+                let high = self.cop1.fpr[rd | 1] as u32 as u64;
+                self.gpr[instr.rt()] = (high << 32) | low;
             }
             0x02 => { // CFC1: GPR[rt] = FCR[rd]
                 let val = match instr.rd() {
@@ -1015,10 +1041,19 @@ impl Vr4300 {
                 self.gpr[instr.rt()] = val as i32 as i64 as u64;
             }
             0x04 => { // MTC1: FPR[rd] = GPR[rt] (low 32 bits)
-                self.cop1.fpr[instr.rd()] = self.gpr[instr.rt()] as u32 as u64;
+                let bits = self.gpr[instr.rt()] as u32;
+                if self.fpu_trace {
+                    eprintln!("  [{:#010X}] MTC1 f{} = r{}(bits={:#010X} = {})",
+                        current_pc, instr.rd(), instr.rt(),
+                        bits, f32::from_bits(bits));
+                }
+                self.cop1.fpr[instr.rd()] = bits as u64;
             }
-            0x05 => { // DMTC1: FPR[rd] = GPR[rt] (full 64 bits)
-                self.cop1.fpr[instr.rd()] = self.gpr[instr.rt()];
+            0x05 => { // DMTC1: FPR[rd] = GPR[rt] (FR=0: split into even/odd pair)
+                let val = self.gpr[instr.rt()];
+                let rd = instr.rd();
+                self.cop1.fpr[rd] = val & 0xFFFF_FFFF;
+                self.cop1.fpr[rd | 1] = (val >> 32) & 0xFFFF_FFFF;
             }
             0x06 => { // CTC1: FCR[rd] = GPR[rt]
                 match instr.rd() {
@@ -1056,44 +1091,98 @@ impl Vr4300 {
 
         match instr.funct() {
             0x00 => { // ADD.S
-                let result = self.cop1.read_f32(fs) + self.cop1.read_f32(ft);
+                let a = self.cop1.read_f32(fs);
+                let b = self.cop1.read_f32(ft);
+                let result = a + b;
+                if self.fpu_trace {
+                    eprintln!("  [{:#010X}] ADD.S f{} = f{}({}) + f{}({}) = {}",
+                        current_pc, fd, fs, a, ft, b, result);
+                }
                 self.cop1.write_f32(fd, result);
             }
             0x01 => { // SUB.S
-                let result = self.cop1.read_f32(fs) - self.cop1.read_f32(ft);
+                let a = self.cop1.read_f32(fs);
+                let b = self.cop1.read_f32(ft);
+                let result = a - b;
+                if self.fpu_trace {
+                    eprintln!("  [{:#010X}] SUB.S f{} = f{}({}) - f{}({}) = {}",
+                        current_pc, fd, fs, a, ft, b, result);
+                }
                 self.cop1.write_f32(fd, result);
             }
             0x02 => { // MUL.S
-                let result = self.cop1.read_f32(fs) * self.cop1.read_f32(ft);
+                let a = self.cop1.read_f32(fs);
+                let b = self.cop1.read_f32(ft);
+                let result = a * b;
+                if self.fpu_trace {
+                    eprintln!("  [{:#010X}] MUL.S f{} = f{}({}) * f{}({}) = {}",
+                        current_pc, fd, fs, a, ft, b, result);
+                }
                 self.cop1.write_f32(fd, result);
             }
             0x03 => { // DIV.S
-                let result = self.cop1.read_f32(fs) / self.cop1.read_f32(ft);
+                let a = self.cop1.read_f32(fs);
+                let b = self.cop1.read_f32(ft);
+                let result = a / b;
+                if self.fpu_trace {
+                    eprintln!("  [{:#010X}] DIV.S f{} = f{}({}) / f{}({}) = {}",
+                        current_pc, fd, fs, a, ft, b, result);
+                }
                 self.cop1.write_f32(fd, result);
             }
             0x04 => { // SQRT.S
-                self.cop1.write_f32(fd, self.cop1.read_f32(fs).sqrt());
+                let a = self.cop1.read_f32(fs);
+                let result = a.sqrt();
+                if self.fpu_trace {
+                    eprintln!("  [{:#010X}] SQRT.S f{} = sqrt(f{}({})) = {}",
+                        current_pc, fd, fs, a, result);
+                }
+                self.cop1.write_f32(fd, result);
             }
             0x05 => { // ABS.S
-                self.cop1.write_f32(fd, self.cop1.read_f32(fs).abs());
+                let a = self.cop1.read_f32(fs);
+                let result = a.abs();
+                if self.fpu_trace {
+                    eprintln!("  [{:#010X}] ABS.S f{} = abs(f{}({})) = {}",
+                        current_pc, fd, fs, a, result);
+                }
+                self.cop1.write_f32(fd, result);
             }
             0x06 => { // MOV.S — copy raw bits, avoid float canonicalization
+                if self.fpu_trace {
+                    eprintln!("  [{:#010X}] MOV.S f{} = f{}(bits={:#010X} = {})",
+                        current_pc, fd, fs, self.cop1.fpr[fs] as u32, self.cop1.read_f32(fs));
+                }
                 self.cop1.fpr[fd] = self.cop1.fpr[fs] & 0xFFFF_FFFF;
             }
             0x07 => { // NEG.S
-                self.cop1.write_f32(fd, -self.cop1.read_f32(fs));
+                let a = self.cop1.read_f32(fs);
+                let result = -a;
+                if self.fpu_trace {
+                    eprintln!("  [{:#010X}] NEG.S f{} = -f{}({}) = {}",
+                        current_pc, fd, fs, a, result);
+                }
+                self.cop1.write_f32(fd, result);
             }
-            0x08 => { // ROUND.L.S
-                self.cop1.fpr[fd] = (self.cop1.read_f32(fs).round_ties_even() as i64) as u64;
+            0x08 => { // ROUND.L.S (FR=0: 64-bit result split into even/odd pair)
+                let val = (self.cop1.read_f32(fs).round_ties_even() as i64) as u64;
+                self.cop1.fpr[fd] = val & 0xFFFF_FFFF;
+                self.cop1.fpr[fd | 1] = (val >> 32) & 0xFFFF_FFFF;
             }
             0x09 => { // TRUNC.L.S
-                self.cop1.fpr[fd] = (self.cop1.read_f32(fs).trunc() as i64) as u64;
+                let val = (self.cop1.read_f32(fs).trunc() as i64) as u64;
+                self.cop1.fpr[fd] = val & 0xFFFF_FFFF;
+                self.cop1.fpr[fd | 1] = (val >> 32) & 0xFFFF_FFFF;
             }
             0x0A => { // CEIL.L.S
-                self.cop1.fpr[fd] = (self.cop1.read_f32(fs).ceil() as i64) as u64;
+                let val = (self.cop1.read_f32(fs).ceil() as i64) as u64;
+                self.cop1.fpr[fd] = val & 0xFFFF_FFFF;
+                self.cop1.fpr[fd | 1] = (val >> 32) & 0xFFFF_FFFF;
             }
             0x0B => { // FLOOR.L.S
-                self.cop1.fpr[fd] = (self.cop1.read_f32(fs).floor() as i64) as u64;
+                let val = (self.cop1.read_f32(fs).floor() as i64) as u64;
+                self.cop1.fpr[fd] = val & 0xFFFF_FFFF;
+                self.cop1.fpr[fd | 1] = (val >> 32) & 0xFFFF_FFFF;
             }
             0x0C => { // ROUND.W.S
                 self.cop1.fpr[fd] = (self.cop1.read_f32(fs).round_ties_even() as i32 as u32) as u64;
@@ -1113,8 +1202,10 @@ impl Vr4300 {
             0x24 => { // CVT.W.S
                 self.cop1.fpr[fd] = (self.cop1.read_f32(fs).round_ties_even() as i32 as u32) as u64;
             }
-            0x25 => { // CVT.L.S
-                self.cop1.fpr[fd] = (self.cop1.read_f32(fs).round_ties_even() as i64) as u64;
+            0x25 => { // CVT.L.S (FR=0: 64-bit result split into even/odd pair)
+                let val = (self.cop1.read_f32(fs).round_ties_even() as i64) as u64;
+                self.cop1.fpr[fd] = val & 0xFFFF_FFFF;
+                self.cop1.fpr[fd | 1] = (val >> 32) & 0xFFFF_FFFF;
             }
             0x30..=0x3F => self.cop1_compare_s(instr),
             _ => self.unimpl(
@@ -1154,23 +1245,32 @@ impl Vr4300 {
             0x05 => { // ABS.D
                 self.cop1.write_f64(fd, self.cop1.read_f64(fs).abs());
             }
-            0x06 => { // MOV.D — copy raw 64-bit bits
+            0x06 => { // MOV.D — copy raw 64-bit bits (FR=0: copy even+odd pair)
                 self.cop1.fpr[fd] = self.cop1.fpr[fs];
+                self.cop1.fpr[fd | 1] = self.cop1.fpr[fs | 1];
             }
             0x07 => { // NEG.D
                 self.cop1.write_f64(fd, -self.cop1.read_f64(fs));
             }
-            0x08 => { // ROUND.L.D
-                self.cop1.fpr[fd] = (self.cop1.read_f64(fs).round_ties_even() as i64) as u64;
+            0x08 => { // ROUND.L.D (FR=0: 64-bit result split into even/odd pair)
+                let val = (self.cop1.read_f64(fs).round_ties_even() as i64) as u64;
+                self.cop1.fpr[fd] = val & 0xFFFF_FFFF;
+                self.cop1.fpr[fd | 1] = (val >> 32) & 0xFFFF_FFFF;
             }
             0x09 => { // TRUNC.L.D
-                self.cop1.fpr[fd] = (self.cop1.read_f64(fs).trunc() as i64) as u64;
+                let val = (self.cop1.read_f64(fs).trunc() as i64) as u64;
+                self.cop1.fpr[fd] = val & 0xFFFF_FFFF;
+                self.cop1.fpr[fd | 1] = (val >> 32) & 0xFFFF_FFFF;
             }
             0x0A => { // CEIL.L.D
-                self.cop1.fpr[fd] = (self.cop1.read_f64(fs).ceil() as i64) as u64;
+                let val = (self.cop1.read_f64(fs).ceil() as i64) as u64;
+                self.cop1.fpr[fd] = val & 0xFFFF_FFFF;
+                self.cop1.fpr[fd | 1] = (val >> 32) & 0xFFFF_FFFF;
             }
             0x0B => { // FLOOR.L.D
-                self.cop1.fpr[fd] = (self.cop1.read_f64(fs).floor() as i64) as u64;
+                let val = (self.cop1.read_f64(fs).floor() as i64) as u64;
+                self.cop1.fpr[fd] = val & 0xFFFF_FFFF;
+                self.cop1.fpr[fd | 1] = (val >> 32) & 0xFFFF_FFFF;
             }
             0x0C => { // ROUND.W.D
                 self.cop1.fpr[fd] = (self.cop1.read_f64(fs).round_ties_even() as i32 as u32) as u64;
@@ -1190,8 +1290,10 @@ impl Vr4300 {
             0x24 => { // CVT.W.D
                 self.cop1.fpr[fd] = (self.cop1.read_f64(fs).round_ties_even() as i32 as u32) as u64;
             }
-            0x25 => { // CVT.L.D
-                self.cop1.fpr[fd] = (self.cop1.read_f64(fs).round_ties_even() as i64) as u64;
+            0x25 => { // CVT.L.D (FR=0: 64-bit result split into even/odd pair)
+                let val = (self.cop1.read_f64(fs).round_ties_even() as i64) as u64;
+                self.cop1.fpr[fd] = val & 0xFFFF_FFFF;
+                self.cop1.fpr[fd | 1] = (val >> 32) & 0xFFFF_FFFF;
             }
             0x30..=0x3F => self.cop1_compare_d(instr),
             _ => self.unimpl(
@@ -1227,7 +1329,10 @@ impl Vr4300 {
     fn cop1_l(&mut self, instr: Instruction, current_pc: u64) {
         let fs = instr.rd();
         let fd = instr.sa();
-        let int_val = self.cop1.fpr[fs] as i64;
+        // FR=0: combine even/odd pair for 64-bit integer value
+        let low = self.cop1.fpr[fs] as u32 as u64;
+        let high = self.cop1.fpr[fs | 1] as u32 as u64;
+        let int_val = ((high << 32) | low) as i64;
 
         match instr.funct() {
             0x20 => { // CVT.S.L
@@ -1253,6 +1358,10 @@ impl Vr4300 {
         let result = ((cond & 0x01) != 0 && unordered)
                   || ((cond & 0x02) != 0 && !unordered && a == b)
                   || ((cond & 0x04) != 0 && !unordered && a < b);
+        if self.fpu_trace {
+            eprintln!("  [{:#010X}] C.{}.S f{}({}) f{}({}) = {}",
+                self.pc.wrapping_sub(8), cond, instr.rd(), a, instr.rt(), b, result);
+        }
         self.cop1.set_condition(result);
     }
 

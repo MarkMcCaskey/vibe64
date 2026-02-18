@@ -59,13 +59,20 @@ impl Cop1 {
         self.fpr[n] = val.to_bits() as u64;
     }
 
-    /// Read a double-precision float from FPR[n]
+    /// Read a double-precision float from FPR[n] (FR=0 mode: even/odd pair).
+    ///
+    /// N64 uses FR=0 mode where doubles span two 32-bit registers:
+    /// FPR[n] holds the low 32 bits, FPR[n+1] holds the high 32 bits.
     pub fn read_f64(&self, n: usize) -> f64 {
-        f64::from_bits(self.fpr[n])
+        let low = self.fpr[n] as u32 as u64;
+        let high = self.fpr[n | 1] as u32 as u64;
+        f64::from_bits((high << 32) | low)
     }
 
-    /// Write a double-precision float to FPR[n]
+    /// Write a double-precision float to FPR[n] (FR=0 mode: even/odd pair).
     pub fn write_f64(&mut self, n: usize, val: f64) {
-        self.fpr[n] = val.to_bits();
+        let bits = val.to_bits();
+        self.fpr[n] = bits & 0xFFFF_FFFF;             // low 32 bits → even register
+        self.fpr[n | 1] = (bits >> 32) & 0xFFFF_FFFF; // high 32 bits → odd register
     }
 }

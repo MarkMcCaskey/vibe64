@@ -52,6 +52,10 @@ pub struct Vr4300 {
     /// Track unimplemented opcode hits: key = "CATEGORY:0xNN", value = hit count.
     /// Logs each unique opcode once on first encounter.
     pub unimpl_opcodes: HashMap<String, u64>,
+
+    /// When true, log every FPU operation with input/output values.
+    /// Set by the diagnostic loop to trace specific functions.
+    pub fpu_trace: bool,
 }
 
 impl Vr4300 {
@@ -69,6 +73,7 @@ impl Vr4300 {
             ll_bit: false,
             tlb_miss: None,
             unimpl_opcodes: HashMap::new(),
+            fpu_trace: false,
         };
 
         // COP0 initial state after cold reset

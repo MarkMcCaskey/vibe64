@@ -102,8 +102,8 @@ pub fn parse_header(data: &[u8], format: RomFormat) -> Result<RomHeader, RomErro
     let crc2 = u32::from_be_bytes(data[0x14..0x18].try_into().unwrap());
     let name_bytes = &data[0x20..0x34];
     let name = String::from_utf8_lossy(name_bytes).trim_end_matches('\0').trim().to_string();
-    let game_code: [u8; 4] = data[0x38..0x3C].try_into().unwrap();
-    let version = data[0x3C];
+    let game_code: [u8; 4] = data[0x3B..0x3F].try_into().unwrap();
+    let version = data[0x3F];
 
     Ok(RomHeader {
         format,
