@@ -7,11 +7,49 @@
 ///   Sequence of command blocks, each: [tx_len, rx_len, tx_data..., rx_data...]
 ///   Byte 63 (0x3F) is the PIF control byte.
 ///   tx_len = 0xFE means end of commands, 0xFD means skip this channel.
+///
+/// PIF control byte (byte 63) values:
+///   0x01 = process joybus commands
+///   0x02 = CIC challenge-response (CIC-6105 only)
+///   0x08 = terminate boot process
+
+use crate::cart::cic::CicVariant;
+
+/// N64 controller button bit flags (big-endian button word).
+pub mod buttons {
+    pub const A: u16       = 0x8000;
+    pub const B: u16       = 0x4000;
+    pub const Z: u16       = 0x2000;
+    pub const START: u16   = 0x1000;
+    pub const D_UP: u16    = 0x0800;
+    pub const D_DOWN: u16  = 0x0400;
+    pub const D_LEFT: u16  = 0x0200;
+    pub const D_RIGHT: u16 = 0x0100;
+    pub const L: u16       = 0x0020;
+    pub const R: u16       = 0x0010;
+    pub const C_UP: u16    = 0x0008;
+    pub const C_DOWN: u16  = 0x0004;
+    pub const C_LEFT: u16  = 0x0002;
+    pub const C_RIGHT: u16 = 0x0001;
+}
+
+/// Live controller state, updated by the frontend from keyboard input.
+#[derive(Default)]
+pub struct ControllerState {
+    pub buttons: u16,
+    pub stick_x: i8,
+    pub stick_y: i8,
+}
+
 pub struct Pif {
     /// PIF Boot ROM (not included — emulators skip PIF boot)
     boot_rom: [u8; 1984],
     /// PIF RAM: 64 bytes for controller communication
     pub ram: [u8; 64],
+    /// CIC variant (needed for CIC-6105 challenge-response)
+    cic: CicVariant,
+    /// Controller 1 state (set by frontend)
+    pub controller: ControllerState,
 }
 
 impl Pif {
@@ -19,7 +57,13 @@ impl Pif {
         Self {
             boot_rom: [0u8; 1984],
             ram: [0u8; 64],
+            cic: CicVariant::Unknown,
+            controller: ControllerState::default(),
         }
+    }
+
+    pub fn set_cic(&mut self, cic: CicVariant) {
+        self.cic = cic;
     }
 
     pub fn read_boot_rom_u32(&self, addr: u32) -> u32 {
@@ -60,9 +104,28 @@ impl Pif {
 
     /// Process PIF commands after SI DMA writes PIF RAM.
     ///
-    /// Walks the command buffer and responds to controller queries.
-    /// For now, all 4 controller ports report "no device connected."
+    /// Checks the control byte (byte 63) to determine which operation to perform:
+    /// - Bit 0 (0x01): process joybus commands (controller/EEPROM)
+    /// - Bit 1 (0x02): CIC challenge-response (CIC-6105 anti-piracy)
     pub fn process_commands(&mut self) {
+        let control = self.ram[63];
+
+        // Process joybus commands (controller I/O)
+        if control & 0x01 != 0 || control == 0 {
+            self.process_joybus();
+        }
+
+        // CIC-6105 challenge-response
+        if control & 0x02 != 0 && self.cic == CicVariant::Cic6105 {
+            self.cic_6105_challenge();
+        }
+
+        // Clear PIF control byte
+        self.ram[63] = 0;
+    }
+
+    /// Walk joybus command buffer and respond to controller queries.
+    fn process_joybus(&mut self) {
         let mut i = 0usize;
         let mut channel = 0u8;
 
@@ -89,13 +152,13 @@ impl Pif {
 
             match cmd {
                 0x00 | 0xFF => {
-                    // Controller info / reset: respond with "no pak" for
-                    // standard N64 controller on port 0, nothing on others
+                    // Controller info / reset
                     if rx >= 3 {
                         if channel == 0 {
-                            // Type: 0x0005 = standard controller, pak status: 0x01
-                            self.ram[rx_start] = 0x05;
-                            self.ram[rx_start + 1] = 0x00;
+                            // Type: 0x0005 = standard controller (big-endian)
+                            // Status: 0x01 = controller pak present
+                            self.ram[rx_start] = 0x00;
+                            self.ram[rx_start + 1] = 0x05;
                             self.ram[rx_start + 2] = 0x01;
                         } else {
                             // No controller: set error flag (bit 7 of rx_len)
@@ -107,11 +170,10 @@ impl Pif {
                     // Read controller buttons: 4 bytes of button/stick state
                     if rx >= 4 {
                         if channel == 0 {
-                            // All buttons released, stick centered
-                            self.ram[rx_start] = 0x00;
-                            self.ram[rx_start + 1] = 0x00;
-                            self.ram[rx_start + 2] = 0x00; // stick X
-                            self.ram[rx_start + 3] = 0x00; // stick Y
+                            self.ram[rx_start] = (self.controller.buttons >> 8) as u8;
+                            self.ram[rx_start + 1] = (self.controller.buttons & 0xFF) as u8;
+                            self.ram[rx_start + 2] = self.controller.stick_x as u8;
+                            self.ram[rx_start + 3] = self.controller.stick_y as u8;
                         } else {
                             self.ram[i + 1] = rx_len | 0x80;
                         }
@@ -126,8 +188,58 @@ impl Pif {
             i = rx_start + rx;
             channel += 1;
         }
+    }
 
-        // Clear PIF control byte
-        self.ram[63] = 0;
+    /// CIC-NUS-6105 challenge-response algorithm.
+    ///
+    /// The game sends a 30-nibble challenge in PIF RAM bytes 0x30-0x3E
+    /// and expects a valid 30-nibble response in the same location.
+    /// If the response is wrong, the game deliberately freezes.
+    ///
+    /// Algorithm from: https://github.com/pj64team/Project64-1.6-Plus/blob/main/n64_cic_nus_6105.c
+    fn cic_6105_challenge(&mut self) {
+        const LUT0: [u8; 16] = [
+            0x4, 0x7, 0xA, 0x7, 0xE, 0x5, 0xE, 0x1,
+            0xC, 0xF, 0x8, 0xF, 0x6, 0x3, 0x6, 0x9,
+        ];
+        const LUT1: [u8; 16] = [
+            0x4, 0x1, 0xA, 0x7, 0xE, 0x5, 0xE, 0x1,
+            0xC, 0x9, 0x8, 0x5, 0x6, 0x3, 0xC, 0x9,
+        ];
+
+        // Extract 30 nibbles from PIF RAM bytes 0x30-0x3E
+        let mut challenge = [0u8; 30];
+        for i in 0..15 {
+            challenge[i * 2] = (self.ram[0x30 + i] >> 4) & 0x0F;
+            challenge[i * 2 + 1] = self.ram[0x30 + i] & 0x0F;
+        }
+
+        // Compute response
+        let mut response = [0u8; 30];
+        let mut key: u8 = 0x0B;
+        let mut use_lut1 = false;
+
+        for i in 0..30 {
+            let lut = if use_lut1 { &LUT1 } else { &LUT0 };
+            response[i] = (key.wrapping_add(5u8.wrapping_mul(challenge[i]))) & 0x0F;
+            key = lut[response[i] as usize];
+            let sgn = (response[i] >> 3) & 1;
+            let mag = if sgn == 1 { (!response[i]) & 0x7 } else { response[i] & 0x7 };
+            let mut mod_val = if mag % 3 == 1 { sgn } else { 1 - sgn };
+            if use_lut1 && (response[i] == 0x1 || response[i] == 0x9) {
+                mod_val = 1;
+            }
+            if use_lut1 && (response[i] == 0xB || response[i] == 0xE) {
+                mod_val = 0;
+            }
+            use_lut1 = mod_val == 1;
+        }
+
+        // Write 30 nibbles back to PIF RAM bytes 0x30-0x3E
+        for i in 0..15 {
+            self.ram[0x30 + i] = (response[i * 2] << 4) | response[i * 2 + 1];
+        }
+
+        log::trace!("CIC-6105 challenge processed");
     }
 }

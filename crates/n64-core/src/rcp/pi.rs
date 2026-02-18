@@ -11,6 +11,15 @@
 
 use super::mi::{Mi, MiInterrupt};
 
+/// PI DMA direction.
+pub enum PiDmaRequest {
+    None,
+    /// Cart → RDRAM (loading from ROM/SRAM)
+    Write,
+    /// RDRAM → Cart (saving to SRAM/Flash)
+    Read,
+}
+
 pub struct Pi {
     pub dram_addr: u32,
     pub cart_addr: u32,
@@ -76,45 +85,46 @@ impl Pi {
         }
     }
 
-    /// Write to PI registers. Returns true if a DMA should be triggered.
-    pub fn write_u32(&mut self, addr: u32, val: u32, mi: &mut Mi) -> bool {
+    /// Write to PI registers. Returns a DMA request if triggered.
+    pub fn write_u32(&mut self, addr: u32, val: u32, mi: &mut Mi) -> PiDmaRequest {
         log::debug!("PI write: reg={:#04X} val={:#010X}", addr & 0x0F_FFFF, val);
         match addr & 0x0F_FFFF {
             0x00 => {
                 self.dram_addr = val & 0x00FF_FFFF;
-                false
+                PiDmaRequest::None
             }
             0x04 => {
                 self.cart_addr = val;
-                false
+                PiDmaRequest::None
             }
             0x08 => {
                 // PI_RD_LEN: RDRAM → Cart DMA (for SRAM/Flash saves)
+                self.pending_dma_len = (val & 0x00FF_FFFF) + 1;
                 log::debug!("PI RD_LEN (RDRAM→Cart): RDRAM[{:#010X}] → Cart[{:#010X}], len={:#X}",
-                    self.dram_addr, self.cart_addr, (val & 0x00FF_FFFF) + 1);
-                false // TODO: implement RDRAM→Cart DMA for saves
+                    self.dram_addr, self.cart_addr, self.pending_dma_len);
+                PiDmaRequest::Read
             }
             0x0C => {
-                // PI_WR_LEN: writing triggers Cart → RDRAM DMA
+                // PI_WR_LEN: Cart → RDRAM DMA
                 self.pending_dma_len = (val & 0x00FF_FFFF) + 1;
-                true // Signal caller to perform DMA
+                PiDmaRequest::Write
             }
             0x10 => {
                 // PI_STATUS write: bit 1 clears PI interrupt
                 if val & 0x02 != 0 {
                     mi.clear_interrupt(MiInterrupt::PI);
                 }
-                false
+                PiDmaRequest::None
             }
-            0x14 => { self.dom1_lat = val & 0xFF; false }
-            0x18 => { self.dom1_pwd = val & 0xFF; false }
-            0x1C => { self.dom1_pgs = val & 0x0F; false }
-            0x20 => { self.dom1_rls = val & 0x03; false }
-            0x24 => { self.dom2_lat = val & 0xFF; false }
-            0x28 => { self.dom2_pwd = val & 0xFF; false }
-            0x2C => { self.dom2_pgs = val & 0x0F; false }
-            0x30 => { self.dom2_rls = val & 0x03; false }
-            _ => false,
+            0x14 => { self.dom1_lat = val & 0xFF; PiDmaRequest::None }
+            0x18 => { self.dom1_pwd = val & 0xFF; PiDmaRequest::None }
+            0x1C => { self.dom1_pgs = val & 0x0F; PiDmaRequest::None }
+            0x20 => { self.dom1_rls = val & 0x03; PiDmaRequest::None }
+            0x24 => { self.dom2_lat = val & 0xFF; PiDmaRequest::None }
+            0x28 => { self.dom2_pwd = val & 0xFF; PiDmaRequest::None }
+            0x2C => { self.dom2_pgs = val & 0x0F; PiDmaRequest::None }
+            0x30 => { self.dom2_rls = val & 0x03; PiDmaRequest::None }
+            _ => PiDmaRequest::None,
         }
     }
 

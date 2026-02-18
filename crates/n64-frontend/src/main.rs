@@ -7,7 +7,10 @@ use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, EventLoop};
+use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
+
+use n64_core::memory::pif::buttons;
 
 const N64_WIDTH: u32 = 320;
 const N64_HEIGHT: u32 = 240;
@@ -50,6 +53,48 @@ impl ApplicationHandler for App {
             WindowEvent::Resized(size) => {
                 if let Some(pixels) = &mut self.pixels {
                     let _ = pixels.resize_surface(size.width.max(1), size.height.max(1));
+                }
+            }
+            WindowEvent::KeyboardInput { event, .. } => {
+                if let PhysicalKey::Code(key) = event.physical_key {
+                    let pressed = event.state.is_pressed();
+                    let ctrl = &mut self.n64.bus.pif.controller;
+
+                    // Button mapping (physical key positions — layout-independent)
+                    let btn = match key {
+                        KeyCode::KeyX      => Some(buttons::A),
+                        KeyCode::KeyZ      => Some(buttons::B),
+                        KeyCode::Space     => Some(buttons::Z),
+                        KeyCode::Enter     => Some(buttons::START),
+                        KeyCode::ShiftLeft => Some(buttons::L),
+                        KeyCode::ShiftRight => Some(buttons::R),
+                        KeyCode::KeyI      => Some(buttons::C_UP),
+                        KeyCode::KeyK      => Some(buttons::C_DOWN),
+                        KeyCode::KeyJ      => Some(buttons::C_LEFT),
+                        KeyCode::KeyL      => Some(buttons::C_RIGHT),
+                        KeyCode::KeyW      => Some(buttons::D_UP),
+                        KeyCode::KeyS      => Some(buttons::D_DOWN),
+                        KeyCode::KeyA      => Some(buttons::D_LEFT),
+                        KeyCode::KeyD      => Some(buttons::D_RIGHT),
+                        _ => None,
+                    };
+                    if let Some(b) = btn {
+                        if pressed { ctrl.buttons |= b; } else { ctrl.buttons &= !b; }
+                    }
+
+                    // Analog stick from arrow keys (±80 range)
+                    match key {
+                        KeyCode::ArrowUp    => ctrl.stick_y = if pressed { 80 } else { 0 },
+                        KeyCode::ArrowDown  => ctrl.stick_y = if pressed { -80 } else { 0 },
+                        KeyCode::ArrowLeft  => ctrl.stick_x = if pressed { -80 } else { 0 },
+                        KeyCode::ArrowRight => ctrl.stick_x = if pressed { 80 } else { 0 },
+                        _ => {}
+                    }
+
+                    // Escape to quit
+                    if key == KeyCode::Escape && pressed {
+                        event_loop.exit();
+                    }
                 }
             }
             WindowEvent::RedrawRequested => {
@@ -150,7 +195,7 @@ fn main() {
     };
 
     if use_diag {
-        let total_steps = 50_000_000u64;
+        let total_steps = 500_000_000u64;
         eprintln!("=== Boot diagnostic ({}M steps) ===", total_steps / 1_000_000);
 
         for _ in 0..total_steps {
@@ -162,12 +207,39 @@ fn main() {
         eprintln!("  VI: ctrl={:#010X} origin={:#010X} width={} h_video={:#010X}",
             n64.bus.vi.ctrl, n64.bus.vi.origin, n64.bus.vi.width, n64.bus.vi.h_video);
 
-        eprintln!("  Renderer: {} fills, {} tex_rects ({} skipped), {} tris",
+        let status = n64.cpu.cop0.regs[n64_core::cpu::cop0::Cop0::STATUS] as u32;
+        let cause = n64.cpu.cop0.regs[n64_core::cpu::cop0::Cop0::CAUSE] as u32;
+        let ie = status & 1 != 0;
+        let exl = status & 2 != 0;
+        let erl = status & 4 != 0;
+        let ip = (cause >> 8) & 0xFF;
+        let im = (status >> 8) & 0xFF;
+        eprintln!("  COP0: IE={} EXL={} ERL={} IP={:08b} IM={:08b} IP&IM={:08b}",
+            ie as u8, exl as u8, erl as u8, ip, im, ip & im);
+        eprintln!("  MI: intr={:06b} mask={:06b} pending={}",
+            n64.bus.mi.intr, n64.bus.mi.intr_mask, n64.bus.mi.interrupt_pending());
+        eprintln!("  VI: v_current={} v_intr={} v_sync={}",
+            n64.bus.vi.v_current, n64.bus.vi.v_intr, n64.bus.vi.v_sync);
+        eprintln!("  SI: {} DMAs  AI: {} DMAs (dacrate={})",
+            n64.bus.si.dma_count, n64.bus.ai.dma_count, n64.bus.ai.dacrate);
+
+        // Show where the CPU is idling
+        eprintln!("  Idle PC={:#010X}", n64.cpu.pc as u32);
+        eprintln!("  Renderer: {} fills, {} tex_rects ({} skipped), {} vtx, {} tris",
             n64.bus.renderer.fill_rect_count,
             n64.bus.renderer.tex_rect_count,
             n64.bus.renderer.tex_rect_skip,
+            n64.bus.renderer.vtx_count,
             n64.bus.renderer.tri_count);
 
+        eprintln!("  Lights: {} dir, ambient=[{},{},{}] dir0=[{},{},{}] col0=[{},{},{}]",
+            n64.bus.renderer.num_dir_lights,
+            n64.bus.renderer.light_colors[n64.bus.renderer.num_dir_lights as usize][0],
+            n64.bus.renderer.light_colors[n64.bus.renderer.num_dir_lights as usize][1],
+            n64.bus.renderer.light_colors[n64.bus.renderer.num_dir_lights as usize][2],
+            n64.bus.renderer.light_dirs[0][0], n64.bus.renderer.light_dirs[0][1], n64.bus.renderer.light_dirs[0][2],
+            n64.bus.renderer.light_colors[0][0], n64.bus.renderer.light_colors[0][1], n64.bus.renderer.light_colors[0][2],
+        );
         let origin = n64.bus.vi.origin as usize;
         let rdram = n64.rdram_data();
         let fb_size = 320 * 240 * 2;

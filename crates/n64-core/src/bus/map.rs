@@ -85,11 +85,32 @@ impl Interconnect {
         self.pi.dma_count += 1;
     }
 
+    /// PI DMA from RDRAM → Cart (save writes). We don't store the data,
+    /// but must fire the completion interrupt so the game doesn't hang.
+    pub fn pi_dma_from_rdram(&mut self) {
+        let len = self.pi.pending_dma_len;
+        log::debug!(
+            "PI DMA (save): RDRAM[{:#010X}] → Cart[{:#010X}], len={:#X}",
+            self.pi.dram_addr, self.pi.cart_addr, len
+        );
+        // Same timing as cart→RDRAM DMA
+        let delay = (len as u64 * 93_750_000) / (5 * 1024 * 1024);
+        self.pi.dma_busy_cycles = delay.max(20);
+        self.pi.pending_dma_len = 0;
+        self.pi.dma_count += 1;
+    }
+
     /// Tick PI DMA timer. Call once per CPU cycle.
     /// Raises PI interrupt in MI when DMA completes.
     pub fn tick_pi_dma(&mut self) {
         if self.pi.tick_dma() {
             self.mi.set_interrupt(crate::rcp::mi::MiInterrupt::PI);
+        }
+    }
+
+    pub fn tick_ai_dma(&mut self, elapsed: u64) {
+        if self.ai.tick(elapsed) {
+            self.mi.set_interrupt(crate::rcp::mi::MiInterrupt::AI);
         }
     }
 
@@ -191,6 +212,7 @@ impl Interconnect {
             self.rdram.write_u8(dram_addr + i, byte);
         }
         self.mi.set_interrupt(crate::rcp::mi::MiInterrupt::SI);
+        self.si.status |= 1 << 12; // Interrupt pending
         self.si.dma_count += 1;
     }
 
@@ -203,6 +225,7 @@ impl Interconnect {
         }
         self.pif.process_commands();
         self.mi.set_interrupt(crate::rcp::mi::MiInterrupt::SI);
+        self.si.status |= 1 << 12; // Interrupt pending
         self.si.dma_count += 1;
     }
 
@@ -322,11 +345,21 @@ impl Bus for Interconnect {
             0x0410_0000..=0x041F_FFFF => self.rdp.write_reg_u32(addr, val),
             0x0430_0000..=0x043F_FFFF => self.mi.write_u32(addr, val),
             0x0440_0000..=0x044F_FFFF => self.vi.write_u32(addr, val, &mut self.mi),
-            0x0450_0000..=0x045F_FFFF => self.ai.write_u32(addr, val),
+            0x0450_0000..=0x045F_FFFF => {
+                use crate::rcp::ai::AiRegWrite;
+                match self.ai.write_u32(addr, val) {
+                    AiRegWrite::ClearInterrupt => {
+                        self.mi.clear_interrupt(crate::rcp::mi::MiInterrupt::AI);
+                    }
+                    AiRegWrite::None => {}
+                }
+            }
             0x0460_0000..=0x046F_FFFF => {
-                let trigger_dma = self.pi.write_u32(addr, val, &mut self.mi);
-                if trigger_dma {
-                    self.pi_dma_to_rdram();
+                use crate::rcp::pi::PiDmaRequest;
+                match self.pi.write_u32(addr, val, &mut self.mi) {
+                    PiDmaRequest::Write => self.pi_dma_to_rdram(),
+                    PiDmaRequest::Read => self.pi_dma_from_rdram(),
+                    PiDmaRequest::None => {}
                 }
             }
             0x0470_0000..=0x047F_FFFF => self.ri.write_u32(addr, val),
@@ -340,6 +373,7 @@ impl Bus for Interconnect {
                         // SI_STATUS write — clear SI interrupt
                         if addr & 0x0F_FFFF == 0x18 {
                             self.mi.clear_interrupt(crate::rcp::mi::MiInterrupt::SI);
+                            self.si.status &= !(1 << 12); // Clear interrupt pending
                         }
                     }
                 }

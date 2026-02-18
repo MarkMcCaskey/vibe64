@@ -40,6 +40,7 @@ impl N64 {
         let entry_point = header.entry_point;
         let cart = Cartridge::new(rom_data, header);
         let mut bus = Interconnect::new(cart);
+        bus.pif.set_cic(cic);
 
         // HLE boot: instead of running the IPL3 bootloader (which is
         // encrypted for CIC-6105), do what it would have done:
@@ -118,6 +119,7 @@ impl N64 {
         self.cycles += elapsed;
         self.bus.vi.tick(elapsed, &mut self.bus.mi);
         self.bus.tick_pi_dma();
+        self.bus.tick_ai_dma(elapsed);
         elapsed
     }
 
@@ -132,6 +134,7 @@ impl N64 {
 
             self.bus.vi.tick(elapsed, &mut self.bus.mi);
             self.bus.tick_pi_dma();
+        self.bus.tick_ai_dma(elapsed);
         }
     }
 
@@ -155,6 +158,7 @@ impl N64 {
             self.cycles += elapsed;
             self.bus.vi.tick(elapsed, &mut self.bus.mi);
             self.bus.tick_pi_dma();
+        self.bus.tick_ai_dma(elapsed);
 
             if !tracing && self.bus.pi.dma_count >= trigger_dma {
                 tracing = true;
@@ -178,6 +182,7 @@ impl N64 {
             self.cycles += elapsed;
             self.bus.vi.tick(elapsed, &mut self.bus.mi);
             self.bus.tick_pi_dma();
+        self.bus.tick_ai_dma(elapsed);
         }
         None
     }
@@ -191,6 +196,7 @@ impl N64 {
             self.cycles += elapsed;
             self.bus.vi.tick(elapsed, &mut self.bus.mi);
             self.bus.tick_pi_dma();
+        self.bus.tick_ai_dma(elapsed);
 
             if self.cpu.gpr[30] != 0 {
                 // Dump CPU state on failure for debugging

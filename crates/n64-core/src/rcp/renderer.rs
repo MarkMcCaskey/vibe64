@@ -83,6 +83,14 @@ pub struct Renderer {
     pub combine_hi: u32,
     pub combine_lo: u32,
 
+    // ─── Segment table (RSP address resolution) ───
+    pub segment_table: [u32; 16],
+
+    // ─── Lighting ───
+    pub num_dir_lights: u8,
+    pub light_colors: [[u8; 3]; 8],   // 0..num_dir_lights = directional, num_dir_lights = ambient
+    pub light_dirs: [[i8; 3]; 8],
+
     // ─── Texture memory (4 KB, mirroring real TMEM) ───
     pub tmem: [u8; 4096],
 
@@ -103,6 +111,10 @@ pub struct Renderer {
     pub mvp: [[f32; 4]; 4],
     pub matrix_stack: Vec<[[f32; 4]; 4]>,
 
+    // ─── Viewport (pixel-space scale & translate) ───
+    pub viewport_scale: [f32; 3],
+    pub viewport_trans: [f32; 3],
+
     // ─── RDP half-word storage (for texture rect) ───
     pub rdp_half: [u32; 2],
 
@@ -111,6 +123,7 @@ pub struct Renderer {
     pub tex_rect_count: u32,
     pub tex_rect_skip: u32,
     pub tri_count: u32,
+    pub vtx_count: u32,
 }
 
 impl Renderer {
@@ -140,6 +153,10 @@ impl Renderer {
             prim_min_level: 0,
             combine_hi: 0,
             combine_lo: 0,
+            segment_table: [0; 16],
+            num_dir_lights: 0,
+            light_colors: [[0; 3]; 8],
+            light_dirs: [[0; 3]; 8],
             tmem: [0; 4096],
             tiles: [TileDescriptor::default(); 8],
             vertex_buffer: [Vertex::default(); 32],
@@ -152,17 +169,29 @@ impl Renderer {
             projection: identity_matrix(),
             mvp: identity_matrix(),
             matrix_stack: Vec::new(),
+            viewport_scale: [160.0, 120.0, 511.0],
+            viewport_trans: [160.0, 120.0, 511.0],
             rdp_half: [0; 2],
             fill_rect_count: 0,
             tex_rect_count: 0,
             tex_rect_skip: 0,
             tri_count: 0,
+            vtx_count: 0,
         }
     }
 
     /// Current cycle type from othermode_H bits 52-53.
     fn cycle_type(&self) -> u8 {
         ((self.othermode_h >> 20) & 0x3) as u8
+    }
+
+    /// Resolve a segment-relative address to a physical RDRAM address.
+    /// Format: addr[27:24] = segment ID, addr[23:0] = offset.
+    /// Result = segment_table[seg] + offset.
+    pub fn resolve_segment(&self, addr: u32) -> u32 {
+        let seg = ((addr >> 24) & 0x0F) as usize;
+        let offset = addr & 0x00FF_FFFF;
+        self.segment_table[seg] + offset
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -175,14 +204,14 @@ impl Renderer {
         self.color_image_format = ((w0 >> 21) & 0x7) as u8;
         self.color_image_size = ((w0 >> 19) & 0x3) as u8;
         self.color_image_width = (w0 & 0xFFF) + 1;
-        self.color_image_addr = virt_to_phys(w1);
+        self.color_image_addr = self.resolve_segment(w1);
         log::trace!("SetColorImage: addr={:#X} width={} size={}",
             self.color_image_addr, self.color_image_width, self.color_image_size);
     }
 
     /// G_SETZIMG: Set the depth buffer destination.
     pub fn cmd_set_z_image(&mut self, _w0: u32, w1: u32) {
-        self.z_image_addr = virt_to_phys(w1);
+        self.z_image_addr = self.resolve_segment(w1);
     }
 
     /// G_SETTIMG: Set the texture source address.
@@ -190,7 +219,7 @@ impl Renderer {
         self.texture_image_format = ((w0 >> 21) & 0x7) as u8;
         self.texture_image_size = ((w0 >> 19) & 0x3) as u8;
         self.texture_image_width = (w0 & 0xFFF) + 1;
-        self.texture_image_addr = virt_to_phys(w1);
+        self.texture_image_addr = self.resolve_segment(w1);
     }
 
     pub fn cmd_set_fill_color(&mut self, w1: u32) {
@@ -484,20 +513,25 @@ impl Renderer {
             );
         }
 
+        // Convert S/T from S10.5 to S10.10 to match dsdx/dtdy (S5.10)
+        let s10 = s << 5;
+        let t10 = t << 5;
+
         for y in y0..y1 {
             for x in x0..x1 {
-                // Compute texture coordinates
+                // Compute texture coordinates in S.10 fixed-point
                 let dx = x - (ulx >> 2);
                 let dy = y - (uly >> 2);
 
                 let (tex_s, tex_t) = if flip {
-                    (s + dy * dsdx, t + dx * dtdy)
+                    (s10 + dy * dsdx, t10 + dx * dtdy)
                 } else {
-                    (s + dx * dsdx, t + dy * dtdy)
+                    (s10 + dx * dsdx, t10 + dy * dtdy)
                 };
 
-                // Sample texture
-                let color = self.sample_texture(tile_idx, tex_s, tex_t, cycle);
+                // Sample texture and run through color combiner
+                let texel0 = self.sample_texture(tile_idx, tex_s >> 5, tex_t >> 5, cycle);
+                let color = self.combine_pixel(texel0, [255, 255, 255, 255]);
 
                 // Write pixel
                 match self.color_image_size {
@@ -650,14 +684,184 @@ impl Renderer {
     }
 
     // ═══════════════════════════════════════════════════════════════
-    // Geometry Commands (stubs for now)
+    // Color Combiner
+    // ═══════════════════════════════════════════════════════════════
+
+    /// Evaluate the RDP color combiner: (A - B) * C + D per channel.
+    /// `texel0` is the sampled texture color, `shade` is the interpolated vertex color.
+    fn combine_pixel(&self, texel0: [u8; 4], shade: [u8; 4]) -> [u8; 4] {
+        let cycle = self.cycle_type();
+
+        // Copy mode: pass texel through directly
+        if cycle == 2 { return texel0; }
+        // Fill mode: shouldn't reach here (handled by fill_rect)
+        if cycle == 3 { return texel0; }
+
+        // Extract cycle 0 selectors from combine_hi / combine_lo
+        let a0_rgb = ((self.combine_hi >> 20) & 0xF) as u8;
+        let c0_rgb = ((self.combine_hi >> 15) & 0x1F) as u8;
+        let a0_a   = ((self.combine_hi >> 12) & 0x7) as u8;
+        let c0_a   = ((self.combine_hi >> 9) & 0x7) as u8;
+        let b0_rgb = ((self.combine_lo >> 28) & 0xF) as u8;
+        let d0_rgb = ((self.combine_lo >> 15) & 0x7) as u8;
+        let b0_a   = ((self.combine_lo >> 12) & 0x7) as u8;
+        let d0_a   = ((self.combine_lo >> 9) & 0x7) as u8;
+
+        // Cycle 0: COMBINED input is zero (no prior cycle output)
+        let combined = [0u8; 4];
+        let result = self.cc_evaluate(
+            a0_rgb, b0_rgb, c0_rgb, d0_rgb,
+            a0_a, b0_a, c0_a, d0_a,
+            &combined, &texel0, &shade,
+        );
+
+        // 2-cycle mode: run again with cycle 1 selectors, feeding cycle 0 result as COMBINED
+        if cycle == 1 {
+            let a1_rgb = ((self.combine_hi >> 5) & 0xF) as u8;
+            let c1_rgb = (self.combine_hi & 0x1F) as u8;
+            let a1_a   = ((self.combine_lo >> 21) & 0x7) as u8;
+            let c1_a   = ((self.combine_lo >> 18) & 0x7) as u8;
+            let b1_rgb = ((self.combine_lo >> 24) & 0xF) as u8;
+            let d1_rgb = ((self.combine_lo >> 6) & 0x7) as u8;
+            let b1_a   = ((self.combine_lo >> 3) & 0x7) as u8;
+            let d1_a   = (self.combine_lo & 0x7) as u8;
+
+            return self.cc_evaluate(
+                a1_rgb, b1_rgb, c1_rgb, d1_rgb,
+                a1_a, b1_a, c1_a, d1_a,
+                &result, &texel0, &shade,
+            );
+        }
+
+        result
+    }
+
+    /// Apply (A - B) * C + D for RGB and Alpha using the given selectors.
+    fn cc_evaluate(
+        &self,
+        a_rgb_sel: u8, b_rgb_sel: u8, c_rgb_sel: u8, d_rgb_sel: u8,
+        a_a_sel: u8, b_a_sel: u8, c_a_sel: u8, d_a_sel: u8,
+        combined: &[u8; 4], texel0: &[u8; 4], shade: &[u8; 4],
+    ) -> [u8; 4] {
+        let a_rgb = self.cc_rgb_a(a_rgb_sel, combined, texel0, shade);
+        let b_rgb = self.cc_rgb_b(b_rgb_sel, combined, texel0, shade);
+        let c_rgb = self.cc_rgb_c(c_rgb_sel, combined, texel0, shade);
+        let d_rgb = self.cc_rgb_d(d_rgb_sel, combined, texel0, shade);
+
+        let a_a = self.cc_alpha_abd(a_a_sel, combined, texel0, shade);
+        let b_a = self.cc_alpha_abd(b_a_sel, combined, texel0, shade);
+        let c_a = self.cc_alpha_c(c_a_sel, texel0, shade);
+        let d_a = self.cc_alpha_abd(d_a_sel, combined, texel0, shade);
+
+        let mut result = [0u8; 4];
+        for i in 0..3 {
+            let v = (a_rgb[i] as i16 - b_rgb[i] as i16) * c_rgb[i] as i16 / 256
+                + d_rgb[i] as i16;
+            result[i] = v.clamp(0, 255) as u8;
+        }
+        let v = (a_a as i16 - b_a as i16) * c_a as i16 / 256 + d_a as i16;
+        result[3] = v.clamp(0, 255) as u8;
+        result
+    }
+
+    /// RGB input A (4-bit, 16 options): COMBINED, TEXEL0, TEXEL1, PRIM, SHADE, ENV, 1.0, NOISE, 0...
+    fn cc_rgb_a(&self, sel: u8, combined: &[u8; 4], texel0: &[u8; 4], shade: &[u8; 4]) -> [u8; 3] {
+        match sel {
+            0 => [combined[0], combined[1], combined[2]],
+            1 => [texel0[0], texel0[1], texel0[2]],
+            2 => [texel0[0], texel0[1], texel0[2]], // TEXEL1 → TEXEL0
+            3 => [self.prim_color[0], self.prim_color[1], self.prim_color[2]],
+            4 => [shade[0], shade[1], shade[2]],
+            5 => [self.env_color[0], self.env_color[1], self.env_color[2]],
+            6 => [255, 255, 255], // 1.0
+            _ => [0, 0, 0],       // NOISE / 0
+        }
+    }
+
+    /// RGB input B (4-bit, 16 options): COMBINED, TEXEL0, TEXEL1, PRIM, SHADE, ENV, CENTER, K4, 0...
+    fn cc_rgb_b(&self, sel: u8, combined: &[u8; 4], texel0: &[u8; 4], shade: &[u8; 4]) -> [u8; 3] {
+        match sel {
+            0 => [combined[0], combined[1], combined[2]],
+            1 => [texel0[0], texel0[1], texel0[2]],
+            2 => [texel0[0], texel0[1], texel0[2]], // TEXEL1
+            3 => [self.prim_color[0], self.prim_color[1], self.prim_color[2]],
+            4 => [shade[0], shade[1], shade[2]],
+            5 => [self.env_color[0], self.env_color[1], self.env_color[2]],
+            _ => [0, 0, 0], // CENTER, K4, 0
+        }
+    }
+
+    /// RGB input C (5-bit, 32 options): includes alpha-as-RGB variants and LOD fraction.
+    fn cc_rgb_c(&self, sel: u8, combined: &[u8; 4], texel0: &[u8; 4], shade: &[u8; 4]) -> [u8; 3] {
+        match sel {
+            0  => [combined[0], combined[1], combined[2]],
+            1  => [texel0[0], texel0[1], texel0[2]],
+            2  => [texel0[0], texel0[1], texel0[2]], // TEXEL1
+            3  => [self.prim_color[0], self.prim_color[1], self.prim_color[2]],
+            4  => [shade[0], shade[1], shade[2]],
+            5  => [self.env_color[0], self.env_color[1], self.env_color[2]],
+            7  => [combined[3], combined[3], combined[3]],     // COMBINED_ALPHA
+            8  => [texel0[3], texel0[3], texel0[3]],           // TEXEL0_ALPHA
+            9  => [texel0[3], texel0[3], texel0[3]],           // TEXEL1_ALPHA
+            10 => [self.prim_color[3]; 3],                     // PRIM_ALPHA
+            11 => [shade[3]; 3],                               // SHADE_ALPHA
+            12 => [self.env_color[3]; 3],                      // ENV_ALPHA
+            14 => [self.prim_lod_frac; 3],                     // PRIM_LOD_FRAC
+            _  => [0, 0, 0], // KEY_SCALE, LOD_FRAC, K5, 0
+        }
+    }
+
+    /// RGB input D (3-bit, 8 options): COMBINED, TEXEL0, TEXEL1, PRIM, SHADE, ENV, 1.0, 0.
+    fn cc_rgb_d(&self, sel: u8, combined: &[u8; 4], texel0: &[u8; 4], shade: &[u8; 4]) -> [u8; 3] {
+        match sel {
+            0 => [combined[0], combined[1], combined[2]],
+            1 => [texel0[0], texel0[1], texel0[2]],
+            2 => [texel0[0], texel0[1], texel0[2]], // TEXEL1
+            3 => [self.prim_color[0], self.prim_color[1], self.prim_color[2]],
+            4 => [shade[0], shade[1], shade[2]],
+            5 => [self.env_color[0], self.env_color[1], self.env_color[2]],
+            6 => [255, 255, 255], // 1.0
+            _ => [0, 0, 0],
+        }
+    }
+
+    /// Alpha inputs A, B, D (3-bit, 8 options): COMBINED, TEXEL0, TEXEL1, PRIM, SHADE, ENV, 1.0, 0.
+    fn cc_alpha_abd(&self, sel: u8, combined: &[u8; 4], texel0: &[u8; 4], shade: &[u8; 4]) -> u8 {
+        match sel {
+            0 => combined[3],
+            1 => texel0[3],
+            2 => texel0[3], // TEXEL1
+            3 => self.prim_color[3],
+            4 => shade[3],
+            5 => self.env_color[3],
+            6 => 255,
+            _ => 0,
+        }
+    }
+
+    /// Alpha input C (3-bit, DIFFERENT mapping): LOD_FRAC, TEXEL0, TEXEL1, PRIM, SHADE, ENV, PRIM_LOD, 0.
+    fn cc_alpha_c(&self, sel: u8, texel0: &[u8; 4], shade: &[u8; 4]) -> u8 {
+        match sel {
+            1 => texel0[3],
+            2 => texel0[3], // TEXEL1
+            3 => self.prim_color[3],
+            4 => shade[3],
+            5 => self.env_color[3],
+            6 => self.prim_lod_frac,
+            _ => 0, // LOD_FRACTION, 0
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // Geometry Commands
     // ═══════════════════════════════════════════════════════════════
 
     /// G_VTX: Load vertices into the vertex buffer.
     pub fn cmd_vertex(&mut self, w0: u32, w1: u32, rdram: &[u8]) {
         let num = ((w0 >> 12) & 0xFF) as usize;
         let start = (((w0 >> 1) & 0x7F) as usize).saturating_sub(num);
-        let addr = virt_to_phys(w1) as usize;
+        let addr = self.resolve_segment(w1) as usize;
+        self.vtx_count += num as u32;
 
         for i in 0..num {
             let idx = start + i;
@@ -672,48 +876,107 @@ impl Renderer {
             // off+6: padding/flag
             let s = read_i16(rdram, off + 8) as f32;
             let t = read_i16(rdram, off + 10) as f32;
-            let r = rdram[(off + 12) & (rdram.len() - 1)];
-            let g = rdram[(off + 13) & (rdram.len() - 1)];
-            let b = rdram[(off + 14) & (rdram.len() - 1)];
             let a = rdram[(off + 15) & (rdram.len() - 1)];
 
-            // Transform vertex by MVP matrix
-            let [tx, ty, tz, tw] = mat4_mul_vec(&self.mvp, [x, y, z, 1.0]);
+            // When G_LIGHTING is on, bytes 12-14 are normals; compute shade color
+            let (r, g, b) = if self.geometry_mode & 0x20000 != 0 {
+                let nx = rdram[(off + 12) & (rdram.len() - 1)] as i8 as f32;
+                let ny = rdram[(off + 13) & (rdram.len() - 1)] as i8 as f32;
+                let nz = rdram[(off + 14) & (rdram.len() - 1)] as i8 as f32;
 
-            self.vertex_buffer[idx] = Vertex {
-                x: tx, y: ty, z: tz, w: tw,
-                s, t, r, g, b, a,
+                // Transform normal by modelview upper-3x3
+                let wnx = self.modelview[0][0] * nx + self.modelview[0][1] * ny + self.modelview[0][2] * nz;
+                let wny = self.modelview[1][0] * nx + self.modelview[1][1] * ny + self.modelview[1][2] * nz;
+                let wnz = self.modelview[2][0] * nx + self.modelview[2][1] * ny + self.modelview[2][2] * nz;
+                let len = (wnx * wnx + wny * wny + wnz * wnz).sqrt();
+                let (wnx, wny, wnz) = if len > 0.001 {
+                    (wnx / len, wny / len, wnz / len)
+                } else {
+                    (0.0, 0.0, 1.0)
+                };
+
+                // Ambient light is at index num_dir_lights
+                let n = self.num_dir_lights as usize;
+                let amb = if n < 8 { self.light_colors[n] } else { [64, 64, 64] };
+                let mut ra = amb[0] as f32;
+                let mut ga = amb[1] as f32;
+                let mut ba = amb[2] as f32;
+
+                // Accumulate directional lights
+                for li in 0..n.min(7) {
+                    let dx = self.light_dirs[li][0] as f32 / 127.0;
+                    let dy = self.light_dirs[li][1] as f32 / 127.0;
+                    let dz = self.light_dirs[li][2] as f32 / 127.0;
+                    let dot = (wnx * dx + wny * dy + wnz * dz).max(0.0);
+                    ra += self.light_colors[li][0] as f32 * dot;
+                    ga += self.light_colors[li][1] as f32 * dot;
+                    ba += self.light_colors[li][2] as f32 * dot;
+                }
+                (ra.clamp(0.0, 255.0) as u8, ga.clamp(0.0, 255.0) as u8, ba.clamp(0.0, 255.0) as u8)
+            } else {
+                // No lighting — read raw vertex colors
+                let r = rdram[(off + 12) & (rdram.len() - 1)];
+                let g = rdram[(off + 13) & (rdram.len() - 1)];
+                let b = rdram[(off + 14) & (rdram.len() - 1)];
+                (r, g, b)
             };
+
+            // Transform vertex by MVP matrix → clip space
+            let [cx, cy, cz, cw] = mat4_mul_vec(&self.mvp, [x, y, z, 1.0]);
+
+            // Perspective divide + viewport transform → screen space
+            if cw.abs() > 0.0001 {
+                let inv_w = 1.0 / cw;
+                self.vertex_buffer[idx] = Vertex {
+                    x: cx * inv_w * self.viewport_scale[0] + self.viewport_trans[0],
+                    y: cy * inv_w * self.viewport_scale[1] + self.viewport_trans[1],
+                    z: (cz * inv_w * self.viewport_scale[2] + self.viewport_trans[2])
+                        .clamp(0.0, 0xFFFF as f32),
+                    w: inv_w,
+                    s, t, r, g, b, a,
+                };
+            } else {
+                // Vertex at infinity — place off-screen so triangles get clipped
+                self.vertex_buffer[idx] = Vertex {
+                    x: -10000.0, y: -10000.0, z: 0.0, w: 0.0,
+                    s, t, r, g, b, a,
+                };
+            }
         }
     }
 
     /// G_TRI1: Draw one triangle.
-    pub fn cmd_tri1(&mut self, w0: u32, _w1: u32) {
+    pub fn cmd_tri1(&mut self, w0: u32, _w1: u32, rdram: &mut [u8]) {
         let v0 = ((w0 >> 16) & 0xFF) as usize / 2;
         let v1 = ((w0 >> 8) & 0xFF) as usize / 2;
         let v2 = (w0 & 0xFF) as usize / 2;
         if v0 < 32 && v1 < 32 && v2 < 32 {
+            self.rasterize_triangle(v0, v1, v2, rdram);
             self.tri_count += 1;
-            // TODO: rasterize triangle
         }
     }
 
     /// G_TRI2: Draw two triangles.
-    pub fn cmd_tri2(&mut self, w0: u32, w1: u32) {
+    pub fn cmd_tri2(&mut self, w0: u32, w1: u32, rdram: &mut [u8]) {
         let v0 = ((w0 >> 16) & 0xFF) as usize / 2;
         let v1 = ((w0 >> 8) & 0xFF) as usize / 2;
         let v2 = (w0 & 0xFF) as usize / 2;
         let v3 = ((w1 >> 16) & 0xFF) as usize / 2;
         let v4 = ((w1 >> 8) & 0xFF) as usize / 2;
         let v5 = (w1 & 0xFF) as usize / 2;
-        if v0 < 32 && v1 < 32 && v2 < 32 { self.tri_count += 1; }
-        if v3 < 32 && v4 < 32 && v5 < 32 { self.tri_count += 1; }
-        // TODO: rasterize triangles
+        if v0 < 32 && v1 < 32 && v2 < 32 {
+            self.rasterize_triangle(v0, v1, v2, rdram);
+            self.tri_count += 1;
+        }
+        if v3 < 32 && v4 < 32 && v5 < 32 {
+            self.rasterize_triangle(v3, v4, v5, rdram);
+            self.tri_count += 1;
+        }
     }
 
     /// G_MTX: Load a 4x4 matrix from RDRAM.
     pub fn cmd_load_matrix(&mut self, w0: u32, w1: u32, rdram: &[u8]) {
-        let addr = virt_to_phys(w1) as usize;
+        let addr = self.resolve_segment(w1) as usize;
         let params = w0 & 0xFF;
         let push = params & 0x01 == 0;
         let load = params & 0x02 != 0; // load vs multiply
@@ -757,19 +1020,173 @@ impl Renderer {
         self.texture_tile = ((w0 >> 8) & 0x7) as u8;
         self.texture_on = (w0 & 0xFF) != 0 || self.texture_scale_s != 0 || self.texture_scale_t != 0;
     }
+
+    /// G_MOVEMEM/G_MV_VIEWPORT: Load viewport parameters from RDRAM.
+    /// The viewport is 16 bytes: vscale[4] (S13.2) then vtrans[4] (S13.2).
+    pub fn cmd_set_viewport(&mut self, w1: u32, rdram: &[u8]) {
+        let addr = self.resolve_segment(w1) as usize;
+        for i in 0..3 {
+            self.viewport_scale[i] = read_i16(rdram, addr + i * 2) as f32 / 4.0;
+            self.viewport_trans[i] = read_i16(rdram, addr + 8 + i * 2) as f32 / 4.0;
+        }
+        log::trace!(
+            "Viewport: scale=({:.1},{:.1},{:.1}) trans=({:.1},{:.1},{:.1})",
+            self.viewport_scale[0], self.viewport_scale[1], self.viewport_scale[2],
+            self.viewport_trans[0], self.viewport_trans[1], self.viewport_trans[2],
+        );
+    }
+
+    /// G_MOVEMEM/G_MV_LIGHT: Load light parameters from RDRAM.
+    /// Light data is 16 bytes: col[3], pad, colc[3], pad, dir[3], pad, pad*4.
+    pub fn cmd_set_light(&mut self, dmem_offset: usize, addr: u32, rdram: &[u8]) {
+        let slot = dmem_offset / 24;
+        if slot < 2 || slot > 9 { return; }
+        let idx = slot - 2;
+        if idx >= 8 { return; }
+
+        let a = self.resolve_segment(addr) as usize;
+        if a + 11 < rdram.len() {
+            self.light_colors[idx] = [rdram[a], rdram[a + 1], rdram[a + 2]];
+            self.light_dirs[idx] = [
+                rdram[a + 8] as i8,
+                rdram[a + 9] as i8,
+                rdram[a + 10] as i8,
+            ];
+        }
+    }
+
+    /// Rasterize a triangle using edge-function (half-space) method.
+    /// Interpolates vertex colors and optionally samples textures.
+    fn rasterize_triangle(&self, i0: usize, i1: usize, i2: usize, rdram: &mut [u8]) {
+        let v0 = self.vertex_buffer[i0];
+        let v1 = self.vertex_buffer[i1];
+        let v2 = self.vertex_buffer[i2];
+
+        // Bounding box clipped to scissor
+        let scr_ulx = (self.scissor_ulx >> 2) as f32;
+        let scr_uly = (self.scissor_uly >> 2) as f32;
+        let scr_lrx = (self.scissor_lrx >> 2) as f32;
+        let scr_lry = (self.scissor_lry >> 2) as f32;
+
+        let min_x = v0.x.min(v1.x).min(v2.x).max(scr_ulx).floor() as i32;
+        let min_y = v0.y.min(v1.y).min(v2.y).max(scr_uly).floor() as i32;
+        let max_x = v0.x.max(v1.x).max(v2.x).min(scr_lrx).ceil() as i32;
+        let max_y = v0.y.max(v1.y).max(v2.y).min(scr_lry).ceil() as i32;
+
+        if min_x >= max_x || min_y >= max_y { return; }
+
+        // Triangle area via edge function — also detects degenerate triangles
+        let area = edge_function(v0.x, v0.y, v1.x, v1.y, v2.x, v2.y);
+        if area.abs() < 0.001 { return; }
+
+        // Face culling: check geometry_mode flags
+        // G_CULL_FRONT = 0x0200, G_CULL_BACK = 0x0400
+        // Positive area = front face (CCW), negative = back face (CW)
+        let cull_front = self.geometry_mode & 0x0200 != 0;
+        let cull_back = self.geometry_mode & 0x0400 != 0;
+        if cull_back && area < 0.0 { return; }
+        if cull_front && area > 0.0 { return; }
+
+        let inv_area = 1.0 / area;
+
+        let addr = self.color_image_addr as usize;
+        let width = self.color_image_width as i32;
+        let cycle = self.cycle_type();
+        let textured = self.texture_on;
+        let tile_idx = self.texture_tile as usize;
+
+        // Z-buffer state from othermode_l
+        let z_cmp = self.othermode_l & 0x10 != 0;
+        let z_upd = self.othermode_l & 0x20 != 0;
+        let z_enabled = self.geometry_mode & 0x10000 != 0 && self.z_image_addr != 0;
+        let z_addr = self.z_image_addr as usize;
+
+        for y in min_y..max_y {
+            for x in min_x..max_x {
+                let px = x as f32 + 0.5;
+                let py = y as f32 + 0.5;
+
+                // Barycentric coordinates via edge functions
+                let w0 = edge_function(v1.x, v1.y, v2.x, v2.y, px, py) * inv_area;
+                let w1 = edge_function(v2.x, v2.y, v0.x, v0.y, px, py) * inv_area;
+                let w2 = 1.0 - w0 - w1;
+
+                // Inside test: all barycentric coords must be non-negative
+                if w0 < 0.0 || w1 < 0.0 || w2 < 0.0 { continue; }
+
+                // Z-buffer depth test
+                if z_enabled {
+                    let z = (w0 * v0.z + w1 * v1.z + w2 * v2.z).clamp(0.0, 0x7FFF as f32) as u16;
+                    let z_offset = z_addr + ((y * width + x) as usize) * 2;
+                    if z_offset + 1 < rdram.len() {
+                        let old_z = u16::from_be_bytes([rdram[z_offset], rdram[z_offset + 1]]);
+                        // Z compare: lower Z = closer to camera
+                        if z_cmp && z > old_z {
+                            continue; // Fail depth test — farther than existing pixel
+                        }
+                        if z_upd {
+                            let z_bytes = z.to_be_bytes();
+                            rdram[z_offset] = z_bytes[0];
+                            rdram[z_offset + 1] = z_bytes[1];
+                        }
+                    }
+                }
+
+                // Interpolate vertex color
+                let r = (w0 * v0.r as f32 + w1 * v1.r as f32 + w2 * v2.r as f32)
+                    .clamp(0.0, 255.0) as u8;
+                let g = (w0 * v0.g as f32 + w1 * v1.g as f32 + w2 * v2.g as f32)
+                    .clamp(0.0, 255.0) as u8;
+                let b = (w0 * v0.b as f32 + w1 * v1.b as f32 + w2 * v2.b as f32)
+                    .clamp(0.0, 255.0) as u8;
+                let a = (w0 * v0.a as f32 + w1 * v1.a as f32 + w2 * v2.a as f32)
+                    .clamp(0.0, 255.0) as u8;
+
+                // Sample texture if enabled, otherwise texel0 = zero
+                let texel0 = if textured {
+                    let tex_s = w0 * v0.s + w1 * v1.s + w2 * v2.s;
+                    let tex_t = w0 * v0.t + w1 * v1.t + w2 * v2.t;
+                    let scaled_s = (tex_s * self.texture_scale_s as f32 / 65536.0) as i32;
+                    let scaled_t = (tex_t * self.texture_scale_t as f32 / 65536.0) as i32;
+                    self.sample_texture(tile_idx, scaled_s, scaled_t, cycle)
+                } else {
+                    [0, 0, 0, 0]
+                };
+                let shade = [r, g, b, a];
+                let color = self.combine_pixel(texel0, shade);
+
+                // Write pixel to framebuffer
+                match self.color_image_size {
+                    2 => {
+                        let offset = addr + ((y * width + x) as usize) * 2;
+                        if offset + 1 < rdram.len() {
+                            let pixel = pack_rgba5551(
+                                color[0], color[1], color[2], color[3],
+                            );
+                            let bytes = pixel.to_be_bytes();
+                            rdram[offset] = bytes[0];
+                            rdram[offset + 1] = bytes[1];
+                        }
+                    }
+                    3 => {
+                        let offset = addr + ((y * width + x) as usize) * 4;
+                        if offset + 3 < rdram.len() {
+                            rdram[offset] = color[0];
+                            rdram[offset + 1] = color[1];
+                            rdram[offset + 2] = color[2];
+                            rdram[offset + 3] = color[3];
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════
 // Helper functions
 // ═══════════════════════════════════════════════════════════════
-
-fn virt_to_phys(addr: u32) -> u32 {
-    match addr {
-        0x8000_0000..=0x9FFF_FFFF => addr - 0x8000_0000,
-        0xA000_0000..=0xBFFF_FFFF => addr - 0xA000_0000,
-        _ => addr & 0x00FF_FFFF,
-    }
-}
 
 fn unpack_rgba5551(val: u16) -> [u8; 4] {
     let r5 = (val >> 11) & 0x1F;
@@ -856,4 +1273,16 @@ fn read_u16(rdram: &[u8], offset: usize) -> u16 {
     } else {
         0
     }
+}
+
+/// Edge function for triangle rasterization.
+///
+/// Computes the signed area of the parallelogram formed by vectors
+/// (v1 - v0) and (p - v0). This is the fundamental building block
+/// of the half-space rasterizer:
+///   - When evaluated at all 3 edges, the signs tell us if p is inside
+///   - The values give us barycentric coordinates (after dividing by total area)
+///   - For a CCW triangle, positive means p is to the left of edge v0→v1
+fn edge_function(v0x: f32, v0y: f32, v1x: f32, v1y: f32, px: f32, py: f32) -> f32 {
+    (v1x - v0x) * (py - v0y) - (v1y - v0y) * (px - v0x)
 }

@@ -106,6 +106,7 @@ pub fn process_display_list(renderer: &mut Renderer, rdram: &mut [u8], addr: u32
     let mut pc = addr & 0x00FF_FFFF; // mask to RDRAM range
     let mut stack: Vec<u32> = Vec::with_capacity(MAX_DL_STACK);
     let mut cmd_count = 0usize;
+    let mut opcode_counts = [0u32; 256];
 
     loop {
         if cmd_count >= MAX_COMMANDS {
@@ -120,6 +121,7 @@ pub fn process_display_list(renderer: &mut Renderer, rdram: &mut [u8], addr: u32
         pc = pc.wrapping_add(8);
 
         let cmd = (w0 >> 24) as u8;
+        opcode_counts[cmd as usize] += 1;
 
         match cmd {
             G_NOOP => {}
@@ -133,7 +135,7 @@ pub fn process_display_list(renderer: &mut Renderer, rdram: &mut [u8], addr: u32
             }
 
             G_DL => {
-                let addr = virt_to_phys(w1);
+                let addr = renderer.resolve_segment(w1);
                 let push = (w0 >> 16) & 0xFF;
                 if push == 0 {
                     // Call (push return address)
@@ -191,8 +193,8 @@ pub fn process_display_list(renderer: &mut Renderer, rdram: &mut [u8], addr: u32
 
             // ─── Geometry commands (RSP-level, need vertex buffer) ───
             G_VTX => renderer.cmd_vertex(w0, w1, rdram),
-            G_TRI1 => renderer.cmd_tri1(w0, w1),
-            G_TRI2 => renderer.cmd_tri2(w0, w1),
+            G_TRI1 => renderer.cmd_tri1(w0, w1, rdram),
+            G_TRI2 => renderer.cmd_tri2(w0, w1, rdram),
             G_MTX => renderer.cmd_load_matrix(w0, w1, rdram),
             G_POPMTX => renderer.cmd_pop_matrix(w0, w1),
             G_GEOMETRYMODE => renderer.cmd_geometry_mode(w0, w1),
@@ -201,9 +203,34 @@ pub fn process_display_list(renderer: &mut Renderer, rdram: &mut [u8], addr: u32
             // ─── Sync commands (no-ops for software renderer) ───
             G_RDPFULLSYNC | G_RDPTILESYNC | G_RDPPIPESYNC | G_RDPLOADSYNC => {}
 
-            // ─── Commands we store but don't act on yet ───
-            G_MOVEWORD | G_MOVEMEM | G_SETCONVERT | G_SETKEYR | G_SETKEYGB
-            | G_SPECIAL_1 | G_MODIFYVTX | G_QUAD => {}
+            // ─── RSP memory/word commands ───
+            G_MOVEMEM => {
+                let index = w0 & 0xFF;
+                let offset = ((w0 >> 8) & 0xFF) as usize * 8;
+                match index {
+                    0x08 => renderer.cmd_set_viewport(w1, rdram),
+                    0x0A => renderer.cmd_set_light(offset, w1, rdram),
+                    _ => {}
+                }
+            }
+            G_MOVEWORD => {
+                let index = (w0 >> 16) & 0xFF;
+                match index {
+                    0x06 => { // G_MW_SEGMENT
+                        let seg = ((w0 & 0xFFFF) / 4) as usize;
+                        if seg < 16 {
+                            renderer.segment_table[seg] = w1 & 0x00FF_FFFF;
+                        }
+                    }
+                    0x0E => { // G_MW_NUMLIGHT
+                        renderer.num_dir_lights = (w1 / 24) as u8;
+                    }
+                    _ => {}
+                }
+            }
+            G_QUAD => renderer.cmd_tri2(w0, w1, rdram),
+            G_SETCONVERT | G_SETKEYR | G_SETKEYGB
+            | G_SPECIAL_1 | G_MODIFYVTX => {}
 
             G_RDPHALF_1 | G_RDPHALF_2 => {
                 // These store half-words for the next texture rect command.
@@ -219,6 +246,15 @@ pub fn process_display_list(renderer: &mut Renderer, rdram: &mut [u8], addr: u32
     }
 
     log::debug!("Display list processed: {} commands", cmd_count);
+
+    // Log opcode distribution for debugging
+    let mut summary = String::new();
+    for (op, &count) in opcode_counts.iter().enumerate() {
+        if count > 0 {
+            summary.push_str(&format!(" {:02X}:{}", op, count));
+        }
+    }
+    log::debug!("  Opcodes:{}", summary);
 }
 
 /// Read a big-endian u32 from RDRAM.
@@ -228,11 +264,3 @@ fn read_u32(rdram: &[u8], addr: u32) -> u32 {
     u32::from_be_bytes([rdram[off], rdram[off+1], rdram[off+2], rdram[off+3]])
 }
 
-/// Convert a virtual (kseg0/kseg1) address to physical.
-fn virt_to_phys(addr: u32) -> u32 {
-    match addr {
-        0x8000_0000..=0x9FFF_FFFF => addr - 0x8000_0000,
-        0xA000_0000..=0xBFFF_FFFF => addr - 0xA000_0000,
-        _ => addr & 0x00FF_FFFF,
-    }
-}
