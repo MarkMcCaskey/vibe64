@@ -135,6 +135,12 @@ pub struct Renderer {
     pub tex_rect_skip: u32,
     pub tri_count: u32,
     pub vtx_count: u32,
+
+    // ─── Debug overlay recording (mirrored from DebugFlags) ───
+    pub debug_wireframe: bool,
+    pub debug_dl_log: bool,
+    pub wire_edges: Vec<crate::debug::WireEdge>,
+    pub dl_log_entries: Vec<crate::debug::DlLogEntry>,
 }
 
 impl Renderer {
@@ -190,6 +196,10 @@ impl Renderer {
             tex_rect_skip: 0,
             tri_count: 0,
             vtx_count: 0,
+            debug_wireframe: false,
+            debug_dl_log: false,
+            wire_edges: Vec::new(),
+            dl_log_entries: Vec::new(),
         }
     }
 
@@ -1258,7 +1268,7 @@ impl Renderer {
     }
 
     /// Clip a triangle against the near plane and rasterize resulting triangles.
-    fn rasterize_triangle(&self, i0: usize, i1: usize, i2: usize, rdram: &mut [u8]) {
+    pub fn rasterize_triangle(&mut self, i0: usize, i1: usize, i2: usize, rdram: &mut [u8]) {
         let verts = [
             self.vertex_buffer[i0],
             self.vertex_buffer[i1],
@@ -1321,7 +1331,15 @@ impl Renderer {
 
     /// Rasterize a triangle using edge-function (half-space) method.
     /// Takes three vertices already in screen space.
-    fn rasterize_screen_triangle(&self, v0: Vertex, v1: Vertex, v2: Vertex, rdram: &mut [u8]) {
+    fn rasterize_screen_triangle(&mut self, v0: Vertex, v1: Vertex, v2: Vertex, rdram: &mut [u8]) {
+        // Record edges for wireframe overlay
+        if self.debug_wireframe && self.wire_edges.len() < 500_000 {
+            use crate::debug::WireEdge;
+            self.wire_edges.push(WireEdge { x0: v0.x, y0: v0.y, x1: v1.x, y1: v1.y });
+            self.wire_edges.push(WireEdge { x0: v1.x, y0: v1.y, x1: v2.x, y1: v2.y });
+            self.wire_edges.push(WireEdge { x0: v2.x, y0: v2.y, x1: v0.x, y1: v0.y });
+        }
+
         // Bounding box clipped to scissor
         let scr_ulx = (self.scissor_ulx >> 2) as f32;
         let scr_uly = (self.scissor_uly >> 2) as f32;

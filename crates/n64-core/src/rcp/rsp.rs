@@ -29,8 +29,8 @@ pub struct Rsp {
     pub dma_full: u32,
     /// SP_DMA_BUSY
     pub dma_busy: u32,
-    /// SP_SEMAPHORE
-    pub semaphore: u32,
+    /// SP_SEMAPHORE (atomic test-and-set on read, clear on write)
+    pub semaphore: std::cell::Cell<u32>,
     /// SP_PC (12-bit, IMEM offset)
     pub pc: u32,
     /// SP_MEM_ADDR — bit 12 selects IMEM vs DMEM, bits 0-11 offset
@@ -43,6 +43,10 @@ pub struct Rsp {
     pub dma_skip: u32,
     /// Debug: count of RSP task starts (auto-completed)
     pub start_count: u32,
+    /// Debug: log of SP_STATUS writes (val, resulting status, auto_complete)
+    pub status_log: Vec<(u32, u32, bool)>,
+    /// Debug: count of SP_STATUS reads
+    pub status_read_count: std::cell::Cell<u32>,
 }
 
 impl Rsp {
@@ -53,7 +57,7 @@ impl Rsp {
             status: 0x01, // Halted by default
             dma_full: 0,
             dma_busy: 0,
-            semaphore: 0,
+            semaphore: std::cell::Cell::new(0),
             pc: 0,
             dma_mem_addr: 0,
             dma_dram_addr: 0,
@@ -61,6 +65,8 @@ impl Rsp {
             dma_count: 0,
             dma_skip: 0,
             start_count: 0,
+            status_log: Vec::new(),
+            status_read_count: std::cell::Cell::new(0),
         }
     }
 
@@ -108,13 +114,15 @@ impl Rsp {
             0x4_0000 => self.dma_mem_addr,
             0x4_0004 => self.dma_dram_addr,
             0x4_0008 | 0x4_000C => 0, // SP_RD_LEN / SP_WR_LEN (write-only, reads return 0)
-            0x4_0010 => self.status,
+            0x4_0010 => { self.status_read_count.set(self.status_read_count.get() + 1); self.status },
             0x4_0014 => self.dma_full,
             0x4_0018 => self.dma_busy,
             0x4_001C => {
-                // SP_SEMAPHORE read: returns current value, then sets to 1
-                // (we can't mutate here since &self, handled at bus level)
-                self.semaphore
+                // SP_SEMAPHORE read: atomic test-and-set
+                // Returns current value, then sets to 1
+                let val = self.semaphore.get();
+                self.semaphore.set(1);
+                val
             }
             0x8_0000 => self.pc & 0xFFC, // SP_PC (12-bit aligned)
             _ => 0,
@@ -147,7 +155,7 @@ impl Rsp {
                     SpRegWrite::None
                 }
             }
-            0x4_001C => { self.semaphore = 0; SpRegWrite::None }
+            0x4_001C => { self.semaphore.set(0); SpRegWrite::None }
             0x8_0000 => { self.pc = val & 0xFFC; SpRegWrite::None }
             _ => SpRegWrite::None,
         }
@@ -156,7 +164,7 @@ impl Rsp {
     /// SP_STATUS write: set/clear flag pairs.
     ///
     /// When the game clears the HALT bit (starts the RSP), we auto-complete:
-    /// immediately re-halt and raise the SP interrupt so the game thinks
+    /// immediately re-halt and raise the SP + DP interrupts so the game thinks
     /// the RSP finished its task. Returns true if a task was started.
     fn write_status(&mut self, val: u32, mi: &mut super::mi::Mi) -> bool {
         let was_halted = self.status & 0x01 != 0;
@@ -167,10 +175,16 @@ impl Rsp {
         if val & 0x04 != 0 { self.status &= !0x02; } // Clear broke
         if val & 0x08 != 0 { mi.clear_interrupt(super::mi::MiInterrupt::SP); }
         if val & 0x10 != 0 { mi.set_interrupt(super::mi::MiInterrupt::SP); }
-        // Bits 5-24: clear/set signal flags (sig0..sig7)
+        // Bits 5/6: clear/set single step (status bit 5)
+        if val & (1 << 5) != 0 { self.status &= !(1 << 5); }
+        if val & (1 << 6) != 0 { self.status |= 1 << 5; }
+        // Bits 7/8: clear/set interrupt on break (status bit 6)
+        if val & (1 << 7) != 0 { self.status &= !(1 << 6); }
+        if val & (1 << 8) != 0 { self.status |= 1 << 6; }
+        // Bits 9-24: clear/set signal 0-7 (status bits 7-14)
         for i in 0..8u32 {
-            let clear_bit = 5 + i * 2;
-            let set_bit = 6 + i * 2;
+            let clear_bit = 9 + i * 2;
+            let set_bit = 10 + i * 2;
             if clear_bit < 25 {
                 if val & (1 << clear_bit) != 0 { self.status &= !(1 << (7 + i)); }
             }
@@ -180,16 +194,23 @@ impl Rsp {
         }
 
         // Auto-complete: if the game just un-halted the RSP, pretend
-        // the task finished instantly (re-halt + SP interrupt + DP interrupt).
-        // The N64 OS scheduler waits for both SP and DP interrupts before
-        // signaling the game thread that a graphics task is complete.
+        // the task finished instantly. Set halt + broke (RSP stopped),
+        // signal 0 (task done) + signal 1 (used by some schedulers),
+        // and raise both SP and DP interrupts. The N64 OS scheduler
+        // waits for both interrupts before signaling the game thread.
         if was_halted && (self.status & 0x01 == 0) {
             log::trace!("RSP auto-complete: task started, immediately finishing");
-            self.status |= 0x01 | 0x02; // Set halt + broke
+            self.status |= 0x01 | 0x02 | (1 << 7) | (1 << 8); // halt + broke + sig0 + sig1
             mi.set_interrupt(super::mi::MiInterrupt::SP);
             mi.set_interrupt(super::mi::MiInterrupt::DP);
             self.start_count += 1;
+            if self.status_log.len() < 100 {
+                self.status_log.push((val, self.status, true));
+            }
             return true;
+        }
+        if self.status_log.len() < 100 {
+            self.status_log.push((val, self.status, false));
         }
         false
     }

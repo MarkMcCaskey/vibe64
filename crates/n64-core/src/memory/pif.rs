@@ -61,6 +61,8 @@ pub struct Pif {
     /// EEPROM save data (accessed via joybus channel 4)
     pub eeprom: Vec<u8>,
     pub eeprom_type: EepromType,
+    /// Debug: count of unhandled joybus commands
+    pub unhandled_cmds: std::collections::HashMap<u8, u32>,
 }
 
 impl Pif {
@@ -72,6 +74,7 @@ impl Pif {
             controller: ControllerState::default(),
             eeprom: Vec::new(),
             eeprom_type: EepromType::None,
+            unhandled_cmds: std::collections::HashMap::new(),
         }
     }
 
@@ -179,11 +182,11 @@ impl Pif {
                     // Device info / reset
                     if rx >= 3 {
                         if channel == 0 {
-                            // Type: 0x0005 = standard controller
-                            // Status: 0x01 = controller pak present
-                            self.ram[rx_start] = 0x00;
-                            self.ram[rx_start + 1] = 0x05;
-                            self.ram[rx_start + 2] = 0x01;
+                            // Type: 0x0500 = standard controller (big-endian)
+                            // Status: 0x00 = no controller pak
+                            self.ram[rx_start] = 0x05;
+                            self.ram[rx_start + 1] = 0x00;
+                            self.ram[rx_start + 2] = 0x00;
                         } else if channel == 4 && self.eeprom_type != EepromType::None {
                             // EEPROM device info
                             let type_id: u16 = match self.eeprom_type {
@@ -249,6 +252,7 @@ impl Pif {
                 }
                 _ => {
                     // Unknown command — flag as error
+                    *self.unhandled_cmds.entry(cmd).or_default() += 1;
                     self.ram[i + 1] = rx_len | 0x80;
                 }
             }

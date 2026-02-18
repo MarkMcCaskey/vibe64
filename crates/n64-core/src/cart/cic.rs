@@ -85,7 +85,11 @@ pub fn detect(rom_data: &[u8]) -> CicVariant {
     log::info!("IPL3 hash: {:#018X}", hash);
 
     match hash {
+        0x000000D0_27FDF31F => CicVariant::Cic6101,
+        0x000000D0_57C85244 => CicVariant::Cic6102,
+        0x000000D2_497E414B => CicVariant::Cic6103,
         0x0000011A_49F60E96 => CicVariant::Cic6105,
+        0x000000D6_D5BE5580 => CicVariant::Cic6106,
         _ => {
             log::warn!("Unknown CIC variant (IPL3 hash: {:#018X})", hash);
             CicVariant::Unknown

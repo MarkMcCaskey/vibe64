@@ -20,6 +20,7 @@ pub struct N64 {
     pub bus: Interconnect,
     engine: Interpreter,
     pub cycles: u64,
+    pub debug: crate::debug::DebugState,
 }
 
 impl N64 {
@@ -47,11 +48,16 @@ impl N64 {
             },
             std::str::from_utf8(&header.game_code).unwrap_or("????"));
 
+        // Detect GBI microcode variant from game code (before header is moved)
+        let ucode = crate::rcp::gbi::detect_ucode(&header.game_code);
+        log::info!("Microcode: {:?}", ucode);
+
         let entry_point = header.entry_point;
         let cart = Cartridge::new(rom_data, header);
         let mut bus = Interconnect::new(cart);
         bus.pif.set_cic(cic);
         bus.pif.set_eeprom(eeprom_type);
+        bus.ucode = ucode;
 
         // HLE boot: instead of running the IPL3 bootloader (which is
         // encrypted for CIC-6105), do what it would have done:
@@ -114,6 +120,7 @@ impl N64 {
             bus,
             engine: Interpreter,
             cycles: 0,
+            debug: crate::debug::DebugState::new(),
         })
     }
 
@@ -138,6 +145,11 @@ impl N64 {
     pub fn run_frame(&mut self) {
         const CYCLES_PER_FRAME: u64 = 93_750_000 / 60;
 
+        // Sync debug flags to renderer before frame
+        self.debug.begin_frame();
+        self.bus.renderer.debug_wireframe = self.debug.flags.show_wireframe;
+        self.bus.renderer.debug_dl_log = self.debug.flags.show_dl_log;
+
         let target = self.cycles + CYCLES_PER_FRAME;
         while self.cycles < target {
             let elapsed = self.engine.execute(&mut self.cpu, &mut self.bus);
@@ -145,8 +157,24 @@ impl N64 {
 
             self.bus.vi.tick(elapsed, &mut self.bus.mi);
             self.bus.tick_pi_dma();
-        self.bus.tick_ai_dma(elapsed);
+            self.bus.tick_ai_dma(elapsed);
         }
+
+        // Harvest debug data from renderer
+        if self.debug.flags.show_wireframe {
+            std::mem::swap(&mut self.debug.wire_edges, &mut self.bus.renderer.wire_edges);
+            self.bus.renderer.wire_edges.clear();
+        }
+        if self.debug.flags.show_dl_log {
+            for entry in self.bus.renderer.dl_log_entries.drain(..) {
+                self.debug.dl_log.push(entry);
+            }
+        }
+        // Copy frame stats from renderer counters
+        self.debug.stats.tri_count = self.bus.renderer.tri_count;
+        self.debug.stats.vtx_count = self.bus.renderer.vtx_count;
+        self.debug.stats.fill_rect_count = self.bus.renderer.fill_rect_count;
+        self.debug.stats.tex_rect_count = self.bus.renderer.tex_rect_count;
     }
 
     /// Run one frame with instruction tracing after a trigger condition.

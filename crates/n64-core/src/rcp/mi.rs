@@ -23,6 +23,10 @@ pub struct Mi {
     pub intr: u8,
     /// MI_MASK: which interrupts are enabled (6 bits)
     pub intr_mask: u8,
+    /// Debug: count of set_interrupt calls per source [SP,SI,AI,VI,PI,DP]
+    pub set_counts: [u32; 6],
+    /// Debug: count of clear_interrupt calls per source
+    pub clear_counts: [u32; 6],
 }
 
 impl Mi {
@@ -32,6 +36,8 @@ impl Mi {
             version: 0x0202_0102, // Retail N64
             intr: 0,
             intr_mask: 0,
+            set_counts: [0; 6],
+            clear_counts: [0; 6],
         }
     }
 
@@ -79,10 +85,12 @@ impl Mi {
 
     pub fn set_interrupt(&mut self, irq: MiInterrupt) {
         self.intr |= 1 << (irq as u8);
+        self.set_counts[irq as usize] += 1;
     }
 
     pub fn clear_interrupt(&mut self, irq: MiInterrupt) {
         self.intr &= !(1 << (irq as u8));
+        self.clear_counts[irq as usize] += 1;
     }
 
     /// Returns true if any unmasked interrupt is pending.

@@ -23,6 +23,8 @@ pub struct Vi {
     pub y_scale: u32,
     /// Internal cycle counter for scanline timing
     cycles: u64,
+    /// Debug: count of writes to each register
+    pub write_counts: [u32; 14],
 }
 
 impl Vi {
@@ -43,6 +45,7 @@ impl Vi {
             x_scale: 0,
             y_scale: 0,
             cycles: 0,
+            write_counts: [0; 14],
         }
     }
 
@@ -67,6 +70,8 @@ impl Vi {
     }
 
     pub fn write_u32(&mut self, addr: u32, val: u32, mi: &mut Mi) {
+        let reg_idx = ((addr & 0x0F_FFFF) / 4) as usize;
+        if reg_idx < 14 { self.write_counts[reg_idx] += 1; }
         match addr & 0x0F_FFFF {
             0x00 => self.ctrl = val,
             0x04 => self.origin = val & 0x00FF_FFFF,

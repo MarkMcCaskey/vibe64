@@ -1,12 +1,38 @@
-/// GBI — Graphics Binary Interface (F3DEX2 variant).
+/// GBI — Graphics Binary Interface.
 ///
-/// Defines the display list command format used by Zelda OoT and most
-/// N64 games. Each command is 64 bits (two 32-bit words). The upper
-/// byte of the first word identifies the command.
+/// Defines display list command formats used by N64 games. Each command
+/// is 64 bits (two 32-bit words). The upper byte of the first word
+/// identifies the command.
 ///
-/// The F3DEX2 microcode processes these commands on the RSP, converting
-/// geometry commands into RDP rasterization commands. In HLE mode, we
-/// interpret them directly.
+/// Two major variants exist:
+/// - **F3D/F3DEX**: Original microcode (Super Mario 64, Mario Kart 64, etc.)
+/// - **F3DEX2**: Later revision with reorganized opcodes (Zelda OoT, etc.)
+///
+/// In HLE mode, we interpret display list commands directly.
+
+/// Microcode variant — determines GBI opcode layout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UcodeType {
+    F3dex2,
+    F3d,
+}
+
+/// Detect microcode variant from ROM game code.
+pub fn detect_ucode(game_code: &[u8; 4]) -> UcodeType {
+    let code = std::str::from_utf8(game_code).unwrap_or("");
+    // F3D games (original microcode)
+    const F3D_GAMES: &[&str] = &[
+        "NSME", "NSMJ", "NSMP",  // Super Mario 64
+        "NMKE", "NMKJ", "NMKP",  // Mario Kart 64
+        "NSSE", "NSSJ", "NSSP",  // Star Fox 64
+        "NWRE", "NWRJ", "NWRP",  // Wave Race 64
+        "NPWE", "NPWJ", "NPWP",  // Pilotwings 64
+    ];
+    for &c in F3D_GAMES {
+        if code == c { return UcodeType::F3d; }
+    }
+    UcodeType::F3dex2
+}
 
 // ─── RDP commands (passed through by F3DEX2 to the RDP) ───
 
@@ -122,6 +148,16 @@ pub fn process_display_list(renderer: &mut Renderer, rdram: &mut [u8], addr: u32
 
         let cmd = (w0 >> 24) as u8;
         opcode_counts[cmd as usize] += 1;
+
+        // DL command logging for debug overlay
+        if renderer.debug_dl_log && renderer.dl_log_entries.len() < 4096 {
+            renderer.dl_log_entries.push(crate::debug::DlLogEntry {
+                pc: pc.wrapping_sub(8),
+                w0,
+                w1,
+                opcode_name: opcode_name_f3dex2(cmd),
+            });
+        }
 
         match cmd {
             G_NOOP => {}
@@ -258,6 +294,324 @@ pub fn process_display_list(renderer: &mut Renderer, rdram: &mut [u8], addr: u32
         }
     }
     log::debug!("  Opcodes:{}", summary);
+}
+
+/// Walk a display list using F3D (original) opcode table.
+/// Used by earlier games: Super Mario 64, Mario Kart 64, etc.
+pub fn process_display_list_f3d(renderer: &mut Renderer, rdram: &mut [u8], addr: u32) {
+    // F3D opcode constants (differ from F3DEX2)
+    const F3D_MTX: u8           = 0x01;
+    const F3D_MOVEMEM: u8       = 0x03;
+    const F3D_VTX: u8           = 0x04;
+    const F3D_DL: u8            = 0x06;
+    const F3D_RDPHALF_1: u8     = 0xB4;
+    const F3D_CLEARGEOMETRYMODE: u8 = 0xB6;
+    const F3D_SETGEOMETRYMODE: u8   = 0xB7;
+    const F3D_ENDDL: u8         = 0xB8;
+    const F3D_SETOTHERMODE_L: u8 = 0xB9;
+    const F3D_SETOTHERMODE_H: u8 = 0xBA;
+    const F3D_TEXTURE: u8       = 0xBB;
+    const F3D_MOVEWORD: u8      = 0xBC;
+    const F3D_POPMTX: u8        = 0xBD;
+    const F3D_TRI1: u8          = 0xBF;
+
+    // F3D geometry mode uses different cull bits
+    const F3D_CULL_FRONT: u32 = 0x0000_1000;
+    const F3D_CULL_BACK: u32  = 0x0000_2000;
+
+    let mut pc = addr & 0x00FF_FFFF;
+    let mut stack: Vec<u32> = Vec::with_capacity(MAX_DL_STACK);
+    let mut cmd_count = 0usize;
+
+    loop {
+        if cmd_count >= MAX_COMMANDS {
+            log::warn!("F3D display list exceeded {} commands, stopping", MAX_COMMANDS);
+            break;
+        }
+        cmd_count += 1;
+
+        let w0 = read_u32(rdram, pc);
+        let w1 = read_u32(rdram, pc.wrapping_add(4));
+        pc = pc.wrapping_add(8);
+
+        let cmd = (w0 >> 24) as u8;
+
+        // DL command logging for debug overlay
+        if renderer.debug_dl_log && renderer.dl_log_entries.len() < 4096 {
+            renderer.dl_log_entries.push(crate::debug::DlLogEntry {
+                pc: pc.wrapping_sub(8),
+                w0,
+                w1,
+                opcode_name: opcode_name_f3d(cmd),
+            });
+        }
+
+        match cmd {
+            0x00 => {} // G_NOOP / G_SPNOOP
+
+            F3D_ENDDL => {
+                if let Some(return_addr) = stack.pop() {
+                    pc = return_addr;
+                } else {
+                    break;
+                }
+            }
+
+            F3D_DL => {
+                let addr = renderer.resolve_segment(w1);
+                let push = (w0 >> 16) & 0xFF;
+                if push == 0 {
+                    stack.push(pc);
+                }
+                pc = addr;
+            }
+
+            // ─── F3D vertex load ───
+            // w0: [04][par:8][length:16] where par = ((n-1)<<4)|v0
+            // w1: DRAM address
+            F3D_VTX => {
+                let par = (w0 >> 16) & 0xFF;
+                let n = ((par >> 4) & 0xF) as usize + 1;
+                let v0 = (par & 0xF) as usize;
+
+                // Build a w0 compatible with F3DEX2's cmd_vertex()
+                // F3DEX2 format: [01][00][num:8][v0+num:7 << 1]
+                let compat_w0 = ((n as u32) << 12) | (((v0 + n) as u32 & 0x7F) << 1);
+                renderer.cmd_vertex(compat_w0, w1, rdram);
+            }
+
+            // ─── F3D triangle ───
+            // w0: [BF][00][00][00]  w1: [v0*10:8][v1*10:8][v2*10:8][00]
+            F3D_TRI1 => {
+                let v0 = ((w1 >> 24) & 0xFF) as usize / 10;
+                let v1 = ((w1 >> 16) & 0xFF) as usize / 10;
+                let v2 = ((w1 >> 8) & 0xFF) as usize / 10;
+                if v0 < 32 && v1 < 32 && v2 < 32 {
+                    renderer.rasterize_triangle(v0, v1, v2, rdram);
+                    renderer.tri_count += 1;
+                }
+            }
+
+            // ─── F3D matrix ───
+            // w0: [01][params:8][length:16]  w1: address
+            // F3D params: bit0=projection, bit1=load, bit2=push(inverted)
+            F3D_MTX => {
+                let f3d_params = (w0 >> 16) & 0xFF;
+                // Translate F3D params to F3DEX2 format:
+                // F3DEX2: bit0=push(inv), bit1=load, bit2=projection
+                let push_inv = (f3d_params >> 2) & 1;  // F3D bit2 → F3DEX2 bit0
+                let load = (f3d_params >> 1) & 1;       // same position
+                let proj = f3d_params & 1;               // F3D bit0 → F3DEX2 bit2
+                let compat_params = push_inv | (load << 1) | (proj << 2);
+                let compat_w0 = compat_params;
+                renderer.cmd_load_matrix(compat_w0, w1, rdram);
+            }
+
+            F3D_POPMTX => {
+                renderer.cmd_pop_matrix(w0, w1);
+            }
+
+            // ─── F3D geometry mode (split into two commands) ───
+            F3D_CLEARGEOMETRYMODE => {
+                // Translate F3D cull bits to F3DEX2 cull bits
+                let mut bits = w1;
+                if bits & F3D_CULL_FRONT != 0 {
+                    bits = (bits & !F3D_CULL_FRONT) | 0x0200;
+                }
+                if bits & F3D_CULL_BACK != 0 {
+                    bits = (bits & !F3D_CULL_BACK) | 0x0400;
+                }
+                renderer.geometry_mode &= !bits;
+            }
+            F3D_SETGEOMETRYMODE => {
+                let mut bits = w1;
+                if bits & F3D_CULL_FRONT != 0 {
+                    bits = (bits & !F3D_CULL_FRONT) | 0x0200;
+                }
+                if bits & F3D_CULL_BACK != 0 {
+                    bits = (bits & !F3D_CULL_BACK) | 0x0400;
+                }
+                renderer.geometry_mode |= bits;
+            }
+
+            F3D_TEXTURE => renderer.cmd_texture(w0, w1),
+            F3D_SETOTHERMODE_H => renderer.cmd_set_other_mode_h(w0, w1),
+            F3D_SETOTHERMODE_L => renderer.cmd_set_other_mode_l(w0, w1),
+
+            F3D_MOVEWORD => {
+                let index = (w0 >> 16) & 0xFF;
+                match index {
+                    0x06 => { // G_MW_SEGMENT
+                        let seg = ((w0 & 0xFFFF) / 4) as usize;
+                        if seg < 16 {
+                            renderer.segment_table[seg] = w1 & 0x00FF_FFFF;
+                        }
+                    }
+                    0x08 => renderer.cmd_set_fog(w1),
+                    0x0E => { renderer.num_dir_lights = (w1 / 24) as u8; }
+                    _ => {}
+                }
+            }
+
+            F3D_MOVEMEM => {
+                // F3D G_MOVEMEM: w0[23:16] = type/index
+                let mtype = (w0 >> 16) & 0xFF;
+                match mtype {
+                    0x80 => renderer.cmd_set_viewport(w1, rdram), // G_MV_VIEWPORT
+                    // Lights: 0x86=lookaty, 0x88=lookatx, 0x90+=lights
+                    0x90..=0xC8 => {
+                        // Light index: (mtype - 0x90) / 0x18 gives light 0..7
+                        let offset = (mtype as usize - 0x80) * 3; // approximate DMEM offset
+                        renderer.cmd_set_light(offset, w1, rdram);
+                    }
+                    _ => {}
+                }
+            }
+
+            F3D_RDPHALF_1 => {
+                renderer.rdp_half[0] = w1;
+            }
+
+            // ─── RDP commands (same as F3DEX2) ───
+            G_SETCIMG => renderer.cmd_set_color_image(w0, w1),
+            G_SETZIMG => renderer.cmd_set_z_image(w0, w1),
+            G_SETTIMG => renderer.cmd_set_texture_image(w0, w1),
+            G_SETFILLCOLOR => renderer.cmd_set_fill_color(w1),
+            G_SETENVCOLOR => renderer.cmd_set_env_color(w1),
+            G_SETPRIMCOLOR => renderer.cmd_set_prim_color(w0, w1),
+            G_SETBLENDCOLOR => renderer.cmd_set_blend_color(w1),
+            G_SETFOGCOLOR => renderer.cmd_set_fog_color(w1),
+            G_SETCOMBINE => renderer.cmd_set_combine(w0, w1),
+            G_SETSCISSOR => renderer.cmd_set_scissor(w0, w1),
+            G_SETTILE => renderer.cmd_set_tile(w0, w1),
+            G_SETTILESIZE => renderer.cmd_set_tile_size(w0, w1),
+            G_LOADBLOCK => renderer.cmd_load_block(w0, w1, rdram),
+            G_LOADTILE => renderer.cmd_load_tile(w0, w1, rdram),
+            G_LOADTLUT => renderer.cmd_load_tlut(w0, w1, rdram),
+            G_FILLRECT => renderer.cmd_fill_rect(w0, w1, rdram),
+
+            G_TEXRECT | G_TEXRECTFLIP => {
+                let w2 = read_u32(rdram, pc);
+                let w3 = read_u32(rdram, pc.wrapping_add(4));
+                pc = pc.wrapping_add(8);
+                let (extra0, extra1) = if (w2 >> 24) as u8 == F3D_RDPHALF_1 {
+                    let h1 = w3;
+                    let _w4 = read_u32(rdram, pc);
+                    let w5 = read_u32(rdram, pc.wrapping_add(4));
+                    pc = pc.wrapping_add(8);
+                    (h1, w5)
+                } else {
+                    (w2, w3)
+                };
+                renderer.cmd_texture_rect(w0, w1, extra0, extra1, rdram, cmd == G_TEXRECTFLIP);
+            }
+
+            G_RDPFULLSYNC | G_RDPTILESYNC | G_RDPPIPESYNC | G_RDPLOADSYNC => {}
+            G_SETCONVERT | G_SETKEYR | G_SETKEYGB => {}
+
+            _ => {
+                log::trace!("Unknown F3D command {:#04X} at {:#010X}", cmd, pc.wrapping_sub(8));
+            }
+        }
+    }
+
+    log::debug!("F3D display list processed: {} commands", cmd_count);
+}
+
+/// Look up a human-readable name for an F3DEX2 GBI opcode.
+pub fn opcode_name_f3dex2(cmd: u8) -> &'static str {
+    match cmd {
+        0x00 => "G_NOOP",
+        0x01 => "G_VTX",
+        0x02 => "G_MODIFYVTX",
+        0x05 => "G_TRI1",
+        0x06 => "G_TRI2",
+        0x07 => "G_QUAD",
+        0xD5 => "G_SPECIAL_1",
+        0xD7 => "G_TEXTURE",
+        0xD8 => "G_POPMTX",
+        0xD9 => "G_GEOMETRYMODE",
+        0xDA => "G_MTX",
+        0xDB => "G_MOVEWORD",
+        0xDC => "G_MOVEMEM",
+        0xDE => "G_DL",
+        0xDF => "G_ENDDL",
+        0xE1 => "G_RDPHALF_1",
+        0xE2 => "G_SETOTHERMODE_L",
+        0xE3 => "G_SETOTHERMODE_H",
+        0xE4 => "G_TEXRECT",
+        0xE5 => "G_TEXRECTFLIP",
+        0xE6 => "G_RDPLOADSYNC",
+        0xE7 => "G_RDPPIPESYNC",
+        0xE8 => "G_RDPTILESYNC",
+        0xE9 => "G_RDPFULLSYNC",
+        0xEA => "G_SETKEYGB",
+        0xEB => "G_SETKEYR",
+        0xEC => "G_SETCONVERT",
+        0xED => "G_SETSCISSOR",
+        0xF0 => "G_LOADTLUT",
+        0xF1 => "G_RDPHALF_2",
+        0xF2 => "G_SETTILESIZE",
+        0xF3 => "G_LOADBLOCK",
+        0xF4 => "G_LOADTILE",
+        0xF5 => "G_SETTILE",
+        0xF6 => "G_FILLRECT",
+        0xF7 => "G_SETFILLCOLOR",
+        0xF8 => "G_SETFOGCOLOR",
+        0xF9 => "G_SETBLENDCOLOR",
+        0xFA => "G_SETPRIMCOLOR",
+        0xFB => "G_SETENVCOLOR",
+        0xFC => "G_SETCOMBINE",
+        0xFD => "G_SETTIMG",
+        0xFE => "G_SETZIMG",
+        0xFF => "G_SETCIMG",
+        _ => "???",
+    }
+}
+
+/// Look up a human-readable name for an F3D (original) GBI opcode.
+pub fn opcode_name_f3d(cmd: u8) -> &'static str {
+    match cmd {
+        0x00 => "G_SPNOOP",
+        0x01 => "G_MTX",
+        0x03 => "G_MOVEMEM",
+        0x04 => "G_VTX",
+        0x06 => "G_DL",
+        0xB4 => "G_RDPHALF_1",
+        0xB6 => "G_CLEARGEOM",
+        0xB7 => "G_SETGEOM",
+        0xB8 => "G_ENDDL",
+        0xB9 => "G_SETOTHERMODE_L",
+        0xBA => "G_SETOTHERMODE_H",
+        0xBB => "G_TEXTURE",
+        0xBC => "G_MOVEWORD",
+        0xBD => "G_POPMTX",
+        0xBF => "G_TRI1",
+        // RDP commands (same encoding)
+        0xE4 => "G_TEXRECT",
+        0xE5 => "G_TEXRECTFLIP",
+        0xE6 => "G_RDPLOADSYNC",
+        0xE7 => "G_RDPPIPESYNC",
+        0xE8 => "G_RDPTILESYNC",
+        0xE9 => "G_RDPFULLSYNC",
+        0xED => "G_SETSCISSOR",
+        0xF0 => "G_LOADTLUT",
+        0xF2 => "G_SETTILESIZE",
+        0xF3 => "G_LOADBLOCK",
+        0xF4 => "G_LOADTILE",
+        0xF5 => "G_SETTILE",
+        0xF6 => "G_FILLRECT",
+        0xF7 => "G_SETFILLCOLOR",
+        0xF8 => "G_SETFOGCOLOR",
+        0xF9 => "G_SETBLENDCOLOR",
+        0xFA => "G_SETPRIMCOLOR",
+        0xFB => "G_SETENVCOLOR",
+        0xFC => "G_SETCOMBINE",
+        0xFD => "G_SETTIMG",
+        0xFE => "G_SETZIMG",
+        0xFF => "G_SETCIMG",
+        _ => "???",
+    }
 }
 
 /// Read a big-endian u32 from RDRAM.

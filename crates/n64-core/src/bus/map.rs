@@ -27,6 +27,7 @@ pub struct Interconnect {
     pub rdp: Rdp,
     pub pif: Pif,
     pub renderer: Renderer,
+    pub ucode: crate::rcp::gbi::UcodeType,
     /// ISViewer debug output buffer (512 bytes at physical 0x13FF0020)
     is_viewer_buf: [u8; 512],
 }
@@ -46,6 +47,7 @@ impl Interconnect {
             rdp: Rdp::new(),
             pif: Pif::new(),
             renderer: Renderer::new(),
+            ucode: crate::rcp::gbi::UcodeType::F3dex2,
             is_viewer_buf: [0u8; 512],
         }
     }
@@ -73,7 +75,7 @@ impl Interconnect {
         );
 
         // Delay the completion interrupt. Real PI DMA runs at ~5MB/s
-        // (~50 cycles per 32-bit word). We use a minimum of 100 cycles
+        // (~19 cycles per byte). We use a minimum of 100 cycles
         // so the OS DMA handler has time to update its queue state
         // before the interrupt fires.
         let delay = (len as u64 / 2).max(100);
@@ -140,7 +142,14 @@ impl Interconnect {
             // Walk display list, rendering into RDRAM
             let rdram = self.rdram.data_mut();
             let tris_before = self.renderer.tri_count;
-            gbi::process_display_list(&mut self.renderer, rdram, phys_addr);
+            match self.ucode {
+                gbi::UcodeType::F3dex2 => {
+                    gbi::process_display_list(&mut self.renderer, rdram, phys_addr);
+                }
+                gbi::UcodeType::F3d => {
+                    gbi::process_display_list_f3d(&mut self.renderer, rdram, phys_addr);
+                }
+            }
             let tris_this_dl = self.renderer.tri_count - tris_before;
 
             log::debug!(
@@ -148,8 +157,9 @@ impl Interconnect {
                 self.rsp.start_count, tris_this_dl,
                 self.renderer.color_image_addr,
             );
+
+            // DP interrupt is fired by auto-complete in write_status
         }
-        // Audio tasks (M_AUDTASK) are silently ignored for now
     }
 
     /// SP DMA Read: RDRAM → SP MEM (load microcode/data into DMEM or IMEM).
