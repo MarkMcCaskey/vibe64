@@ -222,6 +222,9 @@ pub fn process_display_list(renderer: &mut Renderer, rdram: &mut [u8], addr: u32
                             renderer.segment_table[seg] = w1 & 0x00FF_FFFF;
                         }
                     }
+                    0x08 => { // G_MW_FOG
+                        renderer.cmd_set_fog(w1);
+                    }
                     0x0E => { // G_MW_NUMLIGHT
                         renderer.num_dir_lights = (w1 / 24) as u8;
                     }

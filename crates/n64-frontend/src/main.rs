@@ -290,6 +290,10 @@ fn main() {
             n64.bus.renderer.vtx_count,
             n64.bus.renderer.tri_count);
 
+        eprintln!("  Fog: mul={} off={} color=({},{},{},{})",
+            n64.bus.renderer.fog_multiplier, n64.bus.renderer.fog_offset,
+            n64.bus.renderer.fog_color[0], n64.bus.renderer.fog_color[1],
+            n64.bus.renderer.fog_color[2], n64.bus.renderer.fog_color[3]);
         eprintln!("  Lights: {} dir, ambient=[{},{},{}] dir0=[{},{},{}] col0=[{},{},{}]",
             n64.bus.renderer.num_dir_lights,
             n64.bus.renderer.light_colors[n64.bus.renderer.num_dir_lights as usize][0],

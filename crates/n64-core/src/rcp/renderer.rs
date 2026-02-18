@@ -86,6 +86,10 @@ pub struct Renderer {
     // ─── Segment table (RSP address resolution) ───
     pub segment_table: [u32; 16],
 
+    // ─── Fog parameters ───
+    pub fog_multiplier: i16,
+    pub fog_offset: i16,
+
     // ─── Lighting ───
     pub num_dir_lights: u8,
     pub light_colors: [[u8; 3]; 8],   // 0..num_dir_lights = directional, num_dir_lights = ambient
@@ -154,6 +158,8 @@ impl Renderer {
             combine_hi: 0,
             combine_lo: 0,
             segment_table: [0; 16],
+            fog_multiplier: 0,
+            fog_offset: 0,
             num_dir_lights: 0,
             light_colors: [[0; 3]; 8],
             light_dirs: [[0; 3]; 8],
@@ -242,6 +248,13 @@ impl Renderer {
 
     pub fn cmd_set_fog_color(&mut self, w1: u32) {
         self.fog_color = w1.to_be_bytes();
+    }
+
+    /// G_MW_FOG: Set fog multiplier and offset.
+    /// w1[31:16] = multiplier (s16), w1[15:0] = offset (s16).
+    pub fn cmd_set_fog(&mut self, w1: u32) {
+        self.fog_multiplier = (w1 >> 16) as i16;
+        self.fog_offset = (w1 & 0xFFFF) as i16;
     }
 
     pub fn cmd_set_combine(&mut self, w0: u32, w1: u32) {
@@ -905,6 +918,17 @@ impl Renderer {
             // Transform vertex by MVP matrix → clip space
             let [cx, cy, cz, cw] = mat4_mul_vec(&self.mvp, [x, y, z, 1.0]);
 
+            // When G_FOG (0x10000) is enabled, compute fog factor from clip W
+            // and replace vertex alpha with it. The blender then uses shade alpha
+            // to lerp between pixel color and fog_color.
+            let a = if self.geometry_mode & 0x10000 != 0 && cw.abs() > 0.0001 {
+                let fog = (cw * self.fog_multiplier as f32 + self.fog_offset as f32)
+                    .clamp(0.0, 255.0);
+                fog as u8
+            } else {
+                a
+            };
+
             // Perspective divide + viewport transform → screen space
             if cw.abs() > 0.0001 {
                 let inv_w = 1.0 / cw;
@@ -1235,7 +1259,7 @@ impl Renderer {
         // Z-buffer state from othermode_l
         let z_cmp = self.othermode_l & 0x10 != 0;
         let z_upd = self.othermode_l & 0x20 != 0;
-        let z_enabled = self.geometry_mode & 0x10000 != 0 && self.z_image_addr != 0;
+        let z_enabled = self.geometry_mode & 0x1 != 0 && self.z_image_addr != 0;
         let z_addr = self.z_image_addr as usize;
 
         for y in min_y..max_y {
