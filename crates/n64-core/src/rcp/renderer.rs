@@ -1305,8 +1305,18 @@ impl Renderer {
 
                 // Sample texture if enabled, otherwise texel0 = zero
                 let texel0 = if textured {
-                    let tex_s = w0 * v0.s + w1 * v1.s + w2 * v2.s;
-                    let tex_t = w0 * v0.t + w1 * v1.t + w2 * v2.t;
+                    // Perspective-correct interpolation: interpolate S/W and T/W
+                    // (which are linear in screen space), then divide by
+                    // interpolated 1/W to recover correct S and T.
+                    let inv_w = w0 * v0.w + w1 * v1.w + w2 * v2.w;
+                    let (tex_s, tex_t) = if inv_w.abs() > 1e-10 {
+                        let s_over_w = w0 * v0.s * v0.w + w1 * v1.s * v1.w + w2 * v2.s * v2.w;
+                        let t_over_w = w0 * v0.t * v0.w + w1 * v1.t * v1.w + w2 * v2.t * v2.w;
+                        (s_over_w / inv_w, t_over_w / inv_w)
+                    } else {
+                        (w0 * v0.s + w1 * v1.s + w2 * v2.s,
+                         w0 * v0.t + w1 * v1.t + w2 * v2.t)
+                    };
                     let scaled_s = (tex_s * self.texture_scale_s as f32 / 65536.0) as i32;
                     let scaled_t = (tex_t * self.texture_scale_t as f32 / 65536.0) as i32;
                     self.sample_texture(tile_idx, scaled_s, scaled_t, cycle)
