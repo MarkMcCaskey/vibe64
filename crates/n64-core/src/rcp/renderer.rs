@@ -1062,7 +1062,94 @@ impl Renderer {
         }
     }
 
-    /// Write a pixel to the framebuffer with optional alpha compare.
+    /// Read a pixel from the framebuffer ("memory color" in RDP terms).
+    fn read_pixel(&self, rdram: &[u8], x: i32, y: i32) -> [u8; 4] {
+        let addr = self.color_image_addr as usize;
+        let width = self.color_image_width as i32;
+
+        match self.color_image_size {
+            2 => {
+                let offset = addr + ((y * width + x) as usize) * 2;
+                if offset + 1 < rdram.len() {
+                    let val = u16::from_be_bytes([rdram[offset], rdram[offset + 1]]);
+                    unpack_rgba5551(val)
+                } else {
+                    [0, 0, 0, 0]
+                }
+            }
+            3 => {
+                let offset = addr + ((y * width + x) as usize) * 4;
+                if offset + 3 < rdram.len() {
+                    [rdram[offset], rdram[offset + 1], rdram[offset + 2], rdram[offset + 3]]
+                } else {
+                    [0, 0, 0, 0]
+                }
+            }
+            _ => [0, 0, 0, 0],
+        }
+    }
+
+    /// Apply the RDP blender: (P * A + M * B) / (A + B).
+    ///
+    /// P and M are color sources (pixel, memory, blend_color, fog).
+    /// A and B are alpha factors selected by the blend mode.
+    /// The blend mode is extracted from othermode_l bits 16-31.
+    ///
+    /// Cycle 0 layout in othermode_l:
+    ///   P = bits[31:30], A = bits[27:26], M = bits[23:22], B = bits[19:18]
+    fn blend_pixel(&self, pixel: [u8; 4], memory: [u8; 4]) -> [u8; 4] {
+        let p_sel = (self.othermode_l >> 30) & 0x3;
+        let a_sel = (self.othermode_l >> 26) & 0x3;
+        let m_sel = (self.othermode_l >> 22) & 0x3;
+        let b_sel = (self.othermode_l >> 18) & 0x3;
+
+        // Select P color source
+        let p = match p_sel {
+            0 => pixel,
+            1 => memory,
+            2 => self.blend_color,
+            _ => self.fog_color,
+        };
+
+        // Select A alpha factor (single value applied to all channels)
+        let a: u16 = match a_sel {
+            0 => pixel[3] as u16,
+            1 => self.fog_color[3] as u16,
+            2 => pixel[3] as u16, // shade alpha — use pixel alpha as approximation
+            _ => 0,
+        };
+
+        // Select M color source
+        let m = match m_sel {
+            0 => pixel,
+            1 => memory,
+            2 => self.blend_color,
+            _ => self.fog_color,
+        };
+
+        // Select B factor
+        let b: u16 = match b_sel {
+            0 => 255u16.saturating_sub(a), // 1 - A
+            1 => memory[3] as u16,
+            2 => 255,
+            _ => 0,
+        };
+
+        let denom = a + b;
+        if denom == 0 {
+            return pixel;
+        }
+
+        let mut result = [0u8; 4];
+        for i in 0..3 {
+            let val = (p[i] as u16 * a + m[i] as u16 * b) / denom;
+            result[i] = val.min(255) as u8;
+        }
+        result[3] = pixel[3]; // preserve incoming alpha
+        result
+    }
+
+    /// Write a pixel to the framebuffer with alpha compare and blending.
     fn write_pixel(&self, rdram: &mut [u8], x: i32, y: i32, color: [u8; 4]) {
         // Alpha compare: othermode_l bits 0-1
         // 0 = none, 1 = threshold compare, 2/3 = dither
@@ -1071,6 +1158,15 @@ impl Renderer {
             return; // Fail alpha threshold test
         }
 
+        // Blender: FORCE_BL (bit 14) forces the blender to execute
+        let force_bl = self.othermode_l & (1 << 14) != 0;
+        let final_color = if force_bl {
+            let memory = self.read_pixel(rdram, x, y);
+            self.blend_pixel(color, memory)
+        } else {
+            color
+        };
+
         let addr = self.color_image_addr as usize;
         let width = self.color_image_width as i32;
 
@@ -1078,7 +1174,7 @@ impl Renderer {
             2 => {
                 let offset = addr + ((y * width + x) as usize) * 2;
                 if offset + 1 >= rdram.len() { return; }
-                let pixel = pack_rgba5551(color[0], color[1], color[2], color[3]);
+                let pixel = pack_rgba5551(final_color[0], final_color[1], final_color[2], final_color[3]);
                 let bytes = pixel.to_be_bytes();
                 rdram[offset] = bytes[0];
                 rdram[offset + 1] = bytes[1];
@@ -1086,10 +1182,10 @@ impl Renderer {
             3 => {
                 let offset = addr + ((y * width + x) as usize) * 4;
                 if offset + 3 >= rdram.len() { return; }
-                rdram[offset] = color[0];
-                rdram[offset + 1] = color[1];
-                rdram[offset + 2] = color[2];
-                rdram[offset + 3] = color[3];
+                rdram[offset] = final_color[0];
+                rdram[offset + 1] = final_color[1];
+                rdram[offset + 2] = final_color[2];
+                rdram[offset + 3] = final_color[3];
             }
             _ => {}
         }
