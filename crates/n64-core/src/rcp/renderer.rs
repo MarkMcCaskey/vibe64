@@ -555,14 +555,49 @@ impl Renderer {
 
     /// Sample a texel from TMEM at the given S/T coordinates.
     /// S and T are in 10.5 fixed-point.
+    /// Checks othermode_h text_filt bits to select point or bilinear.
     fn sample_texture(&self, tile_idx: usize, s: i32, t: i32, _cycle: u8) -> [u8; 4] {
+        // Text filter mode: othermode_h bits 13-12
+        // 0 = point, 2 = bilinear, 3 = average (treat as bilinear)
+        let text_filt = (self.othermode_h >> 12) & 0x3;
+
+        if text_filt >= 2 {
+            // Bilinear: sample 4 neighbors and blend by fractional position
+            let frac_s = (s & 0x1F) as u16; // 5-bit fraction (0-31)
+            let frac_t = (t & 0x1F) as u16;
+
+            let s0 = s >> 5;
+            let t0 = t >> 5;
+            let s1 = s0 + 1;
+            let t1 = t0 + 1;
+
+            let c00 = self.sample_texel_point(tile_idx, s0, t0);
+            let c10 = self.sample_texel_point(tile_idx, s1, t0);
+            let c01 = self.sample_texel_point(tile_idx, s0, t1);
+            let c11 = self.sample_texel_point(tile_idx, s1, t1);
+
+            // Bilinear blend using 5-bit fractions (0-31 range)
+            let inv_s = 32 - frac_s;
+            let inv_t = 32 - frac_t;
+            let mut result = [0u8; 4];
+            for i in 0..4 {
+                let top = c00[i] as u16 * inv_s + c10[i] as u16 * frac_s;
+                let bot = c01[i] as u16 * inv_s + c11[i] as u16 * frac_s;
+                result[i] = ((top * inv_t + bot * frac_t + 512) >> 10) as u8;
+            }
+            result
+        } else {
+            // Point sampling
+            let si = s >> 5;
+            let ti = t >> 5;
+            self.sample_texel_point(tile_idx, si, ti)
+        }
+    }
+
+    /// Point-sample a single texel at integer coordinates.
+    fn sample_texel_point(&self, tile_idx: usize, si: i32, ti: i32) -> [u8; 4] {
         let tile = &self.tiles[tile_idx];
 
-        // Convert S10.5 to integer texel coordinates
-        let si = (s >> 5) as i32;
-        let ti = (t >> 5) as i32;
-
-        // Apply wrapping/clamping
         let si = self.wrap_coord(si, tile.mask_s, tile.cm_s);
         let ti = self.wrap_coord(ti, tile.mask_t, tile.cm_t);
 
@@ -577,10 +612,8 @@ impl Renderer {
                     let byte = self.tmem[byte_offset];
                     let nibble = if si & 1 == 0 { byte >> 4 } else { byte & 0x0F };
                     if tile.format == 2 {
-                        // CI4: look up in TLUT
                         self.lookup_tlut(tile.palette as usize * 16 + nibble as usize)
                     } else {
-                        // I4: expand to 8-bit intensity
                         let i = nibble | (nibble << 4);
                         [i, i, i, 0xFF]
                     }
