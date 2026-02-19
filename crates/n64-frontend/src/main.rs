@@ -1,3 +1,4 @@
+mod audio;
 mod debug_overlay;
 mod tui;
 
@@ -21,6 +22,7 @@ struct App {
     n64: n64_core::N64,
     window: Option<&'static Window>,
     pixels: Option<Pixels<'static>>,
+    audio: Option<audio::AudioOutput>,
     last_frame_time: std::time::Instant,
 }
 
@@ -101,6 +103,13 @@ impl ApplicationHandler for App {
                     if key == KeyCode::KeyP && pressed {
                         save_screenshot(&self.n64);
                     }
+                    // M = toggle audio mute
+                    if key == KeyCode::KeyM && pressed {
+                        if let Some(audio) = &mut self.audio {
+                            let muted = audio.toggle_mute();
+                            log::info!("Audio: {}", if muted { "muted" } else { "unmuted" });
+                        }
+                    }
                     // F1-F8 = debug overlays
                     if pressed {
                         debug_overlay::handle_f_key(&mut self.n64.debug, key);
@@ -109,6 +118,15 @@ impl ApplicationHandler for App {
             }
             WindowEvent::RedrawRequested => {
                 self.n64.run_frame();
+
+                // Feed audio samples to output device
+                if let Some(audio) = &self.audio {
+                    let samples = self.n64.drain_audio_samples();
+                    if !samples.is_empty() {
+                        let rate = self.n64.audio_sample_rate();
+                        audio.push_samples(&samples, rate);
+                    }
+                }
 
                 // FPS timing
                 let now = std::time::Instant::now();
@@ -872,8 +890,12 @@ fn main() {
     } else if use_tui {
         tui::run(n64);
     } else {
+        let audio = audio::AudioOutput::new();
+        if audio.is_none() {
+            log::warn!("Audio: no output device found, running without audio");
+        }
         let event_loop = EventLoop::new().expect("create event loop");
-        let mut app = App { n64, window: None, pixels: None, last_frame_time: std::time::Instant::now() };
+        let mut app = App { n64, window: None, pixels: None, audio, last_frame_time: std::time::Instant::now() };
         event_loop.run_app(&mut app).expect("run event loop");
     }
 }

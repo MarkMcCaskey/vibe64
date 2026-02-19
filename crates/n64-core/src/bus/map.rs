@@ -30,6 +30,9 @@ pub struct Interconnect {
     pub ucode: crate::rcp::gbi::UcodeType,
     /// ISViewer debug output buffer (512 bytes at physical 0x13FF0020)
     is_viewer_buf: [u8; 512],
+    /// Audio sample buffer: 16-bit signed PCM, stereo interleaved (L,R,L,R...).
+    /// Populated from RDRAM when AI DMA starts. Frontend drains each frame.
+    pub audio_samples: Vec<i16>,
 }
 
 impl Interconnect {
@@ -49,6 +52,7 @@ impl Interconnect {
             renderer: Renderer::new(),
             ucode: crate::rcp::gbi::UcodeType::F3dex2,
             is_viewer_buf: [0u8; 512],
+            audio_samples: Vec::with_capacity(16384),
         }
     }
 
@@ -363,6 +367,22 @@ impl Bus for Interconnect {
                 match self.ai.write_u32(addr, val) {
                     AiRegWrite::ClearInterrupt => {
                         self.mi.clear_interrupt(crate::rcp::mi::MiInterrupt::AI);
+                    }
+                    AiRegWrite::DmaStarted { dram_addr, len } => {
+                        // Capture audio samples from RDRAM for frontend playback.
+                        // N64 audio: 16-bit signed PCM, big-endian, stereo interleaved.
+                        let base = dram_addr as usize;
+                        let sample_count = len as usize / 2; // 2 bytes per i16
+                        for i in 0..sample_count {
+                            let off = base + i * 2;
+                            if off + 1 < self.rdram.data().len() {
+                                let sample = i16::from_be_bytes([
+                                    self.rdram.data()[off],
+                                    self.rdram.data()[off + 1],
+                                ]);
+                                self.audio_samples.push(sample);
+                            }
+                        }
                     }
                     AiRegWrite::None => {}
                 }

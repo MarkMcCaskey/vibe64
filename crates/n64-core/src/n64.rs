@@ -131,6 +131,19 @@ impl N64 {
     pub fn vi_width(&self) -> u32 { self.bus.vi.width }
     pub fn rdram_data(&self) -> &[u8] { self.bus.rdram.data() }
 
+    /// Audio: drain buffered samples. Returns 16-bit signed stereo PCM (L,R,L,R...).
+    pub fn drain_audio_samples(&mut self) -> Vec<i16> {
+        std::mem::take(&mut self.bus.audio_samples)
+    }
+
+    /// Audio: N64 sample rate from AI dacrate register.
+    /// sample_rate = VI_NTSC_clock / (dacrate + 1)
+    pub fn audio_sample_rate(&self) -> u32 {
+        let dacrate = self.bus.ai.dacrate;
+        if dacrate == 0 { return 32000; } // sensible default
+        48_681_812 / (dacrate + 1)
+    }
+
     /// Execute a single CPU instruction and tick peripherals.
     /// Returns cycles consumed (always 1 for interpreter).
     pub fn step_one(&mut self) -> u64 {

@@ -24,6 +24,9 @@ pub enum AiRegWrite {
     None,
     /// AI_STATUS written — caller should clear MI AI interrupt.
     ClearInterrupt,
+    /// AI_LEN written — a DMA was started. Caller should capture audio samples
+    /// from RDRAM at (dram_addr, len) for audio output.
+    DmaStarted { dram_addr: u32, len: u32 },
 }
 
 impl Ai {
@@ -71,6 +74,10 @@ impl Ai {
                     // Minimum 1000 cycles to avoid tight loops
                     if self.dma_cycles < 1000 { self.dma_cycles = 1000; }
                     self.dma_count += 1;
+                    return AiRegWrite::DmaStarted {
+                        dram_addr: self.dram_addr,
+                        len: self.len,
+                    };
                 }
                 AiRegWrite::None
             }
