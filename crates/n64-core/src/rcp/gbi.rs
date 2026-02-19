@@ -253,9 +253,13 @@ pub fn process_display_list(renderer: &mut Renderer, rdram: &mut [u8], addr: u32
             }
             G_MOVEWORD => {
                 let index = (w0 >> 16) & 0xFF;
+                let offset = w0 & 0xFFFF;
                 match index {
+                    0x02 => { // G_MW_NUMLIGHT
+                        renderer.num_dir_lights = (w1 / 24) as u8;
+                    }
                     0x06 => { // G_MW_SEGMENT
-                        let seg = ((w0 & 0xFFFF) / 4) as usize;
+                        let seg = (offset / 4) as usize;
                         if seg < 16 {
                             renderer.segment_table[seg] = w1 & 0x00FF_FFFF;
                         }
@@ -263,9 +267,18 @@ pub fn process_display_list(renderer: &mut Renderer, rdram: &mut [u8], addr: u32
                     0x08 => { // G_MW_FOG
                         renderer.cmd_set_fog(w1);
                     }
-                    0x0E => { // G_MW_NUMLIGHT
-                        renderer.num_dir_lights = (w1 / 24) as u8;
+                    0x0A => { // G_MW_LIGHTCOL: set light color via moveword
+                        let light_idx = (offset as usize) / 24;
+                        let sub = (offset as usize) % 24;
+                        if light_idx < 8 && (sub == 0 || sub == 4) {
+                            renderer.light_colors[light_idx] = [
+                                (w1 >> 24) as u8,
+                                (w1 >> 16) as u8,
+                                (w1 >> 8) as u8,
+                            ];
+                        }
                     }
+                    0x0E => {} // G_MW_PERSPNORM: perspective normalization (ignored)
                     _ => {}
                 }
             }

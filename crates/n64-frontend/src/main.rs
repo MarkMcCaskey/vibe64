@@ -181,6 +181,7 @@ fn save_screenshot(n64: &n64_core::N64) {
     std::fs::write("screenshot.ppm", &ppm).ok();
     eprintln!("  Saved screenshot.ppm");
 
+
 }
 
 /// Read N64 framebuffer from RDRAM and convert to RGBA8888 for display.

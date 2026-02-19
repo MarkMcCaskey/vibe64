@@ -485,6 +485,7 @@ impl Renderer {
         let x1 = ((lrx >> 2) + 1).min(self.scissor_lrx as i32 >> 2);
         let y1 = ((lry >> 2) + 1).min(self.scissor_lry as i32 >> 2);
 
+
         if x0 >= x1 || y0 >= y1 || self.color_image_addr == 0 {
             return;
         }
@@ -565,14 +566,7 @@ impl Renderer {
 
         let cycle = self.cycle_type();
 
-        // Log first few texture rects for debugging
-        if self.tex_rect_count < 5 {
-            log::debug!(
-                "TEXRECT #{}: ({},{})→({},{}) tile={} fmt={} sz={} tmem={:#X} line={} cycle={}",
-                self.tex_rect_count, x0, y0, x1, y1, tile_idx,
-                tile.format, tile.size, tile.tmem * 8, tile.line, cycle,
-            );
-        }
+
 
         // Convert S/T from S10.5 to S10.10 to match dsdx/dtdy (S5.10)
         let s10 = s << 5;
@@ -977,6 +971,7 @@ impl Renderer {
                 // Ambient light is at index num_dir_lights
                 let n = self.num_dir_lights as usize;
                 let amb = if n < 8 { self.light_colors[n] } else { [64, 64, 64] };
+
                 let mut ra = amb[0] as f32;
                 let mut ga = amb[1] as f32;
                 let mut ba = amb[2] as f32;
