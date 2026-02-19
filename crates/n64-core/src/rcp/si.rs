@@ -27,6 +27,8 @@ pub struct Si {
     /// Cycles remaining until SI DMA completion interrupt fires.
     /// While > 0, SI_STATUS bit 0 (DMA busy) is set.
     pub dma_busy_cycles: u64,
+    /// Debug: log of SI DMA events (dram_addr, direction: 0=read, 1=write)
+    pub dma_log: Vec<(u32, u8)>,
 }
 
 impl Si {
@@ -36,6 +38,7 @@ impl Si {
             status: 0,
             dma_count: 0,
             dma_busy_cycles: 0,
+            dma_log: Vec::new(),
         }
     }
 

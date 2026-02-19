@@ -314,71 +314,108 @@ fn main() {
         let intr_q_msgs_addr = 0x0033AEC8usize;  // msg buffer
         let mut prev_valid: u32 = 0;
         let mut msg_log: Vec<(u64, u32)> = Vec::new(); // (step, msg_value)
-        // Monitor gGfxVblankQueue — two candidate addresses:
-        // Decomp symbols: 0x80367158 (phys 0x00367160 for validCount)
-        // display_and_vsync's osRecvMesg arg: 0x8033B028 (phys 0x0033B030 for validCount)
-        let gfx_vblank_q_valid_addr = 0x00367160usize;
-        let mut prev_gfx_vblank_valid: u32 = 0;
-        let mut gfx_vblank_log: Vec<(u64, u32)> = Vec::new();
-        // Also monitor the REAL queue that display_and_vsync blocks on
-        let real_gfx_q_valid_addr = 0x0033B030usize; // 0x8033B028 + 0x08
-        let mut prev_real_gfx_valid: u32 = 0;
-        let mut real_gfx_log: Vec<(u64, u32)> = Vec::new();
-        // Track exec_display_list entry: scan backwards from 0x80246C68 to find function prologue
+        // === SI queue monitoring (every step) ===
+        // Queue A: 0x80367138 — validCount at phys 0x00367140
+        // Queue B: 0x80367158 — validCount at phys 0x00367160
+        // These are the two cap=1 queues involved in SM64's SI access.
+        // Log format: (step, new_validCount, pc32)
+        let si_q_a_valid_addr = 0x00367140usize;
+        let si_q_b_valid_addr = 0x00367160usize;
+        let mut prev_si_q_a: u32 = 0;
+        let mut prev_si_q_b: u32 = 0;
+        let mut si_q_a_log: Vec<(u64, u32, u32)> = Vec::new();
+        let mut si_q_b_log: Vec<(u64, u32, u32)> = Vec::new();
         let mut exec_dl_hits: u64 = 0;
         let mut exec_dl_first_step: u64 = 0;
-        // Also track if thread5 game loop PC is in display_and_vsync range
-        let game_vblank_q_valid_addr = 0x00367138usize + 8; // gGameVblankQueue.validCount
-        let mut prev_game_vblank_valid: u32 = 0;
-        let mut game_vblank_log: Vec<(u64, u32)> = Vec::new();
+        // Track SI DMA timing: (step, dram_addr, direction)
+        let mut si_dma_steps: Vec<(u64, u32, u8)> = Vec::new();
+        // Track MI_INTR SI transitions: (step, set_or_clear, pc32)
+        let mut mi_si_log: Vec<(u64, bool, u32)> = Vec::new();
+        let mut prev_mi_si: bool = false;
+        // Track osRecvMesg and osSendMesg calls during EEPROM window
+        // Log: (step, func: 'R'ecv/'S'end, $a0=queue_addr, $a1=msg)
+        let mut mesg_calls: Vec<(u64, char, u32, u32)> = Vec::new();
+        // PC trace for critical window (after last DMA wait, before blocked acquire)
+        let mut pc_trace: Vec<(u64, u32)> = Vec::new();
+        let mut pc_trace_active = false;
         for i in 0..total_steps {
             let pc32 = n64.cpu.pc as u32;
             if i & 0x3FF == 0 {
                 *pc_hist.entry(pc32).or_default() += 1;
             }
             if pc32 == 0x80000180 { exception_count += 1; }
-            // Track exec_display_list and its callers
-            if pc32 == 0x80246C10 { // exec_display_list entry
+            // Track exec_display_list
+            if pc32 == 0x80246C10 {
                 exec_dl_hits += 1;
                 if exec_dl_hits == 1 { exec_dl_first_step = i; }
             }
-            // render_init's jal exec_display_list
-            if pc32 == 0x80247F94 && exec_dl_first_step == 0 {
-                eprintln!("  ** render_init calls exec_display_list at step {}", i);
-            }
-            // display_and_vsync's jal exec_display_list
-            if pc32 == 0x802480EC && exec_dl_first_step == 0 {
-                eprintln!("  ** display_and_vsync calls exec_display_list at step {}", i);
-            }
-            // Track display_and_vsync entry region (find function start)
-            // The osRecvMesg for gGfxVblankQueue should be shortly before 0x802480CC
-            // Track if PC enters 0x80248040-0x80248100 range (approx display_and_vsync body)
-            if pc32 >= 0x80248040 && pc32 <= 0x80248100 && exec_dl_first_step == 0 {
-                // Only log first few
-                static mut DAV_COUNT: u32 = 0;
-                unsafe {
-                    DAV_COUNT += 1;
-                    if DAV_COUNT <= 20 {
-                        eprintln!("  ** display_and_vsync body: step={} PC={:#010X}", i, pc32);
-                    }
-                }
-            }
-            // Monitor gGameVblankQueue (thread 5 waits on this for frame timing)
+            // === SI queue monitoring — every step ===
             {
                 let rd = n64.rdram_data();
-                if game_vblank_q_valid_addr + 3 < rd.len() {
-                    let cur = u32::from_be_bytes([
-                        rd[game_vblank_q_valid_addr], rd[game_vblank_q_valid_addr+1],
-                        rd[game_vblank_q_valid_addr+2], rd[game_vblank_q_valid_addr+3],
+                if si_q_a_valid_addr + 3 < rd.len() {
+                    let cur_a = u32::from_be_bytes([
+                        rd[si_q_a_valid_addr], rd[si_q_a_valid_addr+1],
+                        rd[si_q_a_valid_addr+2], rd[si_q_a_valid_addr+3],
                     ]);
-                    if cur != prev_game_vblank_valid && game_vblank_log.len() < 50 {
-                        game_vblank_log.push((i, cur));
+                    if cur_a != prev_si_q_a && si_q_a_log.len() < 200 {
+                        si_q_a_log.push((i, cur_a, pc32));
                     }
-                    prev_game_vblank_valid = cur;
+                    prev_si_q_a = cur_a;
+                }
+                if si_q_b_valid_addr + 3 < rd.len() {
+                    let cur_b = u32::from_be_bytes([
+                        rd[si_q_b_valid_addr], rd[si_q_b_valid_addr+1],
+                        rd[si_q_b_valid_addr+2], rd[si_q_b_valid_addr+3],
+                    ]);
+                    if cur_b != prev_si_q_b && si_q_b_log.len() < 200 {
+                        si_q_b_log.push((i, cur_b, pc32));
+                    }
+                    prev_si_q_b = cur_b;
                 }
             }
             let rsp_before = n64.bus.rsp.start_count;
+            let si_dma_before = n64.bus.si.dma_count;
             n64.step_one();
+            // Track SI DMA step timing
+            if n64.bus.si.dma_count > si_dma_before && si_dma_steps.len() < 50 {
+                let idx = n64.bus.si.dma_log.len().saturating_sub(1);
+                let (dram, dir) = if idx < n64.bus.si.dma_log.len() {
+                    n64.bus.si.dma_log[idx]
+                } else { (0, 0) };
+                si_dma_steps.push((i, dram, dir));
+            }
+            // Track MI_INTR SI transitions
+            let cur_mi_si = n64.bus.mi.intr & (1 << 1) != 0;
+            if cur_mi_si != prev_mi_si && mi_si_log.len() < 200 {
+                mi_si_log.push((i, cur_mi_si, n64.cpu.pc as u32));
+            }
+            prev_mi_si = cur_mi_si;
+            // Track osRecvMesg/osSendMesg calls during EEPROM window (steps 23.4M-23.5M)
+            if i >= 23_400_000 && i <= 23_500_000 && mesg_calls.len() < 500 {
+                let pc_now = n64.cpu.pc as u32;
+                if pc_now == 0x80322800 { // osRecvMesg entry
+                    let a0 = n64.cpu.gpr[4] as u32;
+                    let a1 = n64.cpu.gpr[5] as u32;
+                    mesg_calls.push((i, 'R', a0, a1));
+                    // (PC trace trigger moved below)
+                } else if pc_now == 0x80322C20 { // osSendMesg entry
+                    let a0 = n64.cpu.gpr[4] as u32;
+                    let a1 = n64.cpu.gpr[5] as u32;
+                    mesg_calls.push((i, 'S', a0, a1));
+                }
+            }
+            // PC trace: capture critical window around 2nd EEPROM block
+            // Start just before the last DMA wait returns, continue until blocked
+            if i >= 23_442_870 && !pc_trace_active && pc_trace.is_empty() {
+                pc_trace_active = true;
+            }
+            if pc_trace_active && pc_trace.len() < 500 {
+                pc_trace.push((i, n64.cpu.pc as u32));
+                // Stop tracing when we see the blocked osRecvMesg on Queue B
+                if n64.cpu.pc as u32 == 0x80322868 { // osRecvMesg blocking path
+                    pc_trace_active = false;
+                }
+            }
             if n64.bus.rsp.start_count > rsp_before {
                 // Read task type from DMEM to classify
                 let task_type = n64.bus.rsp.read_dmem_u32(0xFC0);
@@ -417,30 +454,7 @@ fn main() {
                     }
                     prev_valid = cur_valid;
                 }
-                // Monitor gGfxVblankQueue (thread 5 unblocking queue)
-                if gfx_vblank_q_valid_addr + 3 < rd.len() {
-                    let cur = u32::from_be_bytes([
-                        rd[gfx_vblank_q_valid_addr], rd[gfx_vblank_q_valid_addr+1],
-                        rd[gfx_vblank_q_valid_addr+2], rd[gfx_vblank_q_valid_addr+3]]);
-                    if cur != prev_gfx_vblank_valid && gfx_vblank_log.len() < 100 {
-                        gfx_vblank_log.push((i, cur));
-                    }
-                    prev_gfx_vblank_valid = cur;
-                }
-                // Monitor the REAL gGfxVblankQueue (from display_and_vsync disasm: 0x8033B028)
-                if real_gfx_q_valid_addr + 3 < rd.len() {
-                    let cur = u32::from_be_bytes([
-                        rd[real_gfx_q_valid_addr], rd[real_gfx_q_valid_addr+1],
-                        rd[real_gfx_q_valid_addr+2], rd[real_gfx_q_valid_addr+3]]);
-                    if cur != prev_real_gfx_valid && real_gfx_log.len() < 100 {
-                        real_gfx_log.push((i, cur));
-                        if cur > prev_real_gfx_valid {
-                            eprintln!("  ** REAL gGfxVblankQueue ({:#010X}) primed: step={} validCount={} PC={:#010X}",
-                                0x8033B028u32, i, cur, pc32);
-                        }
-                    }
-                    prev_real_gfx_valid = cur;
-                }
+                // (SI queue monitoring moved to every-step block above)
             }
             // Track DP interrupt (only raised by GFX tasks in process_rsp_task)
             if n64.bus.mi.intr & (1 << 5) != 0 {
@@ -482,6 +496,16 @@ fn main() {
             n64.bus.vi.v_current, n64.bus.vi.v_intr, n64.bus.vi.v_sync);
         eprintln!("  SI: {} DMAs  AI: {} DMAs (dacrate={})",
             n64.bus.si.dma_count, n64.bus.ai.dma_count, n64.bus.ai.dacrate);
+        // PI DMA start vs completion: check for lost interrupts
+        let pi_starts = n64.bus.pi.dma_count as u64;
+        let pi_completions = n64.bus.mi.set_counts[4] as u64; // PI interrupt fires
+        let pi_pending: u64 = if n64.bus.pi.dma_busy_cycles > 0 { 1 } else { 0 };
+        eprintln!("  PI: {} starts, {} completions, {} pending (busy_cycles={})",
+            pi_starts, pi_completions, pi_pending, n64.bus.pi.dma_busy_cycles);
+        if pi_starts != pi_completions + pi_pending {
+            eprintln!("  *** PI DMA MISMATCH: {} starts != {} completions + {} pending ***",
+                pi_starts, pi_completions, pi_pending);
+        }
         eprintln!("  Renderer: {} fills, {} tex_rects, {} vtx, {} tris, {} pixels, {} z_fail, {} culled",
             n64.bus.renderer.fill_rect_count,
             n64.bus.renderer.tex_rect_count,
@@ -541,12 +565,22 @@ fn main() {
                 let op = u32::from_be_bytes([rdram[addr], rdram[addr+1], rdram[addr+2], rdram[addr+3]]);
                 if op == jal_send {
                     let va = 0x80000000u32 + addr as u32;
-                    // Look for a1 value in nearby instructions
+                    // Look for a0 (queue) and a1 (msg) values in nearby instructions
+                    let mut a0_val: Option<u32> = None;
                     let mut a1_val: Option<u32> = None;
+                    let mut a0_lui: u32 = 0;
                     for off in (-40i32..4).step_by(4) {
                         let check = (addr as i32 + off) as usize;
                         if check + 3 >= rdram.len() { continue; }
                         let inst = u32::from_be_bytes([rdram[check], rdram[check+1], rdram[check+2], rdram[check+3]]);
+                        // lui a0($4), imm
+                        if inst >> 16 == 0x3C04 {
+                            a0_lui = (inst & 0xFFFF) << 16;
+                        }
+                        // addiu a0($4), a0($4), imm
+                        if inst >> 16 == 0x2484 {
+                            a0_val = Some(a0_lui.wrapping_add(inst as u16 as i16 as i32 as u32));
+                        }
                         // addiu a1($5), $zero, imm: 001001_00000_00101 = 0x2405xxxx
                         if inst >> 16 == 0x2405 {
                             a1_val = Some(inst & 0xFFFF);
@@ -561,6 +595,10 @@ fn main() {
                         }
                     }
                     all_calls.push((va, a1_val));
+                    // For msg=NULL calls, also show queue address
+                    if a1_val == Some(0) && a0_val.is_some() {
+                        all_calls.push((va, Some(a0_val.unwrap() | 0xF0000000))); // marker
+                    }
                 }
             }
             eprintln!("  All jal osSendMesg calls ({} found):", all_calls.len());
@@ -628,35 +666,441 @@ fn main() {
         // exec_display_list call tracking
         eprintln!("  exec_display_list (0x80246C68): {} hits, first at step {}", exec_dl_hits, exec_dl_first_step);
 
-        // gGfxVblankQueue monitoring results
-        if !gfx_vblank_log.is_empty() {
-            eprintln!("  gGfxVblankQueue changes ({}):", gfx_vblank_log.len());
-            for &(step, valid) in gfx_vblank_log.iter().take(50) {
-                eprintln!("    step={}: validCount={}", step, valid);
-            }
-        } else {
-            eprintln!("  gGfxVblankQueue: NEVER changed from 0 (thread 5 stuck!)");
+        // SI Queue A (0x80367138) transitions
+        eprintln!("  SI Queue A (0x80367138) transitions ({}):", si_q_a_log.len());
+        for &(step, valid, pc) in si_q_a_log.iter().take(100) {
+            eprintln!("    step={}: valid={} PC={:#010X}", step, valid, pc);
+        }
+        // SI Queue B (0x80367158) transitions
+        eprintln!("  SI Queue B (0x80367158) transitions ({}):", si_q_b_log.len());
+        for &(step, valid, pc) in si_q_b_log.iter().take(100) {
+            eprintln!("    step={}: valid={} PC={:#010X}", step, valid, pc);
         }
 
-        // REAL gGfxVblankQueue (0x8033B028) monitoring results
-        if !real_gfx_log.is_empty() {
-            eprintln!("  REAL gGfxVblankQueue (0x8033B028) changes ({}):", real_gfx_log.len());
-            for &(step, valid) in real_gfx_log.iter().take(50) {
-                eprintln!("    step={}: validCount={}", step, valid);
-            }
-        } else {
-            eprintln!("  REAL gGfxVblankQueue (0x8033B028): NEVER changed from 0");
+        // osRecvMesg/osSendMesg calls during EEPROM window
+        eprintln!("  osRecvMesg/osSendMesg during EEPROM window ({}):", mesg_calls.len());
+        for &(step, func, a0, a1) in mesg_calls.iter().take(100) {
+            let queue_name = match a0 {
+                0x80367138 => " [QueueA/__osSiAccess]",
+                0x80367158 => " [QueueB/__osContAccess]",
+                0x8033AE08 => " [gIntrMesgQueue]",
+                _ => "",
+            };
+            eprintln!("    step={}: os{}Mesg(queue={:#010X}{}, msg={:#010X})",
+                step, if func == 'R' { "Recv" } else { "Send" }, a0, queue_name, a1);
         }
 
-        // gGameVblankQueue monitoring results
-        if !game_vblank_log.is_empty() {
-            eprintln!("  gGameVblankQueue changes ({}):", game_vblank_log.len());
-            for &(step, valid) in game_vblank_log.iter().take(20) {
-                eprintln!("    step={}: validCount={}", step, valid);
+        // PC trace for critical window
+        if !pc_trace.is_empty() {
+            eprintln!("  PC trace after 4th event queue wait ({} entries):", pc_trace.len());
+            for &(step, pc) in pc_trace.iter().take(500) {
+                // Annotate known functions
+                let note = match pc {
+                    0x80328934..=0x8032895F => " [__osSiRelAccess?]",
+                    0x803288F0..=0x80328933 => " [__osContGetAccess?]",
+                    0x80329150..=0x8032933F => " [EEPROM wrapper]",
+                    0x80329340..=0x803293FF => " [func@0x80329340]",
+                    0x80322800..=0x80322C1F => " [osRecvMesg]",
+                    0x80322C20..=0x80322FFF => " [osSendMesg]",
+                    0x80000180 => " [EXCEPTION]",
+                    _ => "",
+                };
+                eprintln!("    step={}: PC={:#010X}{}", step, pc, note);
             }
-        } else {
-            eprintln!("  gGameVblankQueue: NEVER changed from 0");
         }
+
+        // SI DMA step timing
+        eprintln!("  SI DMA step timing ({}):", si_dma_steps.len());
+        for &(step, dram, dir) in &si_dma_steps {
+            let dir_str = if dir == 0 { "read(PIF→RDRAM)" } else { "write(RDRAM→PIF)" };
+            eprintln!("    step={}: RDRAM[{:#010X}] {}", step, dram, dir_str);
+        }
+        // MI_INTR SI transitions
+        eprintln!("  MI_INTR SI transitions ({}):", mi_si_log.len());
+        for &(step, is_set, pc) in mi_si_log.iter().take(50) {
+            eprintln!("    step={}: {} PC={:#010X}", step, if is_set { "SET" } else { "CLEAR" }, pc);
+        }
+
+        // Disassemble key EEPROM functions by known addresses
+        // func@0x80328DAC = osEepromRead (from stack trace)
+        // func@0x80329150 = EEPROM wrapper (from stack trace)
+        // Also find __osSiInterrupt by scanning for SW to SI_STATUS (0xA4800018)
+        {
+            let rdram = n64.rdram_data();
+            let read_u32_fn = |off: usize| -> u32 {
+                if off + 3 < rdram.len() {
+                    u32::from_be_bytes([rdram[off], rdram[off+1], rdram[off+2], rdram[off+3]])
+                } else { 0 }
+            };
+            let decode_fn = |addr: u32, inst: u32| -> String {
+                let op = inst >> 26;
+                match op {
+                    0 => { let func = inst & 0x3F; match func {
+                        0x08 => "jr $ra".into(), 0x09 => format!("jalr ${}", (inst >> 11) & 0x1F),
+                        0x21 => format!("addu ${},${},${}", (inst >> 11)&0x1F, (inst >> 21)&0x1F, (inst >> 16)&0x1F),
+                        0x25 => format!("or ${},${},${}", (inst >> 11)&0x1F, (inst >> 21)&0x1F, (inst >> 16)&0x1F),
+                        _ => format!("special/{:#04X}", func),
+                    }}
+                    2 => format!("j {:#010X}", ((inst & 0x03FFFFFF) << 2) | (addr & 0xF0000000)),
+                    3 => format!("jal {:#010X}", ((inst & 0x03FFFFFF) << 2) | (addr & 0xF0000000)),
+                    4 => format!("beq ${},${},{:+}", (inst >> 21)&0x1F, (inst >> 16)&0x1F, (inst as u16 as i16)*4),
+                    5 => format!("bne ${},${},{:+}", (inst >> 21)&0x1F, (inst >> 16)&0x1F, (inst as u16 as i16)*4),
+                    9 => format!("addiu ${},${},{}", (inst >> 16)&0x1F, (inst >> 21)&0x1F, inst as u16 as i16),
+                    0xD => format!("ori ${},${},{:#X}", (inst >> 16)&0x1F, (inst >> 21)&0x1F, inst & 0xFFFF),
+                    0xF => format!("lui ${},{:#06X}", (inst >> 16)&0x1F, inst & 0xFFFF),
+                    0x23 => format!("lw ${},{}(${})", (inst >> 16)&0x1F, inst as u16 as i16, (inst >> 21)&0x1F),
+                    0x2B => format!("sw ${},{}(${})", (inst >> 16)&0x1F, inst as u16 as i16, (inst >> 21)&0x1F),
+                    _ => format!("op={:#04X}", op),
+                }
+            };
+
+            // Disassemble func@0x80328DAC (osEepromRead)
+            eprintln!("  --- osEepromRead func@0x80328DAC ---");
+            let start = 0x328DACusize;
+            for k in 0..150usize {
+                let a = start + k * 4;
+                if a + 3 >= rdram.len() { break; }
+                let inst = read_u32_fn(a);
+                let va = 0x80000000u32 + a as u32;
+                let note = if inst == 0x03E00008 { " <-- jr $ra" }
+                    else if inst >> 26 == 3 {
+                        let target = ((inst & 0x03FFFFFF) << 2) | 0x80000000;
+                        if target == 0x80322800 { " <-- jal osRecvMesg" }
+                        else if target == 0x80322C20 { " <-- jal osSendMesg" }
+                        else { "" }
+                    } else { "" };
+                eprintln!("    {:#010X}: {:#010X}  {}{}", va, inst, decode_fn(va, inst), note);
+                if inst == 0x03E00008 {
+                    let a2 = start + (k + 1) * 4;
+                    if a2 + 3 < rdram.len() {
+                        let i2 = read_u32_fn(a2);
+                        eprintln!("    {:#010X}: {:#010X}  {}", va + 4, i2, decode_fn(va + 4, i2));
+                    }
+                    break;
+                }
+            }
+
+            // Disassemble func@0x80329150 (wrapper)
+            eprintln!("  --- EEPROM wrapper func@0x80329150 ---");
+            let start2 = 0x329150usize;
+            for k in 0..150usize {
+                let a = start2 + k * 4;
+                if a + 3 >= rdram.len() { break; }
+                let inst = read_u32_fn(a);
+                let va = 0x80000000u32 + a as u32;
+                let note = if inst == 0x03E00008 { " <-- jr $ra" }
+                    else if inst >> 26 == 3 {
+                        let target = ((inst & 0x03FFFFFF) << 2) | 0x80000000;
+                        if target == 0x80322800 { " <-- jal osRecvMesg" }
+                        else if target == 0x80322C20 { " <-- jal osSendMesg" }
+                        else if target == 0x80328DAC { " <-- jal osEepromRead(0x80328DAC)" }
+                        else { "" }
+                    } else { "" };
+                eprintln!("    {:#010X}: {:#010X}  {}{}", va, inst, decode_fn(va, inst), note);
+                if inst == 0x03E00008 {
+                    let a2 = start2 + (k + 1) * 4;
+                    if a2 + 3 < rdram.len() {
+                        let i2 = read_u32_fn(a2);
+                        eprintln!("    {:#010X}: {:#010X}  {}", va + 4, i2, decode_fn(va + 4, i2));
+                    }
+                    break;
+                }
+            }
+
+            // Find __osSiInterrupt by scanning for SW to SI_STATUS (lui+sw pattern for 0xA4800018)
+            // Look for: lui $reg, 0xA480 ... sw $reg2, 0x18($reg)
+            eprintln!("  --- Searching for __osSiInterrupt (SW to SI_STATUS 0xA4800018) ---");
+            for addr in (0x320000..0x340000usize).step_by(4) {
+                if addr + 3 >= rdram.len() { break; }
+                let inst = read_u32_fn(addr);
+                // Look for "sw $X, 0x18($Y)" where Y was loaded with 0xA480xxxx
+                if (inst >> 26) == 0x2B && (inst & 0xFFFF) == 0x0018 {
+                    let base_reg = (inst >> 21) & 0x1F;
+                    // Scan backward for "lui $base_reg, 0xA480"
+                    for back in 1..20 {
+                        let prev_addr = addr.saturating_sub(back * 4);
+                        let prev_inst = read_u32_fn(prev_addr);
+                        {
+                            // Check: lui $base_reg, 0xA480
+                            let lui_rt = (prev_inst >> 16) & 0x1F;
+                            let lui_op = prev_inst >> 26;
+                            let lui_imm = prev_inst & 0xFFFF;
+                            if lui_op == 0xF && lui_rt == base_reg && lui_imm == 0xA480 {
+                                let va = 0x80000000u32 + addr as u32;
+                                eprintln!("    Found SW to SI_STATUS at {:#010X}", va);
+                                // Find containing function
+                                let mut fs = addr;
+                                for _ in 0..200 {
+                                    if fs < 4 { break; }
+                                    fs -= 4;
+                                    let fi = read_u32_fn(fs);
+                                    if fi >> 16 == 0x27BD && (fi & 0x8000) != 0 { break; }
+                                }
+                                let fva = 0x80000000u32 + fs as u32;
+                                eprintln!("  --- __osSiInterrupt candidate func@{:#010X} ---", fva);
+                                for k in 0..80usize {
+                                    let a = fs + k * 4;
+                                    if a + 3 >= rdram.len() { break; }
+                                    let fi = read_u32_fn(a);
+                                    let fva2 = fva.wrapping_add((k * 4) as u32);
+                                    let note = if fi >> 26 == 3 {
+                                        let target = ((fi & 0x03FFFFFF) << 2) | 0x80000000;
+                                        if target == 0x80322C20 { " <-- jal osSendMesg" }
+                                        else if target == 0x80322800 { " <-- jal osRecvMesg" }
+                                        else { "" }
+                                    } else if fi == 0x03E00008 { " <-- jr $ra" }
+                                    else { "" };
+                                    eprintln!("    {:#010X}: {:#010X}  {}{}", fva2, fi, decode_fn(fva2, fi), note);
+                                    if fi == 0x03E00008 {
+                                        let a2 = fs + (k + 1) * 4;
+                                        if a2 + 3 < rdram.len() {
+                                            let i2 = read_u32_fn(a2);
+                                            eprintln!("    {:#010X}: {:#010X}  {}", fva2 + 4, i2, decode_fn(fva2 + 4, i2));
+                                        }
+                                        break;
+                                    }
+                                }
+                                break; // found it
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Disassemble functions containing osSendMesg calls at 0x80328428 and 0x803288D8
+        {
+            let rdram = n64.rdram_data();
+            let read_u32 = |off: usize| -> u32 {
+                if off + 3 < rdram.len() {
+                    u32::from_be_bytes([rdram[off], rdram[off+1], rdram[off+2], rdram[off+3]])
+                } else { 0 }
+            };
+            let decode = |addr: u32, inst: u32| -> String {
+                let op = inst >> 26;
+                match op {
+                    0 => { let func = inst & 0x3F; match func {
+                        0x08 => "jr $ra".into(), 0x09 => format!("jalr ${}", (inst >> 11) & 0x1F),
+                        0x21 => format!("addu ${},${},${}", (inst >> 11)&0x1F, (inst >> 21)&0x1F, (inst >> 16)&0x1F),
+                        0x25 => format!("or ${},${},${}", (inst >> 11)&0x1F, (inst >> 21)&0x1F, (inst >> 16)&0x1F),
+                        _ => format!("special/{:#04X}", func),
+                    }}
+                    2 => format!("j {:#010X}", ((inst & 0x03FFFFFF) << 2) | (addr & 0xF0000000)),
+                    3 => format!("jal {:#010X}", ((inst & 0x03FFFFFF) << 2) | (addr & 0xF0000000)),
+                    4 => format!("beq ${},${},{:+}", (inst >> 21)&0x1F, (inst >> 16)&0x1F, (inst as u16 as i16)*4),
+                    5 => format!("bne ${},${},{:+}", (inst >> 21)&0x1F, (inst >> 16)&0x1F, (inst as u16 as i16)*4),
+                    9 => format!("addiu ${},${},{}", (inst >> 16)&0x1F, (inst >> 21)&0x1F, inst as u16 as i16),
+                    0xD => format!("ori ${},${},{:#X}", (inst >> 16)&0x1F, (inst >> 21)&0x1F, inst & 0xFFFF),
+                    0xF => format!("lui ${},{:#06X}", (inst >> 16)&0x1F, inst & 0xFFFF),
+                    0x23 => format!("lw ${},{}(${})", (inst >> 16)&0x1F, inst as u16 as i16, (inst >> 21)&0x1F),
+                    0x2B => format!("sw ${},{}(${})", (inst >> 16)&0x1F, inst as u16 as i16, (inst >> 21)&0x1F),
+                    _ => format!("op={:#04X}", op),
+                }
+            };
+            // Dump functions containing the two osSendMesg call sites
+            for &target_va in &[0x80328428u32, 0x803288D8u32] {
+                let target_phys = (target_va & 0x7FFFFF) as usize;
+                // Scan backward for function prologue (addiu sp, sp, -XX)
+                let mut func_start = target_phys;
+                for _ in 0..200 {
+                    if func_start < 4 { break; }
+                    func_start -= 4;
+                    let inst = read_u32(func_start);
+                    if inst >> 16 == 0x27BD && (inst & 0x8000) != 0 { break; }
+                }
+                let func_va = 0x80000000u32 + func_start as u32;
+                eprintln!("  --- func@{:#010X} (contains osSendMesg at {:#010X}) ---", func_va, target_va);
+                for k in 0..80usize {
+                    let a = func_start + k * 4;
+                    if a + 3 >= rdram.len() { break; }
+                    let inst = read_u32(a);
+                    let va = func_va.wrapping_add((k * 4) as u32);
+                    let marker = if va == target_va { " <-- osSendMesg" } else { "" };
+                    eprintln!("    {:#010X}: {:#010X}  {}{}", va, inst, decode(va, inst), marker);
+                    if inst == 0x03E00008 { // jr $ra
+                        let a2 = func_start + (k + 1) * 4;
+                        if a2 + 3 < rdram.len() {
+                            let i2 = read_u32(a2);
+                            eprintln!("    {:#010X}: {:#010X}  {}", va + 4, i2, decode(va + 4, i2));
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        // Targeted code dumps from RDRAM (game code is in memory after boot)
+        {
+            let rdram = n64.rdram_data();
+            let read_u32_at = |off: usize| -> u32 {
+                if off + 3 < rdram.len() {
+                    u32::from_be_bytes([rdram[off], rdram[off+1], rdram[off+2], rdram[off+3]])
+                } else { 0 }
+            };
+            let decode_inst = |addr: u32, inst: u32| -> String {
+                let op = inst >> 26;
+                match op {
+                    0 => { let func = inst & 0x3F; match func {
+                        0x08 => "jr $ra".into(), 0x09 => format!("jalr ${}", (inst >> 11) & 0x1F),
+                        0x21 => format!("addu ${},${},${}", (inst >> 11)&0x1F, (inst >> 21)&0x1F, (inst >> 16)&0x1F),
+                        0x25 => format!("or ${},${},${}", (inst >> 11)&0x1F, (inst >> 21)&0x1F, (inst >> 16)&0x1F),
+                        0x24 => format!("and ${},${},${}", (inst >> 11)&0x1F, (inst >> 21)&0x1F, (inst >> 16)&0x1F),
+                        _ => format!("special/{:#04X}", func),
+                    }}
+                    2 => format!("j {:#010X}", ((inst & 0x03FFFFFF) << 2) | (addr & 0xF0000000)),
+                    3 => { let target = ((inst & 0x03FFFFFF) << 2) | (addr & 0xF0000000);
+                        let tag = match target {
+                            0x80322800 => " [osRecvMesg]",
+                            0x80322C20 => " [osSendMesg]",
+                            _ => "",
+                        };
+                        format!("jal {:#010X}{}", target, tag) }
+                    4 => format!("beq ${},${},{:+}", (inst >> 21)&0x1F, (inst >> 16)&0x1F, (inst as u16 as i16)*4),
+                    5 => format!("bne ${},${},{:+}", (inst >> 21)&0x1F, (inst >> 16)&0x1F, (inst as u16 as i16)*4),
+                    6 => format!("blez ${},{:+}", (inst >> 21)&0x1F, (inst as u16 as i16)*4),
+                    9 => format!("addiu ${},${},{}", (inst >> 16)&0x1F, (inst >> 21)&0x1F, inst as u16 as i16),
+                    0xC => format!("andi ${},${},{:#X}", (inst >> 16)&0x1F, (inst >> 21)&0x1F, inst & 0xFFFF),
+                    0xD => format!("ori ${},${},{:#X}", (inst >> 16)&0x1F, (inst >> 21)&0x1F, inst & 0xFFFF),
+                    0xF => format!("lui ${},{:#06X}", (inst >> 16)&0x1F, inst & 0xFFFF),
+                    0x23 => format!("lw ${},{}(${})", (inst >> 16)&0x1F, inst as u16 as i16, (inst >> 21)&0x1F),
+                    0x2B => format!("sw ${},{}(${})", (inst >> 16)&0x1F, inst as u16 as i16, (inst >> 21)&0x1F),
+                    _ => format!("op={:#04X}", op),
+                }
+            };
+
+            // 1. Exception handler around SI_STATUS write (0x803279E0 to 0x80327B00)
+            eprintln!("  --- Exception handler SI dispatch (0x803279E0..0x80327B00) ---");
+            let si_start = 0x3279E0usize;
+            for k in 0..72usize {
+                let a = si_start + k * 4;
+                let inst = read_u32_at(a);
+                let va = 0x80000000u32 + a as u32;
+                eprintln!("    {:#010X}: {:#010X}  {}", va, inst, decode_inst(va, inst));
+            }
+
+            // 2. __osSiRawStartDma at 0x80328960
+            eprintln!("  --- __osSiRawStartDma func@0x80328960 ---");
+            let raw_start = 0x328960usize;
+            for k in 0..80usize {
+                let a = raw_start + k * 4;
+                let inst = read_u32_at(a);
+                let va = 0x80000000u32 + a as u32;
+                eprintln!("    {:#010X}: {:#010X}  {}", va, inst, decode_inst(va, inst));
+                if inst == 0x03E00008 { // jr $ra
+                    let a2 = raw_start + (k + 1) * 4;
+                    let i2 = read_u32_at(a2);
+                    eprintln!("    {:#010X}: {:#010X}  {}", va + 4, i2, decode_inst(va + 4, i2));
+                    break;
+                }
+            }
+
+            // 3. Mystery function at 0x803225A0
+            eprintln!("  --- func@0x803225A0 (called from SI callbacks) ---");
+            let mystery_start = 0x3225A0usize;
+            for k in 0..80usize {
+                let a = mystery_start + k * 4;
+                let inst = read_u32_at(a);
+                let va = 0x80000000u32 + a as u32;
+                eprintln!("    {:#010X}: {:#010X}  {}", va, inst, decode_inst(va, inst));
+                if inst == 0x03E00008 {
+                    let a2 = mystery_start + (k + 1) * 4;
+                    let i2 = read_u32_at(a2);
+                    eprintln!("    {:#010X}: {:#010X}  {}", va + 4, i2, decode_inst(va + 4, i2));
+                    break;
+                }
+            }
+
+            // 4. __osSiInterrupt full dump: 0x803279C0 to 0x80327AF0
+            // (the main dispatch logic after MI_INTR check)
+            eprintln!("  --- __osSiInterrupt event dispatch (0x803279C0..0x80327AF0) ---");
+            let si_int_start = 0x3279C0usize;
+            for k in 0..76usize {
+                let a = si_int_start + k * 4;
+                let inst = read_u32_at(a);
+                let va = 0x80000000u32 + a as u32;
+                eprintln!("    {:#010X}: {:#010X}  {}", va, inst, decode_inst(va, inst));
+            }
+
+            // 5. Dump osSetEventMesg (search for it — sets __osEventStateTab entries)
+            // It's typically called with (event_id, queue, msg)
+            // Search for stores to 0x80335A* area (event table)
+            eprintln!("  --- osSetEventMesg search (stores to event table) ---");
+            // Search for the event table by looking at what the callbacks reference
+            // func@0x803283F0 writes 1 to 0x80335A50, func@0x803288A0 writes 1 to 0x80335A60
+            // These are likely __osSiCallBack and __osContCallBack flags
+            // The event table entries are nearby. Dump 0x80335A40..0x80335A70
+            eprintln!("    Event table area (0x335A40..0x335A70):");
+            for off in (0x335A40usize..0x335A70).step_by(4) {
+                let val = read_u32_at(off);
+                if val != 0 {
+                    eprintln!("      [{:#010X}] = {:#010X}", 0x80000000u32 + off as u32, val);
+                }
+            }
+
+            // 6. Dump __osContRelAccess / __osSiRelAccess at 0x80328934
+            eprintln!("  --- func@0x80328934 (release function) ---");
+            let rel_start = 0x328934usize;
+            for k in 0..30usize {
+                let a = rel_start + k * 4;
+                let inst = read_u32_at(a);
+                let va = 0x80000000u32 + a as u32;
+                eprintln!("    {:#010X}: {:#010X}  {}", va, inst, decode_inst(va, inst));
+                if inst == 0x03E00008 {
+                    let a2 = rel_start + (k + 1) * 4;
+                    let i2 = read_u32_at(a2);
+                    eprintln!("    {:#010X}: {:#010X}  {}", va + 4, i2, decode_inst(va + 4, i2));
+                    break;
+                }
+            }
+
+            // 7. Dump __osContGetAccess at 0x803288F0
+            eprintln!("  --- func@0x803288F0 (acquire function) ---");
+            let acq_start = 0x3288F0usize;
+            for k in 0..30usize {
+                let a = acq_start + k * 4;
+                let inst = read_u32_at(a);
+                let va = 0x80000000u32 + a as u32;
+                eprintln!("    {:#010X}: {:#010X}  {}", va, inst, decode_inst(va, inst));
+                if inst == 0x03E00008 {
+                    let a2 = acq_start + (k + 1) * 4;
+                    let i2 = read_u32_at(a2);
+                    eprintln!("    {:#010X}: {:#010X}  {}", va + 4, i2, decode_inst(va + 4, i2));
+                    break;
+                }
+            }
+
+            // 8. Dump mystery function at 0x80329340
+            eprintln!("  --- func@0x80329340 (called between osEepromRead and wrapper DMAs) ---");
+            let mys_start = 0x329340usize;
+            for k in 0..60usize {
+                let a = mys_start + k * 4;
+                let inst = read_u32_at(a);
+                let va = 0x80000000u32 + a as u32;
+                eprintln!("    {:#010X}: {:#010X}  {}", va, inst, decode_inst(va, inst));
+                if inst == 0x03E00008 {
+                    let a2 = mys_start + (k + 1) * 4;
+                    let i2 = read_u32_at(a2);
+                    eprintln!("    {:#010X}: {:#010X}  {}", va + 4, i2, decode_inst(va + 4, i2));
+                    break;
+                }
+            }
+
+            // 9. Dump __osDispatchEvent at 0x80327B98
+            eprintln!("  --- __osDispatchEvent func@0x80327B98 ---");
+            let disp_start = 0x327B98usize;
+            for k in 0..60usize {
+                let a = disp_start + k * 4;
+                let inst = read_u32_at(a);
+                let va = 0x80000000u32 + a as u32;
+                eprintln!("    {:#010X}: {:#010X}  {}", va, inst, decode_inst(va, inst));
+                if inst == 0x03E00008 {
+                    let a2 = disp_start + (k + 1) * 4;
+                    let i2 = read_u32_at(a2);
+                    eprintln!("    {:#010X}: {:#010X}  {}", va + 4, i2, decode_inst(va + 4, i2));
+                    break;
+                }
+            }
+        }
+
         eprintln!("  MI mask={:06b} (SP={} SI={} AI={} VI={} PI={} DP={})",
             n64.bus.mi.intr_mask,
             n64.bus.mi.intr_mask & 1, (n64.bus.mi.intr_mask >> 1) & 1,
@@ -749,17 +1193,55 @@ fn main() {
                 eprintln!("    {:#010X}: pri={:4} {:8} id={:3} PC={:#010X} RA={:#010X} queue={:#010X}",
                     vaddr, pri_i, s, id, saved_pc, saved_ra, queue);
 
-                // For WAITING threads, dump code at saved PC and queue info
+                // For WAITING threads, disassemble around saved PC and queue info
                 if state == 8 {
+                    // Mini MIPS disassembler for call chain analysis
+                    let decode_mips = |addr: u32, inst: u32| -> String {
+                        let op = inst >> 26;
+                        match op {
+                            0 => { // SPECIAL
+                                let func = inst & 0x3F;
+                                match func {
+                                    0x08 => "jr      $ra".to_string(),
+                                    0x09 => format!("jalr    ${}", (inst >> 11) & 0x1F),
+                                    0x21 => format!("addu    ${},${},${}", (inst >> 11) & 0x1F, (inst >> 21) & 0x1F, (inst >> 16) & 0x1F),
+                                    0x25 => format!("or      ${},${},${}", (inst >> 11) & 0x1F, (inst >> 21) & 0x1F, (inst >> 16) & 0x1F),
+                                    _ => format!("special/{:#04X}", func),
+                                }
+                            }
+                            2 => { // J
+                                let target = ((inst & 0x03FFFFFF) << 2) | (addr & 0xF0000000);
+                                format!("j       {:#010X}", target)
+                            }
+                            3 => { // JAL
+                                let target = ((inst & 0x03FFFFFF) << 2) | (addr & 0xF0000000);
+                                format!("jal     {:#010X}", target)
+                            }
+                            4 => format!("beq     ${},${},{:+}", (inst >> 21) & 0x1F, (inst >> 16) & 0x1F, (inst as u16 as i16) * 4),
+                            5 => format!("bne     ${},${},{:+}", (inst >> 21) & 0x1F, (inst >> 16) & 0x1F, (inst as u16 as i16) * 4),
+                            9 => format!("addiu   ${},${},{}", (inst >> 16) & 0x1F, (inst >> 21) & 0x1F, inst as u16 as i16),
+                            0xD => format!("ori     ${},${},{:#X}", (inst >> 16) & 0x1F, (inst >> 21) & 0x1F, inst & 0xFFFF),
+                            0xF => format!("lui     ${},{:#06X}", (inst >> 16) & 0x1F, inst & 0xFFFF),
+                            0x23 => format!("lw      ${},{}(${})", (inst >> 16) & 0x1F, inst as u16 as i16, (inst >> 21) & 0x1F),
+                            0x2B => format!("sw      ${},{}(${})", (inst >> 16) & 0x1F, inst as u16 as i16, (inst >> 21) & 0x1F),
+                            _ => format!("op={:#04X}", op),
+                        }
+                    };
+
                     if saved_pc >= 0x8000_0000 && saved_pc < 0x8080_0000 {
                         let pc_phys = (saved_pc & 0x7FFFFF) as usize;
-                        if pc_phys + 15 < rdram.len() {
-                            eprint!("             code@PC:");
-                            for j in 0..4u32 {
-                                let op = read_u32(pc_phys + (j as usize) * 4);
-                                eprint!(" {:#010X}", op);
-                            }
-                            eprintln!();
+                        // Disassemble 8 instructions before and 4 after saved_pc
+                        let start = pc_phys.saturating_sub(32);
+                        let end = (pc_phys + 16).min(rdram.len().saturating_sub(3));
+                        eprintln!("             --- disasm around saved_pc={:#010X} ---", saved_pc);
+                        let mut addr = 0x80000000u32.wrapping_add(start as u32);
+                        let mut off = start;
+                        while off < end {
+                            let inst = read_u32(off);
+                            let marker = if off == pc_phys { " <-- saved_pc" } else { "" };
+                            eprintln!("               {:#010X}: {:#010X}  {}{}", addr, inst, decode_mips(addr, inst), marker);
+                            addr = addr.wrapping_add(4);
+                            off += 4;
                         }
                     }
                     // Examine the OSMesgQueue this thread is waiting on
@@ -778,6 +1260,64 @@ fn main() {
                         }
                     }
 
+                    // For the game thread (pri=10), dump caller functions
+                    if pri == 10 {
+                        // Collect unique function entries from stack
+                        let sp_val = read_u32((vaddr & 0x7FFFFF) as usize + 0xF4);
+                        if sp_val >= 0x8000_0000 && sp_val < 0x8080_0000 {
+                            let sp_p = (sp_val & 0x7FFFFF) as usize;
+                            let mut func_entries: Vec<u32> = Vec::new();
+                            for j in 0..64usize {
+                                let off = sp_p + j * 4;
+                                if off + 3 >= rdram.len() { break; }
+                                let w = read_u32(off);
+                                if w >= 0x8000_0000 && w < 0x8040_0000 {
+                                    // Find function prologue
+                                    let rp = (w & 0x7FFFFF) as usize;
+                                    if rp >= 4 {
+                                        let mut scan = rp;
+                                        for _ in 0..256 {
+                                            if scan < 4 { break; }
+                                            scan -= 4;
+                                            let inst = read_u32(scan);
+                                            if inst >> 16 == 0x27BD && (inst & 0x8000) != 0 {
+                                                let fe = 0x80000000 + scan as u32;
+                                                if !func_entries.contains(&fe) {
+                                                    func_entries.push(fe);
+                                                }
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            // Dump first 100 instructions of each unique caller function
+                            for &fe in func_entries.iter().take(6) {
+                                let fp = (fe & 0x7FFFFF) as usize;
+                                eprintln!("             --- func@{:#010X} ---", fe);
+                                for k in 0..100usize {
+                                    let a = fp + k * 4;
+                                    if a + 3 >= rdram.len() { break; }
+                                    let inst = read_u32(a);
+                                    let va = fe.wrapping_add((k * 4) as u32);
+                                    let decoded = decode_mips(va, inst);
+                                    eprintln!("               {:#010X}: {:#010X}  {}", va, inst, decoded);
+                                    // Stop at jr ra (function return)
+                                    if inst == 0x03E00008 { // jr $ra
+                                        // Print the delay slot too
+                                        let a2 = fp + (k + 1) * 4;
+                                        if a2 + 3 < rdram.len() {
+                                            let inst2 = read_u32(a2);
+                                            let va2 = fe.wrapping_add(((k + 1) * 4) as u32);
+                                            eprintln!("               {:#010X}: {:#010X}  {}", va2, inst2, decode_mips(va2, inst2));
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     // Dump saved SP and stack frame for WAITING threads
                     let thread_phys = (vaddr & 0x7FFFFF) as usize;
                     // SP is at thread + 0xF4 (low 32 of u64 at +0xF0)
@@ -787,26 +1327,61 @@ fn main() {
                     if sp_off + 3 < rdram.len() && a0_off + 3 < rdram.len() {
                         let saved_sp = read_u32(sp_off);
                         let saved_a0 = read_u32(a0_off);
-                        eprint!("             SP={:#010X} a0={:#010X}", saved_sp, saved_a0);
-                        // Walk stack: dump 32 words looking for return addresses
+                        eprintln!("             SP={:#010X} a0={:#010X}", saved_sp, saved_a0);
+                        // Walk stack: dump words looking for return addresses, with disasm
                         if saved_sp >= 0x8000_0000 && saved_sp < 0x8080_0000 {
                             let sp_p = (saved_sp & 0x7FFFFF) as usize;
-                            eprint!(" stack[");
-                            let mut first_addr = true;
-                            for j in 0..32usize {
+                            let mut ret_addrs: Vec<(usize, u32)> = Vec::new();
+                            for j in 0..64usize {
                                 let off = sp_p + j * 4;
                                 if off + 3 >= rdram.len() { break; }
                                 let w = read_u32(off);
-                                // Show all stack words that look like code addresses
+                                // Code addresses in text segment
                                 if w >= 0x8000_0000 && w < 0x8040_0000 {
-                                    if !first_addr { eprint!(","); }
-                                    eprint!(" +{:#X}:{:#010X}", j*4, w);
-                                    first_addr = false;
+                                    ret_addrs.push((j * 4, w));
                                 }
                             }
-                            eprint!("]");
+                            if !ret_addrs.is_empty() {
+                                eprintln!("             stack return addresses:");
+                                for &(stack_off, ret_addr) in ret_addrs.iter().take(12) {
+                                    let rp = (ret_addr & 0x7FFFFF) as usize;
+                                    // Show the jal instruction BEFORE the return address
+                                    // (ret_addr is the instruction after jal, so jal is at ret_addr-8
+                                    //  due to delay slot: jal target; nop; <-- ret_addr)
+                                    let mut context = String::new();
+                                    if rp >= 8 && rp + 3 < rdram.len() {
+                                        let jal_inst = read_u32(rp - 8);
+                                        let jal_op = jal_inst >> 26;
+                                        if jal_op == 3 { // JAL
+                                            let target = ((jal_inst & 0x03FFFFFF) << 2) | (ret_addr & 0xF0000000);
+                                            context = format!(" calls {:#010X}", target);
+                                        } else if jal_op == 0 && (jal_inst & 0x3F) == 9 { // JALR
+                                            context = " (jalr)".to_string();
+                                        }
+                                    }
+                                    // Also find the function this return address is IN
+                                    // by scanning backward for addiu sp,sp,-XX
+                                    let mut func_entry = 0u32;
+                                    if rp >= 4 {
+                                        let mut scan = rp;
+                                        for _ in 0..256 {
+                                            if scan < 4 { break; }
+                                            scan -= 4;
+                                            let inst = read_u32(scan);
+                                            // addiu sp, sp, negative = function prologue
+                                            if inst >> 16 == 0x27BD && (inst & 0x8000) != 0 {
+                                                func_entry = 0x80000000 + scan as u32;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    let func_str = if func_entry != 0 {
+                                        format!(" (in func@{:#010X})", func_entry)
+                                    } else { String::new() };
+                                    eprintln!("               SP+{:#04X}: {:#010X}{}{}", stack_off, ret_addr, context, func_str);
+                                }
+                            }
                         }
-                        eprintln!();
                     }
                 }
             }
@@ -860,6 +1435,13 @@ fn main() {
             }
         }
         eprintln!();
+
+        // SI DMA log
+        eprintln!("  SI DMA log ({} entries):", n64.bus.si.dma_log.len());
+        for (i, &(dram, dir)) in n64.bus.si.dma_log.iter().enumerate() {
+            let dir_str = if dir == 0 { "PIF→RDRAM (read)" } else { "RDRAM→PIF (write)" };
+            eprintln!("    #{}: RDRAM[{:#010X}] {}", i+1, dram, dir_str);
+        }
 
         // PI DMA log
         eprintln!("  PI DMA log ({} entries):", n64.bus.pi.dma_log.len());

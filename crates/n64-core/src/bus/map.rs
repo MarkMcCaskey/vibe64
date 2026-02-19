@@ -162,7 +162,9 @@ impl Interconnect {
                 self.renderer.color_image_addr,
             );
 
-            // DP interrupt is fired by auto-complete in write_status
+            // DP interrupt: RDP finished rendering this display list.
+            // Only raised for GFX tasks (audio tasks don't use the RDP).
+            self.mi.set_interrupt(crate::rcp::mi::MiInterrupt::DP);
         }
     }
 
@@ -218,32 +220,37 @@ impl Interconnect {
     }
 
     /// SI DMA Read: PIF RAM → RDRAM (game reads controller state).
-    /// Processes PIF commands first, then copies 64 bytes.
-    /// Data is copied immediately; the completion interrupt is delayed to
-    /// match real PIF bus speed (~1 MHz → ~6000 CPU cycles for 64 bytes).
+    /// Copies 64 bytes immediately but defers the SI interrupt by ~6000
+    /// CPU cycles to match real PIF bus timing (~64 µs at 1 MHz bus).
     fn si_dma_read(&mut self) {
-        self.pif.process_commands();
         let dram_addr = self.si.dram_addr & 0x00FF_FFFF;
         for i in 0..64u32 {
             let byte = self.pif.ram[i as usize];
             self.rdram.write_u8(dram_addr + i, byte);
         }
-        // Delay interrupt: ~64 microseconds at 93.75 MHz ≈ 6000 cycles.
-        // This prevents SI event queue overflow when rapid DMAs occur.
+        // Defer SI interrupt — tick_si_dma will fire it after the delay.
         self.si.dma_busy_cycles = 6000;
         self.si.dma_count += 1;
+        if self.si.dma_log.len() < 200 {
+            self.si.dma_log.push((dram_addr, 0)); // 0 = read (PIF→RDRAM)
+        }
     }
 
     /// SI DMA Write: RDRAM → PIF RAM (game sends commands to PIF).
-    /// Copies 64 bytes then processes PIF commands.
+    /// Copies 64 bytes and processes PIF commands immediately, but defers
+    /// the SI interrupt to match real PIF bus timing.
     fn si_dma_write(&mut self) {
         let dram_addr = self.si.dram_addr & 0x00FF_FFFF;
         for i in 0..64u32 {
             self.pif.ram[i as usize] = self.rdram.read_u8(dram_addr + i);
         }
         self.pif.process_commands();
+        // Defer SI interrupt — tick_si_dma will fire it after the delay.
         self.si.dma_busy_cycles = 6000;
         self.si.dma_count += 1;
+        if self.si.dma_log.len() < 200 {
+            self.si.dma_log.push((dram_addr, 1)); // 1 = write (RDRAM→PIF)
+        }
     }
 
     /// Tick SI DMA timer. Raises SI interrupt when DMA completes.

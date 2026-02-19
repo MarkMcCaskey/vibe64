@@ -86,7 +86,7 @@ impl Pif {
             EepromType::Eeprom4K => 512,
             EepromType::Eeprom16K => 2048,
         };
-        self.eeprom = vec![0u8; size];
+        self.eeprom = vec![0xFFu8; size];
     }
 
     pub fn set_cic(&mut self, cic: CicVariant) {
@@ -156,6 +156,7 @@ impl Pif {
         let mut i = 0usize;
         let mut channel = 0u8;
 
+
         while i < 63 {
             let tx_len = self.ram[i];
 
@@ -163,6 +164,8 @@ impl Pif {
             if tx_len == 0xFE { break; }          // End of commands
             if tx_len == 0x00 { i += 1; channel += 1; continue; } // Skip channel
             if tx_len == 0xFD { i += 1; channel += 1; continue; } // Skip channel
+            // Bit 7 set = channel already processed / skip (e.g. 0xFF = no device)
+            if tx_len & 0x80 != 0 { i += 1; channel += 1; continue; }
 
             let tx = (tx_len & 0x3F) as usize;
             if i + 1 >= 63 { break; }

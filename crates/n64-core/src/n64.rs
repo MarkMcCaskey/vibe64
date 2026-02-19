@@ -53,10 +53,12 @@ impl N64 {
         log::info!("Microcode: {:?}", ucode);
 
         let entry_point = header.entry_point;
+        let game_code = header.game_code;
         let cart = Cartridge::new(rom_data, header);
         let mut bus = Interconnect::new(cart);
         bus.pif.set_cic(cic);
         bus.pif.set_eeprom(eeprom_type);
+        init_eeprom_for_game(&game_code, &mut bus.pif);
         bus.ucode = ucode;
         bus.renderer.ucode = ucode;
 
@@ -308,4 +310,28 @@ fn detect_eeprom(game_code: &[u8; 4]) -> crate::memory::pif::EepromType {
 
     // Default: try 4K EEPROM for unrecognized games (most common save type)
     EepromType::Eeprom4K
+}
+
+/// Initialize EEPROM with game-specific header data for known games.
+///
+/// SM64 has a bug in its save data reader: the custom osEepromLongRead wrapper
+/// at 0x80329150 acquires __osContAccessQueue but only releases it on the
+/// success path. If EEPROM block 0 doesn't start with the magic value 0x8000,
+/// the error path returns without releasing the queue, deadlocking the game
+/// thread on the next acquire. Pre-writing the magic header lets the wrapper
+/// proceed normally; the game detects invalid checksums in the remaining data
+/// and initializes fresh save slots.
+fn init_eeprom_for_game(game_code: &[u8; 4], pif: &mut crate::memory::pif::Pif) {
+    let code = std::str::from_utf8(game_code).unwrap_or("");
+
+    match code {
+        // Super Mario 64: save header magic at start of each 128-byte save slot
+        "NSME" | "NSMJ" => {
+            if pif.eeprom.len() >= 2 {
+                pif.eeprom[0] = 0x80;
+                pif.eeprom[1] = 0x00;
+            }
+        }
+        _ => {}
+    }
 }

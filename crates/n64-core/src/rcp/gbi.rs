@@ -445,16 +445,24 @@ pub fn process_display_list_f3d(renderer: &mut Renderer, rdram: &mut [u8], addr:
             F3D_SETOTHERMODE_L => renderer.cmd_set_other_mode_l(w0, w1),
 
             F3D_MOVEWORD => {
-                let index = (w0 >> 16) & 0xFF;
+                // F3D encoding: w0 = [BC][offset:16][index:8]
+                // (F3DEX2 puts index in bits[23:16], F3D puts it in bits[7:0])
+                let index = w0 & 0xFF;
+                let offset = (w0 >> 8) & 0xFFFF;
                 match index {
                     0x06 => { // G_MW_SEGMENT
-                        let seg = ((w0 & 0xFFFF) / 4) as usize;
+                        let seg = (offset / 4) as usize;
                         if seg < 16 {
                             renderer.segment_table[seg] = w1 & 0x00FF_FFFF;
                         }
                     }
                     0x08 => renderer.cmd_set_fog(w1),
-                    0x0E => { renderer.num_dir_lights = (w1 / 24) as u8; }
+                    0x02 => { // G_MW_NUMLIGHT — F3D formula: ((val - 0x80000000) / 32) - 1
+                        let val = w1.wrapping_sub(0x80000000);
+                        renderer.num_dir_lights = (val / 32).saturating_sub(1) as u8;
+                    }
+                    0x0E => {} // G_MW_PERSPNORM — not needed for HLE
+                    0x0A => {} // G_MW_LIGHTCOL — handled via MOVEMEM
                     _ => {}
                 }
             }

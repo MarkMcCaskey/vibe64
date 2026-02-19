@@ -196,13 +196,14 @@ impl Rsp {
         // Auto-complete: if the game just un-halted the RSP, pretend
         // the task finished instantly. Set halt + broke (RSP stopped),
         // signal 0 (task done) + signal 1 (used by some schedulers),
-        // and raise both SP and DP interrupts. The N64 OS scheduler
-        // waits for both interrupts before signaling the game thread.
+        // and raise the SP interrupt. DP interrupt is raised separately
+        // by the bus only for GFX tasks (after display list processing),
+        // matching real hardware where DP fires when the RDP finishes.
         if was_halted && (self.status & 0x01 == 0) {
             log::trace!("RSP auto-complete: task started, immediately finishing");
             self.status |= 0x01 | 0x02 | (1 << 7) | (1 << 8); // halt + broke + sig0 + sig1
             mi.set_interrupt(super::mi::MiInterrupt::SP);
-            mi.set_interrupt(super::mi::MiInterrupt::DP);
+            // DP interrupt raised by bus after GFX task processing (not here)
             self.start_count += 1;
             if self.status_log.len() < 100 {
                 self.status_log.push((val, self.status, true));
