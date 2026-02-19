@@ -24,6 +24,11 @@ struct App {
     pixels: Option<Pixels<'static>>,
     audio: Option<audio::AudioOutput>,
     last_frame_time: std::time::Instant,
+    /// Track held arrow keys for proper analog stick (survives simultaneous presses)
+    arrow_up: bool,
+    arrow_down: bool,
+    arrow_left: bool,
+    arrow_right: bool,
 }
 
 impl ApplicationHandler for App {
@@ -87,13 +92,24 @@ impl ApplicationHandler for App {
                     }
 
                     // Analog stick from arrow keys (±80 range)
+                    // Track each key independently so simultaneous presses work
                     match key {
-                        KeyCode::ArrowUp    => ctrl.stick_y = if pressed { 80 } else { 0 },
-                        KeyCode::ArrowDown  => ctrl.stick_y = if pressed { -80 } else { 0 },
-                        KeyCode::ArrowLeft  => ctrl.stick_x = if pressed { -80 } else { 0 },
-                        KeyCode::ArrowRight => ctrl.stick_x = if pressed { 80 } else { 0 },
+                        KeyCode::ArrowUp    => self.arrow_up = pressed,
+                        KeyCode::ArrowDown  => self.arrow_down = pressed,
+                        KeyCode::ArrowLeft  => self.arrow_left = pressed,
+                        KeyCode::ArrowRight => self.arrow_right = pressed,
                         _ => {}
                     }
+                    ctrl.stick_y = match (self.arrow_up, self.arrow_down) {
+                        (true, false) => 80,
+                        (false, true) => -80,
+                        _ => 0,
+                    };
+                    ctrl.stick_x = match (self.arrow_right, self.arrow_left) {
+                        (true, false) => 80,
+                        (false, true) => -80,
+                        _ => 0,
+                    };
 
                     // Escape to quit
                     if key == KeyCode::Escape && pressed {
@@ -290,7 +306,7 @@ fn main() {
         let mut audio_task_count: u32 = 0;
         let mut other_task_count: u32 = 0;
         let mut dp_interrupt_count: u64 = 0;
-        let mut sp_status_write_count: u64 = 0;
+        let _sp_status_write_count: u64 = 0;
         let mut first_dp_step: u64 = 0;
         // Monitor gIntrMesgQueue for message arrivals
         let intr_q_valid_addr = 0x0033AE10usize; // validCount at queue+0x08
@@ -312,7 +328,7 @@ fn main() {
         let mut exec_dl_hits: u64 = 0;
         let mut exec_dl_first_step: u64 = 0;
         // Also track if thread5 game loop PC is in display_and_vsync range
-        let mut game_vblank_q_valid_addr = 0x00367138usize + 8; // gGameVblankQueue.validCount
+        let game_vblank_q_valid_addr = 0x00367138usize + 8; // gGameVblankQueue.validCount
         let mut prev_game_vblank_valid: u32 = 0;
         let mut game_vblank_log: Vec<(u64, u32)> = Vec::new();
         for i in 0..total_steps {
@@ -895,7 +911,11 @@ fn main() {
             log::warn!("Audio: no output device found, running without audio");
         }
         let event_loop = EventLoop::new().expect("create event loop");
-        let mut app = App { n64, window: None, pixels: None, audio, last_frame_time: std::time::Instant::now() };
+        let mut app = App {
+            n64, window: None, pixels: None, audio,
+            last_frame_time: std::time::Instant::now(),
+            arrow_up: false, arrow_down: false, arrow_left: false, arrow_right: false,
+        };
         event_loop.run_app(&mut app).expect("run event loop");
     }
 }
