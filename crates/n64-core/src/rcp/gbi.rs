@@ -63,6 +63,7 @@ pub const G_TEXRECT: u8      = 0xE4; // Texture Rectangle
 pub const G_TEXRECTFLIP: u8  = 0xE5; // Texture Rectangle (S/T flipped)
 pub const G_SETOTHERMODE_H: u8 = 0xE3; // Set Other Modes (high half)
 pub const G_SETOTHERMODE_L: u8 = 0xE2; // Set Other Modes (low half)
+pub const G_RDPSETOTHERMODE: u8 = 0xEF; // Set Both Other Mode halves at once
 
 // ─── RSP geometry commands (F3DEX2-specific opcodes) ───
 
@@ -193,6 +194,7 @@ pub fn process_display_list(renderer: &mut Renderer, rdram: &mut [u8], addr: u32
             G_SETCOMBINE => renderer.cmd_set_combine(w0, w1),
             G_SETOTHERMODE_H => renderer.cmd_set_other_mode_h(w0, w1),
             G_SETOTHERMODE_L => renderer.cmd_set_other_mode_l(w0, w1),
+            G_RDPSETOTHERMODE => renderer.cmd_rdp_set_other_mode(w0, w1),
             G_SETSCISSOR => renderer.cmd_set_scissor(w0, w1),
 
             // ─── Tile commands ───
@@ -549,6 +551,7 @@ pub fn opcode_name_f3dex2(cmd: u8) -> &'static str {
         0xEB => "G_SETKEYR",
         0xEC => "G_SETCONVERT",
         0xED => "G_SETSCISSOR",
+        0xEF => "G_RDPSETOTHERMODE",
         0xF0 => "G_LOADTLUT",
         0xF1 => "G_RDPHALF_2",
         0xF2 => "G_SETTILESIZE",

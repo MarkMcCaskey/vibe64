@@ -58,6 +58,7 @@ impl N64 {
         bus.pif.set_cic(cic);
         bus.pif.set_eeprom(eeprom_type);
         bus.ucode = ucode;
+        bus.renderer.ucode = ucode;
 
         // HLE boot: instead of running the IPL3 bootloader (which is
         // encrypted for CIC-6105), do what it would have done:

@@ -327,28 +327,85 @@ fn draw_stats_hud(buf: &mut [u8], debug: &DebugState, bus: &Interconnect) {
 
 /// F2: Wireframe overlay
 fn draw_wireframe(buf: &mut [u8], debug: &DebugState) {
+    let mut visible = 0u32;
+    let mut x_min = f32::MAX;
+    let mut x_max = f32::MIN;
+    let mut y_min = f32::MAX;
+    let mut y_max = f32::MIN;
+
     for edge in &debug.wire_edges {
+        let on_screen = edge.x0 >= 0.0 && edge.x0 < WIDTH as f32
+            && edge.y0 >= 0.0 && edge.y0 < HEIGHT as f32;
+        if on_screen { visible += 1; }
+        x_min = x_min.min(edge.x0).min(edge.x1);
+        x_max = x_max.max(edge.x0).max(edge.x1);
+        y_min = y_min.min(edge.y0).min(edge.y1);
+        y_max = y_max.max(edge.y0).max(edge.y1);
         draw_line(buf, edge.x0 as i32, edge.y0 as i32,
                   edge.x1 as i32, edge.y1 as i32, 0x00, 0xFF, 0x00);
+    }
+
+    // Show edge stats with coordinate ranges
+    let total = debug.wire_edges.len();
+    let lines = if total > 0 {
+        vec![
+            format!("Wire: {} edges ({} visible)", total, visible),
+            format!("X: {:.0}..{:.0}", x_min, x_max),
+            format!("Y: {:.0}..{:.0}", y_min, y_max),
+        ]
+    } else {
+        vec!["Wire: 0 edges".to_string()]
+    };
+    let max_w = lines.iter().map(|l| l.len() * FONT_CHAR_W + 8).max().unwrap_or(100);
+    draw_rect_bg(buf, WIDTH - max_w - 2, 2, max_w, lines.len() * 9 + 4);
+    for (i, line) in lines.iter().enumerate() {
+        draw_text(buf, WIDTH - max_w, 4 + i * 9, line, 0x00, 0xFF, 0x00);
     }
 }
 
 /// F3: Depth buffer visualization
 fn draw_depth_viz(buf: &mut [u8], bus: &Interconnect) {
     let z_addr = bus.renderer.z_image_addr as usize;
-    if z_addr == 0 { return; }
-
     let rdram = bus.rdram.data();
     let width = (bus.renderer.color_image_width as usize).min(WIDTH);
+
+    if z_addr == 0 || z_addr + width * HEIGHT * 2 >= rdram.len() {
+        draw_rect_bg(buf, 2, 2, 180, 14);
+        draw_text(buf, 4, 4, &format!("Z: addr={:#X} (invalid)", z_addr), 0xFF, 0x40, 0x40);
+        return;
+    }
+
+    // Sample Z stats while drawing
+    let mut z_min: u16 = 0xFFFF;
+    let mut z_max: u16 = 0;
+    let mut z_nonzero: u32 = 0;
+    let mut z_non_ffff: u32 = 0;
 
     for y in 0..HEIGHT {
         for x in 0..width {
             let offset = z_addr + (y * width + x) * 2;
             if offset + 1 >= rdram.len() { continue; }
             let z = u16::from_be_bytes([rdram[offset], rdram[offset + 1]]);
+            if z != 0 { z_nonzero += 1; }
+            if z != 0xFFFF { z_non_ffff += 1; }
+            if z < z_min { z_min = z; }
+            if z > z_max { z_max = z; }
+            // Map Z to grayscale: 0=white (near), 0xFFFF=black (far)
             let gray = (255u16).saturating_sub(z >> 7).min(255) as u8;
             set_pixel(buf, x, y, gray, gray, gray);
         }
+    }
+
+    // Overlay Z stats
+    let lines = [
+        format!("Z: {:#X} {}px", z_addr, width),
+        format!("min={:#06X} max={:#06X}", z_min, z_max),
+        format!("non0={} nonFF={}", z_nonzero, z_non_ffff),
+    ];
+    let max_w = lines.iter().map(|l| l.len() * FONT_CHAR_W + 8).max().unwrap_or(100);
+    draw_rect_bg(buf, 2, 2, max_w, lines.len() * 9 + 4);
+    for (i, line) in lines.iter().enumerate() {
+        draw_text(buf, 4, 4 + i * 9, line, 0xFF, 0xFF, 0x00);
     }
 }
 

@@ -180,6 +180,7 @@ fn save_screenshot(n64: &n64_core::N64) {
     }
     std::fs::write("screenshot.ppm", &ppm).ok();
     eprintln!("  Saved screenshot.ppm");
+
 }
 
 /// Read N64 framebuffer from RDRAM and convert to RGBA8888 for display.
@@ -448,11 +449,14 @@ fn main() {
             n64.bus.vi.v_current, n64.bus.vi.v_intr, n64.bus.vi.v_sync);
         eprintln!("  SI: {} DMAs  AI: {} DMAs (dacrate={})",
             n64.bus.si.dma_count, n64.bus.ai.dma_count, n64.bus.ai.dacrate);
-        eprintln!("  Renderer: {} fills, {} tex_rects, {} vtx, {} tris",
+        eprintln!("  Renderer: {} fills, {} tex_rects, {} vtx, {} tris, {} pixels, {} z_fail, {} culled",
             n64.bus.renderer.fill_rect_count,
             n64.bus.renderer.tex_rect_count,
             n64.bus.renderer.vtx_count,
-            n64.bus.renderer.tri_count);
+            n64.bus.renderer.tri_count,
+            n64.bus.renderer.pixel_count,
+            n64.bus.renderer.z_fail_count,
+            n64.bus.renderer.cull_count);
         let origin = n64.bus.vi.origin as usize;
         let rdram = n64.rdram_data();
         let fb_size = 320 * 240 * 2;
@@ -850,6 +854,7 @@ fn main() {
         }
 
         n64.cpu.dump_unimpl_summary();
+        save_screenshot(&n64);
         return;
     } else if use_test {
         // Test mode: run until r30 is set (5M cycles max)

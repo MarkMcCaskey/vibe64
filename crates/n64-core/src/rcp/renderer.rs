@@ -90,6 +90,9 @@ pub struct Renderer {
     pub combine_hi: u32,
     pub combine_lo: u32,
 
+    // ─── Microcode variant (affects command encoding) ───
+    pub ucode: crate::rcp::gbi::UcodeType,
+
     // ─── Segment table (RSP address resolution) ───
     pub segment_table: [u32; 16],
 
@@ -135,6 +138,9 @@ pub struct Renderer {
     pub tex_rect_skip: u32,
     pub tri_count: u32,
     pub vtx_count: u32,
+    pub pixel_count: u64,
+    pub z_fail_count: u64,
+    pub cull_count: u32,
 
     // ─── Debug overlay recording (mirrored from DebugFlags) ───
     pub debug_wireframe: bool,
@@ -170,6 +176,7 @@ impl Renderer {
             prim_min_level: 0,
             combine_hi: 0,
             combine_lo: 0,
+            ucode: crate::rcp::gbi::UcodeType::F3dex2,
             segment_table: [0; 16],
             fog_multiplier: 0,
             fog_offset: 0,
@@ -196,6 +203,9 @@ impl Renderer {
             tex_rect_skip: 0,
             tri_count: 0,
             vtx_count: 0,
+            pixel_count: 0,
+            z_fail_count: 0,
+            cull_count: 0,
             debug_wireframe: false,
             debug_dl_log: false,
             wire_edges: Vec::new(),
@@ -282,20 +292,41 @@ impl Renderer {
     /// G_SETOTHERMODE_H: Modify high half of other modes.
     /// w0: [E3][00][shift:8][len:8]  w1: [data:32]
     pub fn cmd_set_other_mode_h(&mut self, w0: u32, w1: u32) {
-        let shift = (w0 >> 8) & 0xFF;
-        let len = w0 & 0xFF;
-        let len = if len == 0 { 32 } else { len };
+        let (shift, len) = self.decode_othermode_shift_len(w0);
         let mask = ((1u64 << len) - 1) as u32;
         self.othermode_h = (self.othermode_h & !(mask << shift)) | (w1 & (mask << shift));
     }
 
     /// G_SETOTHERMODE_L: Modify low half of other modes.
     pub fn cmd_set_other_mode_l(&mut self, w0: u32, w1: u32) {
-        let shift = (w0 >> 8) & 0xFF;
-        let len = w0 & 0xFF;
-        let len = if len == 0 { 32 } else { len };
+        let (shift, len) = self.decode_othermode_shift_len(w0);
         let mask = ((1u64 << len) - 1) as u32;
         self.othermode_l = (self.othermode_l & !(mask << shift)) | (w1 & (mask << shift));
+    }
+
+    /// G_RDPSETOTHERMODE (0xEF): Set both othermode halves at once.
+    /// w0: [EF][othermode_H bits 23:0]  w1: [othermode_L full 32 bits]
+    pub fn cmd_rdp_set_other_mode(&mut self, w0: u32, w1: u32) {
+        self.othermode_h = w0 & 0x00FF_FFFF;
+        self.othermode_l = w1;
+    }
+
+    /// Decode shift/len from G_SETOTHERMODE command word.
+    /// F3D stores shift and len directly; F3DEX2 inverts them.
+    fn decode_othermode_shift_len(&self, w0: u32) -> (u32, u32) {
+        let sft_field = (w0 >> 8) & 0xFF;
+        let len_field = w0 & 0xFF;
+        match self.ucode {
+            crate::rcp::gbi::UcodeType::F3dex2 => {
+                let len = len_field + 1;
+                let shift = 32u32.saturating_sub(sft_field).saturating_sub(len);
+                (shift, len)
+            }
+            crate::rcp::gbi::UcodeType::F3d => {
+                let len = if len_field == 0 { 32 } else { len_field };
+                (sft_field, len)
+            }
+        }
     }
 
     /// G_SETSCISSOR: Set clipping rectangle.
@@ -594,13 +625,15 @@ impl Renderer {
             let c11 = self.sample_texel_point(tile_idx, s1, t1);
 
             // Bilinear blend using 5-bit fractions (0-31 range)
+            // Use u32 to avoid overflow: top/bot can reach 255*32=8160,
+            // and top*inv_t can reach 8160*32=261120 which exceeds u16.
             let inv_s = 32 - frac_s;
             let inv_t = 32 - frac_t;
             let mut result = [0u8; 4];
             for i in 0..4 {
-                let top = c00[i] as u16 * inv_s + c10[i] as u16 * frac_s;
-                let bot = c01[i] as u16 * inv_s + c11[i] as u16 * frac_s;
-                result[i] = ((top * inv_t + bot * frac_t + 512) >> 10) as u8;
+                let top = c00[i] as u32 * inv_s as u32 + c10[i] as u32 * frac_s as u32;
+                let bot = c01[i] as u32 * inv_s as u32 + c11[i] as u32 * frac_s as u32;
+                result[i] = ((top * inv_t as u32 + bot * frac_t as u32 + 512) >> 10) as u8;
             }
             result
         } else {
@@ -768,11 +801,13 @@ impl Renderer {
             let b1_a   = ((self.combine_lo >> 3) & 0x7) as u8;
             let d1_a   = (self.combine_lo & 0x7) as u8;
 
-            return self.cc_evaluate(
+            let cycle1_result = self.cc_evaluate(
                 a1_rgb, b1_rgb, c1_rgb, d1_rgb,
                 a1_a, b1_a, c1_a, d1_a,
                 &result, &texel0, &shade,
             );
+
+            return cycle1_result;
         }
 
         result
@@ -984,7 +1019,7 @@ impl Renderer {
                 let inv_w = 1.0 / cw;
                 self.vertex_buffer[idx] = Vertex {
                     x: cx * inv_w * self.viewport_scale[0] + self.viewport_trans[0],
-                    y: cy * inv_w * self.viewport_scale[1] + self.viewport_trans[1],
+                    y: -cy * inv_w * self.viewport_scale[1] + self.viewport_trans[1],
                     z: (cz * inv_w * self.viewport_scale[2] + self.viewport_trans[2])
                         .clamp(0.0, 0xFFFF as f32),
                     w: inv_w,
@@ -1066,13 +1101,15 @@ impl Renderer {
             if load {
                 self.projection = mat;
             } else {
-                self.projection = mat4_mul(&self.projection, &mat);
+                // RSP microcode prepends: stack = new * old
+                self.projection = mat4_mul(&mat, &self.projection);
             }
         } else {
             if push {
                 self.matrix_stack.push(self.modelview);
             }
-            self.modelview = if load { mat } else { mat4_mul(&self.modelview, &mat) };
+            // RSP microcode prepends: stack = new * old
+            self.modelview = if load { mat } else { mat4_mul(&mat, &self.modelview) };
         }
 
         // N64 uses v * MVP, so MVP = MV * P
@@ -1112,11 +1149,6 @@ impl Renderer {
             self.viewport_scale[i] = read_i16(rdram, addr + i * 2) as f32 / 4.0;
             self.viewport_trans[i] = read_i16(rdram, addr + 8 + i * 2) as f32 / 4.0;
         }
-        log::trace!(
-            "Viewport: scale=({:.1},{:.1},{:.1}) trans=({:.1},{:.1},{:.1})",
-            self.viewport_scale[0], self.viewport_scale[1], self.viewport_scale[2],
-            self.viewport_trans[0], self.viewport_trans[1], self.viewport_trans[2],
-        );
     }
 
     /// G_MOVEMEM/G_MV_LIGHT: Load light parameters from RDRAM.
@@ -1359,12 +1391,12 @@ impl Renderer {
 
         // Face culling: check geometry_mode flags
         // G_CULL_FRONT = 0x0200, G_CULL_BACK = 0x0400
-        // In Y-down screen space, the edge function sign is inverted:
-        //   positive area = CW = back face, negative = CCW = front face
+        // The viewport transform negates clip_y, which reverses winding:
+        //   positive area = CCW = front face, negative = CW = back face
         let cull_front = self.geometry_mode & 0x0200 != 0;
         let cull_back = self.geometry_mode & 0x0400 != 0;
-        if cull_back && area > 0.0 { return; }
-        if cull_front && area < 0.0 { return; }
+        if cull_back && area < 0.0 { self.cull_count += 1; return; }
+        if cull_front && area > 0.0 { self.cull_count += 1; return; }
 
         let inv_area = 1.0 / area;
 
@@ -1401,6 +1433,7 @@ impl Renderer {
                         let old_z = u16::from_be_bytes([rdram[z_offset], rdram[z_offset + 1]]);
                         // Z compare: lower Z = closer to camera
                         if z_cmp && z > old_z {
+                            self.z_fail_count += 1;
                             continue; // Fail depth test — farther than existing pixel
                         }
                         if z_upd {
@@ -1443,6 +1476,8 @@ impl Renderer {
                 };
                 let shade = [r, g, b, a];
                 let color = self.combine_pixel(texel0, shade);
+
+                self.pixel_count += 1;
 
                 self.write_pixel(rdram, x, y, color);
             }
@@ -1574,7 +1609,7 @@ fn clip_lerp(a: &Vertex, b: &Vertex, near_w: f32, vp_scale: &[f32; 3], vp_trans:
     let inv_w = 1.0 / cw;
     Vertex {
         x: cx * inv_w * vp_scale[0] + vp_trans[0],
-        y: cy * inv_w * vp_scale[1] + vp_trans[1],
+        y: -cy * inv_w * vp_scale[1] + vp_trans[1],
         z: (cz * inv_w * vp_scale[2] + vp_trans[2]).clamp(0.0, 0xFFFF as f32),
         w: inv_w,
         clip_x: cx, clip_y: cy, clip_z: cz, clip_w: cw,
