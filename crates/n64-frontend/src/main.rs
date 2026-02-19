@@ -180,8 +180,6 @@ fn save_screenshot(n64: &n64_core::N64) {
     }
     std::fs::write("screenshot.ppm", &ppm).ok();
     eprintln!("  Saved screenshot.ppm");
-
-
 }
 
 /// Read N64 framebuffer from RDRAM and convert to RGBA8888 for display.
@@ -858,8 +856,9 @@ fn main() {
         save_screenshot(&n64);
         return;
     } else if use_test {
-        // Test mode: run until r30 is set (5M cycles max)
-        let result = n64.run_until_r30(5_000_000);
+        // Test mode: run until r30 is set (50M cycles max)
+        // Higher budget needed for realistic PI DMA timing (~19 cycles/byte)
+        let result = n64.run_until_r30(50_000_000);
         n64.cpu.dump_unimpl_summary();
         if result == 0 {
             eprintln!("TIMEOUT: r30 never set (tests didn't finish)");

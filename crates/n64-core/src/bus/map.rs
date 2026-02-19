@@ -74,11 +74,11 @@ impl Interconnect {
             self.pi.dma_count + 1, cart_addr, dram_addr, len
         );
 
-        // Delay the completion interrupt. Real PI DMA runs at ~5MB/s
-        // (~19 cycles per byte). We use a minimum of 100 cycles
-        // so the OS DMA handler has time to update its queue state
-        // before the interrupt fires.
-        let delay = (len as u64 / 2).max(100);
+        // Delay the completion interrupt to match real PI DMA speed (~5MB/s).
+        // Real hardware: ~19 CPU cycles per byte (93.75MHz / 5MB/s).
+        // Realistic timing ensures the N64 OS thread scheduler has time to
+        // properly dispatch threads that are waiting for DMA completion.
+        let delay = (len as u64 * 19).max(200);
         self.pi.dma_busy_cycles = delay;
 
         self.notify_dma_write(dram_addr, len);

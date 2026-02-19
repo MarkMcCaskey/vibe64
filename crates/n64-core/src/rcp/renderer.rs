@@ -104,6 +104,7 @@ pub struct Renderer {
     pub num_dir_lights: u8,
     pub light_colors: [[u8; 3]; 8],   // 0..num_dir_lights = directional, num_dir_lights = ambient
     pub light_dirs: [[i8; 3]; 8],
+    pub lookat: [[f32; 3]; 2],        // lookat_x [0] and lookat_y [1] for texgen
 
     // ─── Texture memory (4 KB, mirroring real TMEM) ───
     pub tmem: [u8; 4096],
@@ -183,6 +184,7 @@ impl Renderer {
             num_dir_lights: 0,
             light_colors: [[0; 3]; 8],
             light_dirs: [[0; 3]; 8],
+            lookat: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
             tmem: [0; 4096],
             tiles: [TileDescriptor::default(); 8],
             vertex_buffer: [Vertex::default(); 32],
@@ -403,6 +405,7 @@ impl Renderer {
                 self.tmem[tmem_offset + i] = rdram[src_idx];
             }
         }
+
     }
 
     /// G_LOADTILE: Copy a rectangular region of texture data from RDRAM to TMEM.
@@ -444,6 +447,7 @@ impl Renderer {
                 }
             }
         }
+
     }
 
     /// G_LOADTLUT: Load texture lookup table (palette) into TMEM.
@@ -654,8 +658,16 @@ impl Renderer {
                     let byte = self.tmem[byte_offset];
                     let nibble = if si & 1 == 0 { byte >> 4 } else { byte & 0x0F };
                     if tile.format == 2 {
+                        // CI4: palette lookup
                         self.lookup_tlut(tile.palette as usize * 16 + nibble as usize)
+                    } else if tile.format == 3 {
+                        // IA4: I[3:1] (3-bit intensity), A[0] (1-bit alpha)
+                        let i3 = (nibble >> 1) & 0x7;
+                        let i = (i3 << 5) | (i3 << 2) | (i3 >> 1); // expand 3-bit to 8-bit
+                        let a = if nibble & 1 != 0 { 0xFF } else { 0x00 };
+                        [i, i, i, a]
                     } else {
+                        // I4: expand 4-bit to 8-bit
                         let i = nibble | (nibble << 4);
                         [i, i, i, 0xFF]
                     }
@@ -671,8 +683,10 @@ impl Renderer {
                     match tile.format {
                         2 => self.lookup_tlut(val as usize), // CI8
                         3 => { // IA8: I[7:4], A[3:0]
-                            let i = val & 0xF0;
-                            let a = (val & 0x0F) << 4;
+                            let hi = (val >> 4) & 0xF;
+                            let i = (hi << 4) | hi; // expand 4-bit to 8-bit: 0xF → 0xFF
+                            let lo = val & 0xF;
+                            let a = (lo << 4) | lo;
                             [i, i, i, a]
                         }
                         4 | _ => [val, val, val, 0xFF], // I8
@@ -950,7 +964,7 @@ impl Renderer {
             let a = rdram[(off + 15) & (rdram.len() - 1)];
 
             // When G_LIGHTING is on, bytes 12-14 are normals; compute shade color
-            let (r, g, b) = if self.geometry_mode & 0x20000 != 0 {
+            let (r, g, b, s, t) = if self.geometry_mode & 0x20000 != 0 {
                 let nx = rdram[(off + 12) & (rdram.len() - 1)] as i8 as f32;
                 let ny = rdram[(off + 13) & (rdram.len() - 1)] as i8 as f32;
                 let nz = rdram[(off + 14) & (rdram.len() - 1)] as i8 as f32;
@@ -984,13 +998,34 @@ impl Renderer {
                     ga += self.light_colors[li][1] as f32 * dot;
                     ba += self.light_colors[li][2] as f32 * dot;
                 }
-                (ra.clamp(0.0, 255.0) as u8, ga.clamp(0.0, 255.0) as u8, ba.clamp(0.0, 255.0) as u8)
+
+                // G_TEXTURE_GEN: generate S/T from eye-space normal projected
+                // onto lookat vectors (set by gSPLookAt). The dot product gives
+                // how much the normal aligns with each viewing axis.
+                let s = if self.geometry_mode & 0x40000 != 0 {
+                    let dot_x = wnx * self.lookat[0][0] + wny * self.lookat[0][1] + wnz * self.lookat[0][2];
+                    if self.geometry_mode & 0x80000 != 0 {
+                        (-dot_x).clamp(-1.0, 1.0).acos() / std::f32::consts::PI * 32768.0
+                    } else {
+                        dot_x * 16384.0 + 16384.0
+                    }
+                } else { s };
+                let t = if self.geometry_mode & 0x40000 != 0 {
+                    let dot_y = wnx * self.lookat[1][0] + wny * self.lookat[1][1] + wnz * self.lookat[1][2];
+                    if self.geometry_mode & 0x80000 != 0 {
+                        (-dot_y).clamp(-1.0, 1.0).acos() / std::f32::consts::PI * 32768.0
+                    } else {
+                        dot_y * 16384.0 + 16384.0
+                    }
+                } else { t };
+
+                (ra.clamp(0.0, 255.0) as u8, ga.clamp(0.0, 255.0) as u8, ba.clamp(0.0, 255.0) as u8, s, t)
             } else {
                 // No lighting — read raw vertex colors
                 let r = rdram[(off + 12) & (rdram.len() - 1)];
                 let g = rdram[(off + 13) & (rdram.len() - 1)];
                 let b = rdram[(off + 14) & (rdram.len() - 1)];
-                (r, g, b)
+                (r, g, b, s, t)
             };
 
             // Transform vertex by MVP matrix → clip space
@@ -1010,11 +1045,12 @@ impl Renderer {
             // Perspective divide + viewport transform → screen space
             if cw.abs() > 0.0001 {
                 let inv_w = 1.0 / cw;
+                let z = (cz * inv_w * self.viewport_scale[2] + self.viewport_trans[2])
+                    .clamp(0.0, 0xFFFF as f32);
                 self.vertex_buffer[idx] = Vertex {
                     x: cx * inv_w * self.viewport_scale[0] + self.viewport_trans[0],
                     y: -cy * inv_w * self.viewport_scale[1] + self.viewport_trans[1],
-                    z: (cz * inv_w * self.viewport_scale[2] + self.viewport_trans[2])
-                        .clamp(0.0, 0xFFFF as f32),
+                    z,
                     w: inv_w,
                     clip_x: cx, clip_y: cy, clip_z: cz, clip_w: cw,
                     s, t, r, g, b, a,
@@ -1036,15 +1072,6 @@ impl Renderer {
         let v1 = ((w0 >> 8) & 0xFF) as usize / 2;
         let v2 = (w0 & 0xFF) as usize / 2;
         if v0 < 32 && v1 < 32 && v2 < 32 {
-            if self.tri_count < 5 || (self.tri_count >= 1000 && self.tri_count < 1005)
-                || (self.tri_count >= 10000 && self.tri_count < 10005)
-                || (self.tri_count >= 50000 && self.tri_count < 50005) {
-                let a = self.vertex_buffer[v0];
-                let b = self.vertex_buffer[v1];
-                let c = self.vertex_buffer[v2];
-                log::debug!("TRI #{}: ({:.1},{:.1}) ({:.1},{:.1}) ({:.1},{:.1}) w={:.4},{:.4},{:.4}",
-                    self.tri_count, a.x, a.y, b.x, b.y, c.x, c.y, a.w, b.w, c.w);
-            }
             self.rasterize_triangle(v0, v1, v2, rdram);
             self.tri_count += 1;
         }
@@ -1059,14 +1086,6 @@ impl Renderer {
         let v4 = ((w1 >> 8) & 0xFF) as usize / 2;
         let v5 = (w1 & 0xFF) as usize / 2;
         if v0 < 32 && v1 < 32 && v2 < 32 {
-            if self.tri_count < 5 || (self.tri_count >= 1000 && self.tri_count < 1005)
-                || (self.tri_count >= 50000 && self.tri_count < 50005) {
-                let a = self.vertex_buffer[v0];
-                let b = self.vertex_buffer[v1];
-                let c = self.vertex_buffer[v2];
-                log::debug!("TRI #{}: ({:.1},{:.1}) ({:.1},{:.1}) ({:.1},{:.1})",
-                    self.tri_count, a.x, a.y, b.x, b.y, c.x, c.y);
-            }
             self.rasterize_triangle(v0, v1, v2, rdram);
             self.tri_count += 1;
         }
@@ -1148,12 +1167,21 @@ impl Renderer {
     /// Light data is 16 bytes: col[3], pad, colc[3], pad, dir[3], pad, pad*4.
     pub fn cmd_set_light(&mut self, dmem_offset: usize, addr: u32, rdram: &[u8]) {
         let slot = dmem_offset / 24;
-        if slot < 2 || slot > 9 { return; }
-        let idx = slot - 2;
-        if idx >= 8 { return; }
+        if slot > 9 { return; }
 
         let a = self.resolve_segment(addr) as usize;
-        if a + 11 < rdram.len() {
+        if a + 11 >= rdram.len() { return; }
+
+        if slot < 2 {
+            // Lookat vectors: slot 0 = lookat_x, slot 1 = lookat_y
+            // Direction is at bytes 8-10 as signed i8 (normalized to ~127)
+            let dx = rdram[a + 8] as i8 as f32 / 127.0;
+            let dy = rdram[a + 9] as i8 as f32 / 127.0;
+            let dz = rdram[a + 10] as i8 as f32 / 127.0;
+            self.lookat[slot] = [dx, dy, dz];
+        } else {
+            let idx = slot - 2;
+            if idx >= 8 { return; }
             self.light_colors[idx] = [rdram[a], rdram[a + 1], rdram[a + 2]];
             self.light_dirs[idx] = [
                 rdram[a + 8] as i8,
@@ -1300,6 +1328,7 @@ impl Renderer {
     }
 
     /// Clip a triangle against the near plane and rasterize resulting triangles.
+    /// Also performs frustum trivial rejection and guard band clipping.
     pub fn rasterize_triangle(&mut self, i0: usize, i1: usize, i2: usize, rdram: &mut [u8]) {
         let verts = [
             self.vertex_buffer[i0],
@@ -1319,8 +1348,8 @@ impl Renderer {
 
         match inside_count {
             3 => {
-                // All in front — rasterize directly (screen coords already valid)
-                self.rasterize_screen_triangle(verts[0], verts[1], verts[2], rdram);
+                // All in front — check guard band before rasterizing
+                self.rasterize_with_guard_band(verts[0], verts[1], verts[2], rdram);
             }
             0 => {
                 // All behind camera — cull entirely
@@ -1352,13 +1381,54 @@ impl Renderer {
                 }
 
                 if count >= 3 {
-                    self.rasterize_screen_triangle(output[0], output[1], output[2], rdram);
+                    self.rasterize_with_guard_band(output[0], output[1], output[2], rdram);
                 }
                 if count >= 4 {
-                    self.rasterize_screen_triangle(output[0], output[2], output[3], rdram);
+                    self.rasterize_with_guard_band(output[0], output[2], output[3], rdram);
                 }
             }
         }
+    }
+
+    /// Check guard band and either rasterize directly or reject.
+    /// The N64 RSP uses a guard band of ~2x screen size. Vertices outside
+    /// this range can cause edge-function precision issues and slow rendering.
+    fn rasterize_with_guard_band(&mut self, v0: Vertex, v1: Vertex, v2: Vertex, rdram: &mut [u8]) {
+        // Guard band: 2x screen size in each direction
+        let gb_min_x = -640.0f32;
+        let gb_min_y = -480.0f32;
+        let gb_max_x = 960.0f32;
+        let gb_max_y = 720.0f32;
+
+        // Trivial rejection: if all 3 vertices are outside the same edge, skip
+        if (v0.x < gb_min_x && v1.x < gb_min_x && v2.x < gb_min_x) ||
+           (v0.x > gb_max_x && v1.x > gb_max_x && v2.x > gb_max_x) ||
+           (v0.y < gb_min_y && v1.y < gb_min_y && v2.y < gb_min_y) ||
+           (v0.y > gb_max_y && v1.y > gb_max_y && v2.y > gb_max_y)
+        {
+            return;
+        }
+
+        // If any vertex is outside the guard band, check if the triangle
+        // could still contribute pixels. If vertices are wildly off-screen,
+        // skip to avoid precision issues in the edge function.
+        let any_outside = v0.x < gb_min_x || v0.x > gb_max_x ||
+                          v0.y < gb_min_y || v0.y > gb_max_y ||
+                          v1.x < gb_min_x || v1.x > gb_max_x ||
+                          v1.y < gb_min_y || v1.y > gb_max_y ||
+                          v2.x < gb_min_x || v2.x > gb_max_x ||
+                          v2.y < gb_min_y || v2.y > gb_max_y;
+
+        if any_outside {
+            // Check for NaN/Inf which would break the rasterizer
+            if !v0.x.is_finite() || !v0.y.is_finite() ||
+               !v1.x.is_finite() || !v1.y.is_finite() ||
+               !v2.x.is_finite() || !v2.y.is_finite() {
+                return;
+            }
+        }
+
+        self.rasterize_screen_triangle(v0, v1, v2, rdram);
     }
 
     /// Rasterize a triangle using edge-function (half-space) method.
@@ -1394,10 +1464,15 @@ impl Renderer {
         // Our viewport transform negates clip_y, which reverses winding:
         //   front face (CCW in clip space) → negative area in screen space
         //   back face (CW in clip space) → positive area in screen space
+        // When BOTH flags are set, skip culling entirely (N64 convention:
+        // both-set = no culling, used by sky domes and similar geometry).
         let cull_front = self.geometry_mode & 0x0200 != 0;
         let cull_back = self.geometry_mode & 0x0400 != 0;
-        if cull_back && area > 0.0 { self.cull_count += 1; return; }
-        if cull_front && area < 0.0 { self.cull_count += 1; return; }
+        if cull_front != cull_back {
+            // Only one cull mode active — apply it
+            if cull_back && area > 0.0 { self.cull_count += 1; return; }
+            if cull_front && area < 0.0 { self.cull_count += 1; return; }
+        }
 
         let inv_area = 1.0 / area;
 
@@ -1407,8 +1482,6 @@ impl Renderer {
         let tile_idx = self.texture_tile as usize;
 
         // Z-buffer state from RDP othermode_l
-        // Note: G_ZBUFFER in geometry_mode controls RSP Z computation, but since
-        // we always compute vertex Z in HLE, we gate on the RDP flags only.
         let z_cmp = self.othermode_l & 0x10 != 0;
         let z_upd = self.othermode_l & 0x20 != 0;
         let z_enabled = (z_cmp || z_upd) && self.z_image_addr != 0;

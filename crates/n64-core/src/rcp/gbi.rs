@@ -299,16 +299,6 @@ pub fn process_display_list(renderer: &mut Renderer, rdram: &mut [u8], addr: u32
         }
     }
 
-    log::debug!("Display list processed: {} commands", cmd_count);
-
-    // Log opcode distribution for debugging
-    let mut summary = String::new();
-    for (op, &count) in opcode_counts.iter().enumerate() {
-        if count > 0 {
-            summary.push_str(&format!(" {:02X}:{}", op, count));
-        }
-    }
-    log::debug!("  Opcodes:{}", summary);
 }
 
 /// Walk a display list using F3D (original) opcode table.
