@@ -472,11 +472,12 @@ pub fn process_display_list_f3d(renderer: &mut Renderer, rdram: &mut [u8], addr:
                 let mtype = (w0 >> 16) & 0xFF;
                 match mtype {
                     0x80 => renderer.cmd_set_viewport(w1, rdram), // G_MV_VIEWPORT
-                    // Lights: 0x86=lookaty, 0x88=lookatx, 0x90+=lights
-                    0x90..=0xC8 => {
-                        // Light index: (mtype - 0x90) / 0x18 gives light 0..7
-                        let offset = (mtype as usize - 0x80) * 3; // approximate DMEM offset
-                        renderer.cmd_set_light(offset, w1, rdram);
+                    // F3D light indices: 0x82=lookaty, 0x84=lookatx,
+                    // 0x86=light0, 0x88=light1, ... 0x94=light7
+                    // Map to cmd_set_light slot: (mtype-0x82)/2, offset=slot*24
+                    0x82..=0x94 => {
+                        let slot = ((mtype as usize) - 0x82) / 2;
+                        renderer.cmd_set_light(slot * 24, w1, rdram);
                     }
                     _ => {}
                 }
