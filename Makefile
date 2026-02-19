@@ -6,7 +6,7 @@ BINARY = target/release/n64-frontend
 
 # ROMs
 OOT_ROM = test_roms/zelda-oot.z64
-SM64_ROM = test_roms/sm64.z64
+SM64_ROM = test_roms/super-mario-64.z64
 MM_ROM = test_roms/zelda-mm.z64
 TEST_ROMS = test_roms/n64-tests/roms-simpleboot/*.z64
 

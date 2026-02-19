@@ -49,6 +49,10 @@ pub struct Vr4300 {
     /// Checked by step() after execute() to take TLB exception.
     pub tlb_miss: Option<(u64, ExceptionCode)>,
 
+    /// Set by execute() when an undefined opcode is encountered.
+    /// step() checks this to take a Reserved Instruction exception.
+    pub reserved_instr: bool,
+
     /// Track unimplemented opcode hits: key = "CATEGORY:0xNN", value = hit count.
     /// Logs each unique opcode once on first encounter.
     pub unimpl_opcodes: HashMap<String, u64>,
@@ -72,6 +76,7 @@ impl Vr4300 {
             in_delay_slot: false,
             ll_bit: false,
             tlb_miss: None,
+            reserved_instr: false,
             unimpl_opcodes: HashMap::new(),
             fpu_trace: false,
         };
@@ -96,13 +101,16 @@ impl Vr4300 {
         self.gpr[29] = 0xA400_1FF0; // sp: top of DMEM
     }
 
-    /// Record an unimplemented opcode. Logs once per unique key, then silently counts.
+    /// Record an unimplemented opcode and trigger Reserved Instruction exception.
+    /// On real hardware, undefined opcodes cause this exception. The N64 OS
+    /// exception handler decides how to handle it (usually fatal).
     pub fn unimpl(&mut self, key: String, pc: u64, raw: u32) {
         let count = self.unimpl_opcodes.entry(key.clone()).or_insert(0);
         if *count == 0 {
             log::error!("UNIMPLEMENTED {} at PC={:#018X} (raw={:#010X})", key, pc, raw);
         }
         *count += 1;
+        self.reserved_instr = true;
     }
 
     /// Dump summary of all unimplemented opcodes encountered.
@@ -169,6 +177,33 @@ impl Vr4300 {
             if was_delay_slot {
                 self.cop0.regs[Cop0::CAUSE] |= 1u64 << 31; // BD bit
             }
+            self.gpr[0] = 0;
+            self.cop0.increment_count();
+            self.cop0.decrement_random();
+            self.cop0.check_timer_interrupt();
+            return 1;
+        }
+
+        // 5b. Check for Reserved Instruction exception (undefined opcode)
+        if self.reserved_instr {
+            self.reserved_instr = false;
+            let epc = if was_delay_slot {
+                current_pc.wrapping_sub(4)
+            } else {
+                current_pc
+            };
+            self.cop0.regs[Cop0::EPC] = epc;
+            let cause = self.cop0.regs[Cop0::CAUSE] as u32;
+            let cause = (cause & !0x7C) | ((ExceptionCode::ReservedInstruction as u32) << 2);
+            self.cop0.regs[Cop0::CAUSE] = cause as i32 as i64 as u64;
+            if was_delay_slot {
+                self.cop0.regs[Cop0::CAUSE] |= 1u64 << 31;
+            }
+            self.cop0.regs[Cop0::STATUS] |= 0x02; // Set EXL
+            let bev = (self.cop0.regs[Cop0::STATUS] >> 22) & 1;
+            let vector = if bev != 0 { 0xFFFF_FFFF_BFC0_0200u64 } else { 0xFFFF_FFFF_8000_0180u64 };
+            self.pc = vector;
+            self.next_pc = vector.wrapping_add(4);
             self.gpr[0] = 0;
             self.cop0.increment_count();
             self.cop0.decrement_random();

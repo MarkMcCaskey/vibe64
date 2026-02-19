@@ -123,7 +123,8 @@ pub const TASK_YIELD_DATA_SIZE: u32 = 0xFFC;
 const MAX_DL_STACK: usize = 18;
 
 /// Maximum commands to process per display list (safety limit).
-const MAX_COMMANDS: usize = 100_000;
+/// OoT draws 3D world geometry before overlay/text, requiring >100K commands.
+const MAX_COMMANDS: usize = 1_000_000;
 
 use super::renderer::Renderer;
 

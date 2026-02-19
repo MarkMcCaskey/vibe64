@@ -219,6 +219,8 @@ impl Interconnect {
 
     /// SI DMA Read: PIF RAM → RDRAM (game reads controller state).
     /// Processes PIF commands first, then copies 64 bytes.
+    /// Data is copied immediately; the completion interrupt is delayed to
+    /// match real PIF bus speed (~1 MHz → ~6000 CPU cycles for 64 bytes).
     fn si_dma_read(&mut self) {
         self.pif.process_commands();
         let dram_addr = self.si.dram_addr & 0x00FF_FFFF;
@@ -226,8 +228,9 @@ impl Interconnect {
             let byte = self.pif.ram[i as usize];
             self.rdram.write_u8(dram_addr + i, byte);
         }
-        self.mi.set_interrupt(crate::rcp::mi::MiInterrupt::SI);
-        self.si.status |= 1 << 12; // Interrupt pending
+        // Delay interrupt: ~64 microseconds at 93.75 MHz ≈ 6000 cycles.
+        // This prevents SI event queue overflow when rapid DMAs occur.
+        self.si.dma_busy_cycles = 6000;
         self.si.dma_count += 1;
     }
 
@@ -239,9 +242,16 @@ impl Interconnect {
             self.pif.ram[i as usize] = self.rdram.read_u8(dram_addr + i);
         }
         self.pif.process_commands();
-        self.mi.set_interrupt(crate::rcp::mi::MiInterrupt::SI);
-        self.si.status |= 1 << 12; // Interrupt pending
+        self.si.dma_busy_cycles = 6000;
         self.si.dma_count += 1;
+    }
+
+    /// Tick SI DMA timer. Raises SI interrupt when DMA completes.
+    pub fn tick_si_dma(&mut self) {
+        if self.si.tick_dma() {
+            self.mi.set_interrupt(crate::rcp::mi::MiInterrupt::SI);
+            self.si.status |= 1 << 12; // Interrupt pending
+        }
     }
 
     /// ISViewer read: return buffer contents or zero.

@@ -151,6 +151,7 @@ impl N64 {
         self.cycles += elapsed;
         self.bus.vi.tick(elapsed, &mut self.bus.mi);
         self.bus.tick_pi_dma();
+        self.bus.tick_si_dma();
         self.bus.tick_ai_dma(elapsed);
         elapsed
     }
@@ -171,6 +172,7 @@ impl N64 {
 
             self.bus.vi.tick(elapsed, &mut self.bus.mi);
             self.bus.tick_pi_dma();
+            self.bus.tick_si_dma();
             self.bus.tick_ai_dma(elapsed);
         }
 
@@ -211,6 +213,7 @@ impl N64 {
             self.cycles += elapsed;
             self.bus.vi.tick(elapsed, &mut self.bus.mi);
             self.bus.tick_pi_dma();
+        self.bus.tick_si_dma();
         self.bus.tick_ai_dma(elapsed);
 
             if !tracing && self.bus.pi.dma_count >= trigger_dma {
@@ -235,6 +238,7 @@ impl N64 {
             self.cycles += elapsed;
             self.bus.vi.tick(elapsed, &mut self.bus.mi);
             self.bus.tick_pi_dma();
+        self.bus.tick_si_dma();
         self.bus.tick_ai_dma(elapsed);
         }
         None
@@ -249,6 +253,7 @@ impl N64 {
             self.cycles += elapsed;
             self.bus.vi.tick(elapsed, &mut self.bus.mi);
             self.bus.tick_pi_dma();
+        self.bus.tick_si_dma();
         self.bus.tick_ai_dma(elapsed);
 
             if self.cpu.gpr[30] != 0 {
