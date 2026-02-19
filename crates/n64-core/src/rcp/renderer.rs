@@ -549,24 +549,22 @@ impl Renderer {
         let dsdx = (extra1 >> 16) as i16 as i32; // S5.10 fixed-point
         let dtdy = (extra1 & 0xFFFF) as i16 as i32;
 
-        // Convert 10.2 to pixels
+        // Convert 10.2 to pixels (lr coords are inclusive, +1 for half-open range)
         let x0 = (ulx >> 2).max(self.scissor_ulx as i32 >> 2);
         let y0 = (uly >> 2).max(self.scissor_uly as i32 >> 2);
-        let x1 = (lrx >> 2).min(self.scissor_lrx as i32 >> 2);
-        let y1 = (lry >> 2).min(self.scissor_lry as i32 >> 2);
+        let x1 = ((lrx >> 2) + 1).min(self.scissor_lrx as i32 >> 2);
+        let y1 = ((lry >> 2) + 1).min(self.scissor_lry as i32 >> 2);
 
         if x0 >= x1 || y0 >= y1 || self.color_image_addr == 0 {
             self.tex_rect_skip += 1;
             return;
         }
 
-        let tile = &self.tiles[tile_idx];
-        let addr = self.color_image_addr as usize;
-        let width = self.color_image_width as i32;
-
         let cycle = self.cycle_type();
 
-
+        // In copy mode (cycle=2), the RDP processes 4 texels per clock.
+        // Games set dsdx=4.0 to account for this, but per-pixel advance is 1.0.
+        let dsdx = if cycle == 2 { dsdx / 4 } else { dsdx };
 
         // Convert S/T from S10.5 to S10.10 to match dsdx/dtdy (S5.10)
         let s10 = s << 5;
@@ -1254,6 +1252,13 @@ impl Renderer {
 
     /// Write a pixel to the framebuffer with alpha compare and blending.
     fn write_pixel(&self, rdram: &mut [u8], x: i32, y: i32, color: [u8; 4]) {
+        // CVG_X_ALPHA (bit 12): coverage × alpha — if alpha is 0, pixel is fully transparent
+        // This is how the N64 handles texture cutout (e.g., tree leaves, fences)
+        let cvg_x_alpha = self.othermode_l & (1 << 12) != 0;
+        if cvg_x_alpha && color[3] == 0 {
+            return;
+        }
+
         // Alpha compare: othermode_l bits 0-1
         // 0 = none, 1 = threshold compare, 2/3 = dither
         let alpha_compare = self.othermode_l & 0x3;
@@ -1386,25 +1391,27 @@ impl Renderer {
 
         // Face culling: check geometry_mode flags
         // G_CULL_FRONT = 0x0200, G_CULL_BACK = 0x0400
-        // The viewport transform negates clip_y, which reverses winding:
-        //   positive area = CCW = front face, negative = CW = back face
+        // Our viewport transform negates clip_y, which reverses winding:
+        //   front face (CCW in clip space) → negative area in screen space
+        //   back face (CW in clip space) → positive area in screen space
         let cull_front = self.geometry_mode & 0x0200 != 0;
         let cull_back = self.geometry_mode & 0x0400 != 0;
-        if cull_back && area < 0.0 { self.cull_count += 1; return; }
-        if cull_front && area > 0.0 { self.cull_count += 1; return; }
+        if cull_back && area > 0.0 { self.cull_count += 1; return; }
+        if cull_front && area < 0.0 { self.cull_count += 1; return; }
 
         let inv_area = 1.0 / area;
 
-        let addr = self.color_image_addr as usize;
         let width = self.color_image_width as i32;
         let cycle = self.cycle_type();
         let textured = self.texture_on;
         let tile_idx = self.texture_tile as usize;
 
-        // Z-buffer state from othermode_l
+        // Z-buffer state from RDP othermode_l
+        // Note: G_ZBUFFER in geometry_mode controls RSP Z computation, but since
+        // we always compute vertex Z in HLE, we gate on the RDP flags only.
         let z_cmp = self.othermode_l & 0x10 != 0;
         let z_upd = self.othermode_l & 0x20 != 0;
-        let z_enabled = self.geometry_mode & 0x1 != 0 && self.z_image_addr != 0;
+        let z_enabled = (z_cmp || z_upd) && self.z_image_addr != 0;
         let z_addr = self.z_image_addr as usize;
 
         for y in min_y..max_y {
@@ -1422,7 +1429,7 @@ impl Renderer {
 
                 // Z-buffer depth test
                 if z_enabled {
-                    let z = (w0 * v0.z + w1 * v1.z + w2 * v2.z).clamp(0.0, 0x7FFF as f32) as u16;
+                    let z = (w0 * v0.z + w1 * v1.z + w2 * v2.z).clamp(0.0, 0xFFFF as f32) as u16;
                     let z_offset = z_addr + ((y * width + x) as usize) * 2;
                     if z_offset + 1 < rdram.len() {
                         let old_z = u16::from_be_bytes([rdram[z_offset], rdram[z_offset + 1]]);
