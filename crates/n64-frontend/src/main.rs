@@ -365,7 +365,7 @@ fn main() {
     };
 
     if use_diag {
-        let total_steps = 500_000_000u64;
+        let total_steps = 300_000_000u64;
         eprintln!("=== Boot diagnostic ({}M steps) ===", total_steps / 1_000_000);
 
         // PC histogram: sample every 1024 steps to keep overhead low
@@ -409,6 +409,28 @@ fn main() {
         // PC trace for critical window (after last DMA wait, before blocked acquire)
         let mut pc_trace: Vec<(u64, u32)> = Vec::new();
         let mut pc_trace_active = false;
+        // Non-idle PC histogram for window after last GFX task
+        let mut nonidle_pc_hist: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
+        let nonidle_window_start: u64 = 120_000_000;
+        let nonidle_window_end: u64 = 200_000_000;
+        // Monitor GFX completion queue at 0x8033B028 (validCount at phys 0x0033B030)
+        // Decoded from: LUI $a0,0x8034; ADDIU $a0,$a0,0xB028 (sign-extends: 0x8034_0000 + (-0x4FD8) = 0x8033_B028)
+        let gfx_q_valid_addr = 0x0033B030usize;
+        let mut prev_gfx_q_valid: u32 = 0;
+        let mut gfx_q_log: Vec<(u64, u32, u32)> = Vec::new(); // (step, validCount, pc)
+        // Track osRecvMesg calls (0x80322800) after last GFX task to find blocking queue
+        let mut recv_mesg_log: Vec<(u64, u32, u32)> = Vec::new(); // (step, $a0=queue, $a2=block)
+        // Monitor rendering gate variable at phys 0x0032D584 (virt 0x8032D584)
+        // When == 0: rendering enabled. When != 0: rendering skipped.
+        let render_gate_addr = 0x0032D584usize;
+        let mut prev_render_gate: u8 = 0xFF;
+        let mut render_gate_log: Vec<(u64, u8, u32)> = Vec::new(); // (step, value, pc)
+        let mut render_gate_check_count: u64 = 0;
+        let mut render_gate_check_log: Vec<(u64, u8, u64)> = Vec::new(); // (step, gate_val, check#)
+        let mut game_loop_body_hits: u64 = 0;
+        // Track PI DMA timing
+        let mut pi_dma_steps: Vec<u64> = Vec::new();
+        let mut prev_pi_count = 0u32;
         // Press Start at 200M to open menu, release at 210M
         let start_press_step: u64 = 200_000_000;
         let start_release_step: u64 = 210_000_000;
@@ -428,10 +450,58 @@ fn main() {
                 *pc_hist.entry(pc32).or_default() += 1;
             }
             if pc32 == 0x80000180 { exception_count += 1; }
-            // Track exec_display_list
+            // Non-idle PC histogram: sample every 256 steps, exclude idle loop
+            if i >= nonidle_window_start && i < nonidle_window_end && i & 0xFF == 0 {
+                if pc32 != 0x80246DDC && pc32 != 0x80246DD8 {
+                    *nonidle_pc_hist.entry(pc32).or_default() += 1;
+                }
+            }
+            // Track osRecvMesg calls after frame 3 starts
+            if pc32 == 0x80322800 && i > 63_000_000 && recv_mesg_log.len() < 200 {
+                let a0 = n64.cpu.gpr[4] as u32; // queue address
+                let a2 = n64.cpu.gpr[6] as u32; // blocking flag
+                recv_mesg_log.push((i, a0, a2));
+            }
+            // Track key SM64 addresses
             if pc32 == 0x80246C10 {
                 exec_dl_hits += 1;
                 if exec_dl_hits == 1 { exec_dl_first_step = i; }
+            }
+            // Track render gate check (0x80248B78 = BEQ that gates rendering)
+            if pc32 == 0x80248B78 {
+                if render_gate_check_count < 10 || render_gate_check_count % 100 == 0 {
+                    let rd = n64.rdram_data();
+                    let gate_val = rd[render_gate_addr];
+                    render_gate_check_log.push((i, gate_val, render_gate_check_count));
+                }
+                render_gate_check_count += 1;
+            }
+            // Track function entry of game_loop body (look for call at 0x80248B68)
+            if pc32 == 0x80248B68 { game_loop_body_hits += 1; }
+            // Monitor rendering gate
+            {
+                let rd = n64.rdram_data();
+                if render_gate_addr < rd.len() {
+                    let val = rd[render_gate_addr];
+                    if val != prev_render_gate && render_gate_log.len() < 100 {
+                        render_gate_log.push((i, val, pc32));
+                    }
+                    prev_render_gate = val;
+                }
+            }
+            // GFX completion queue monitoring
+            {
+                let rd = n64.rdram_data();
+                if gfx_q_valid_addr + 3 < rd.len() {
+                    let cur = u32::from_be_bytes([
+                        rd[gfx_q_valid_addr], rd[gfx_q_valid_addr+1],
+                        rd[gfx_q_valid_addr+2], rd[gfx_q_valid_addr+3],
+                    ]);
+                    if cur != prev_gfx_q_valid && gfx_q_log.len() < 100 {
+                        gfx_q_log.push((i, cur, pc32));
+                    }
+                    prev_gfx_q_valid = cur;
+                }
             }
             // === SI queue monitoring — every step ===
             {
@@ -499,6 +569,11 @@ fn main() {
                 if n64.cpu.pc as u32 == 0x80322868 { // osRecvMesg blocking path
                     pc_trace_active = false;
                 }
+            }
+            // Track PI DMA timing
+            if n64.bus.pi.dma_count > prev_pi_count && pi_dma_steps.len() < 500 {
+                pi_dma_steps.push(i);
+                prev_pi_count = n64.bus.pi.dma_count;
             }
             if n64.bus.rsp.start_count > rsp_before {
                 // Read task type from DMEM to classify
@@ -646,6 +721,121 @@ fn main() {
             }
         }
 
+        // Game loop body hits
+        eprintln!("  Game loop body (0x80248B68): {} hits", game_loop_body_hits);
+        eprintln!("  Render gate check (0x80248B78): {} hits", render_gate_check_count);
+        for &(step, val, check_num) in render_gate_check_log.iter() {
+            eprintln!("    check #{}: step={} gate={}", check_num, step, val);
+        }
+        // Rendering gate (0x8032D584) transitions
+        eprintln!("  Rendering gate (0x8032D584) transitions ({}):", render_gate_log.len());
+        for &(step, val, pc) in render_gate_log.iter() {
+            let state = if val == 0 { "RENDER" } else { "SKIP" };
+            eprintln!("    step={}: val={} ({}) PC={:#010X}", step, val, state, pc);
+        }
+        // Also check current value
+        {
+            let rd = n64.rdram_data();
+            let cur = rd[render_gate_addr];
+            eprintln!("  Rendering gate CURRENT value: {} ({})", cur, if cur == 0 { "RENDER" } else { "SKIP" });
+        }
+
+        // PI DMA timing
+        if !pi_dma_steps.is_empty() {
+            eprintln!("  PI DMA timing: {} DMAs, first at step {}, last at step {}",
+                pi_dma_steps.len(),
+                pi_dma_steps.first().unwrap(),
+                pi_dma_steps.last().unwrap());
+            // Show last 10 DMAs
+            let start = pi_dma_steps.len().saturating_sub(10);
+            for (j, &step) in pi_dma_steps[start..].iter().enumerate() {
+                eprintln!("    DMA #{}: step {}", start + j + 1, step);
+            }
+        }
+
+        // osRecvMesg calls after frame 3
+        eprintln!("  osRecvMesg calls after step 63M ({}):", recv_mesg_log.len());
+        {
+            let mut queue_counts: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+            for &(_, q, _) in &recv_mesg_log {
+                *queue_counts.entry(q).or_default() += 1;
+            }
+            let mut entries: Vec<_> = queue_counts.iter().collect();
+            entries.sort_by(|a, b| b.1.cmp(a.1));
+            for (q, count) in &entries {
+                eprintln!("    queue={:#010X}: {} calls", q, count);
+            }
+            // Show first 20 with timestamps
+            for &(step, q, block) in recv_mesg_log.iter().take(20) {
+                eprintln!("    step={}: queue={:#010X} block={}", step, q, block);
+            }
+        }
+
+        // GFX completion queue (0x8033B028) transitions
+        eprintln!("  GFX completion queue (0x8033B028) validCount transitions ({}):", gfx_q_log.len());
+        for &(step, valid, pc) in gfx_q_log.iter().take(30) {
+            eprintln!("    step={}: validCount={} PC={:#010X}", step, valid, pc);
+        }
+
+        // Find callers of alloc_display_list (0x80248090) = JAL 0x0C092024
+        // and config_gfx_pool (first function called in render path)
+        {
+            let rdram = n64.rdram_data();
+            let target_opcode = 0x0C092024u32; // JAL alloc_display_list
+            eprintln!("  Searching for JAL 0x80248090 (alloc_display_list):");
+            for off in (0x00200000usize..0x00400000).step_by(4) {
+                if off + 3 < rdram.len() {
+                    let instr = u32::from_be_bytes([rdram[off], rdram[off+1], rdram[off+2], rdram[off+3]]);
+                    if instr == target_opcode {
+                        let vaddr = 0x80000000u32 + off as u32;
+                        // Dump context: 8 instructions before and 4 after
+                        eprintln!("    Found at {:#010X}:", vaddr);
+                        for ctx in -30i32..10 {
+                            let ctx_off = off as i32 + ctx * 4;
+                            if ctx_off >= 0 && (ctx_off as usize) + 3 < rdram.len() {
+                                let ctx_instr = u32::from_be_bytes([
+                                    rdram[ctx_off as usize], rdram[ctx_off as usize + 1],
+                                    rdram[ctx_off as usize + 2], rdram[ctx_off as usize + 3],
+                                ]);
+                                let ctx_va = 0x80000000u32.wrapping_add(ctx_off as u32);
+                                let marker = if ctx == 0 { " ★★★" } else { "" };
+                                eprintln!("      {:#010X}: {:#010X}{}", ctx_va, ctx_instr, marker);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Dump MIPS code around exec_display_list call site (0x802480EC)
+        // to understand game thread blocking
+        {
+            let rdram = n64.rdram_data();
+            eprintln!("  Code dump around exec_display_list call (0x802480xx):");
+            // Dump 0x80248000-0x80248120 (phys 0x00248000)
+            for off in (0x00248000usize..0x00248120).step_by(4) {
+                if off + 3 < rdram.len() {
+                    let instr = u32::from_be_bytes([rdram[off], rdram[off+1], rdram[off+2], rdram[off+3]]);
+                    if instr != 0 {
+                        let vaddr = 0x80000000u32 + off as u32;
+                        let marker = if vaddr == 0x802480EC { " ★ jal exec_display_list" } else { "" };
+                        eprintln!("    {:#010X}: {:#010X}{}", vaddr, instr, marker);
+                    }
+                }
+            }
+            // Full function containing the render path (0x80248A00-0x80248D00)
+            eprintln!("  Full render function (0x80248A00-0x80248D00):");
+            for off in (0x00248A00usize..0x00248D00).step_by(4) {
+                if off + 3 < rdram.len() {
+                    let instr = u32::from_be_bytes([rdram[off], rdram[off+1], rdram[off+2], rdram[off+3]]);
+                    if instr != 0 {
+                        let vaddr = 0x80000000u32 + off as u32;
+                        eprintln!("    {:#010X}: {:#010X}", vaddr, instr);
+                    }
+                }
+            }
+        }
+
         // Search for ALL jal osSendMesg calls, find exec_display_list (msg=0x67)
         {
             let rdram = n64.rdram_data();
@@ -756,6 +946,21 @@ fn main() {
 
         // exec_display_list call tracking
         eprintln!("  exec_display_list (0x80246C68): {} hits, first at step {}", exec_dl_hits, exec_dl_first_step);
+
+        // Non-idle PC histogram (steps {}M-{}M)
+        eprintln!("  Non-idle PCs (steps {}M-{}M, excluding idle loop):", nonidle_window_start/1_000_000, nonidle_window_end/1_000_000);
+        {
+            let mut entries: Vec<_> = nonidle_pc_hist.iter().collect();
+            entries.sort_by(|a, b| b.1.cmp(a.1));
+            for (j, (pc, count)) in entries.iter().enumerate().take(30) {
+                let off = (**pc as usize) & 0x00FF_FFFF;
+                let opcode = if off + 3 < n64.rdram_data().len() {
+                    let rd = n64.rdram_data();
+                    u32::from_be_bytes([rd[off], rd[off+1], rd[off+2], rd[off+3]])
+                } else { 0 };
+                eprintln!("    {:#010X}: {} hits (opcode={:#010X})", pc, count, opcode);
+            }
+        }
 
         // SI Queue A (0x80367138) transitions
         eprintln!("  SI Queue A (0x80367138) transitions ({}):", si_q_a_log.len());

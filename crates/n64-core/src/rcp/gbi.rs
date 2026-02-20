@@ -322,6 +322,7 @@ fn translate_f3d_geom(bits: u32) -> u32 {
 /// Walk a display list using F3D (original) opcode table.
 /// Used by earlier games: Super Mario 64, Mario Kart 64, etc.
 pub fn process_display_list_f3d(renderer: &mut Renderer, rdram: &mut [u8], addr: u32) {
+    log::error!("ENTERING process_display_list_f3d addr={:#010X}", addr);
     // F3D opcode constants (differ from F3DEX2)
     const F3D_MTX: u8           = 0x01;
     const F3D_MOVEMEM: u8       = 0x03;
@@ -346,7 +347,7 @@ pub fn process_display_list_f3d(renderer: &mut Renderer, rdram: &mut [u8], addr:
 
     loop {
         if cmd_count >= MAX_COMMANDS {
-            log::warn!("F3D display list exceeded {} commands, stopping", MAX_COMMANDS);
+            log::error!("F3D display list exceeded {} commands, stopping at pc={:#010X}", MAX_COMMANDS, pc);
             break;
         }
         cmd_count += 1;
@@ -528,12 +529,14 @@ pub fn process_display_list_f3d(renderer: &mut Renderer, rdram: &mut [u8], addr:
             G_SETCONVERT | G_SETKEYR | G_SETKEYGB => {}
 
             _ => {
-                log::trace!("Unknown F3D command {:#04X} at {:#010X}", cmd, pc.wrapping_sub(8));
+                log::error!("Unknown F3D command {:#04X} at DL[{:#010X}] w0={:#010X} w1={:#010X}",
+                    cmd, pc.wrapping_sub(8), w0, w1);
             }
         }
     }
 
-    log::debug!("F3D display list processed: {} commands", cmd_count);
+    log::error!("F3D DL done: {} cmds, {} tris, {} DL branches at addr={:#010X}",
+        cmd_count, renderer.tri_count, stack.len(), addr);
 }
 
 /// Look up a human-readable name for an F3DEX2 GBI opcode.
