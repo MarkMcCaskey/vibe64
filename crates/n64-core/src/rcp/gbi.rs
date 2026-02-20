@@ -400,11 +400,11 @@ pub fn process_display_list_f3d(renderer: &mut Renderer, rdram: &mut [u8], addr:
             }
 
             // ─── F3D triangle ───
-            // w0: [BF][00][00][00]  w1: [v0*10:8][v1*10:8][v2*10:8][00]
+            // w0: [BF][00][00][00]  w1: [00][v0*10:8][v1*10:8][v2*10:8]
             F3D_TRI1 => {
-                let v0 = ((w1 >> 24) & 0xFF) as usize / 10;
-                let v1 = ((w1 >> 16) & 0xFF) as usize / 10;
-                let v2 = ((w1 >> 8) & 0xFF) as usize / 10;
+                let v0 = ((w1 >> 16) & 0xFF) as usize / 10;
+                let v1 = ((w1 >> 8) & 0xFF) as usize / 10;
+                let v2 = (w1 & 0xFF) as usize / 10;
                 if v0 < 32 && v1 < 32 && v2 < 32 {
                     renderer.rasterize_triangle(v0, v1, v2, rdram);
                     renderer.tri_count += 1;

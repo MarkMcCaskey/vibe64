@@ -152,6 +152,7 @@ pub struct Renderer {
     // ─── Snapshot of best completed frame (for diagnostic screenshot) ───
     pub best_frame_snapshot: Vec<u8>,
     pub best_frame_nonblack: u32,
+
 }
 
 impl Renderer {
@@ -295,6 +296,9 @@ impl Renderer {
     pub fn cmd_set_combine(&mut self, w0: u32, w1: u32) {
         self.combine_hi = w0 & 0x00FF_FFFF;
         self.combine_lo = w1;
+        // combine_lo hardware layout (from parallel-rdp):
+        //   b0_rgb[31:28] b1_rgb[27:24] Aa1[23:21] Ac1[20:18] d0_rgb[17:15]
+        //   Ab0[14:12] Ad0[11:9] d1_rgb[8:6] Ab1[5:3] Ad1[2:0]
     }
 
     /// G_SETOTHERMODE_H: Modify high half of other modes.
@@ -462,8 +466,11 @@ impl Renderer {
         let count = (((w1 >> 14) & 0x3FF) + 1) as usize;
 
         let _tile = &self.tiles[tile_idx];
-        // TLUT is loaded to upper half of TMEM (offset 0x800)
-        let tmem_offset = 0x800 + (_tile.tmem as usize) * 8;
+        // TLUT entries are 16-bit in upper TMEM (0x800-0xFFF).
+        // GBI sets tile.tmem = 256 + palette*16 for CI4 (256 = 0x800/8).
+        // The lookup reads at 0x800 + index*2, so LOAD must write at
+        // 0x800 + (tmem - 256)*2 to keep addressing consistent.
+        let tmem_offset = 0x800 + (_tile.tmem as usize).saturating_sub(256) * 2;
         let src = self.texture_image_addr as usize;
 
         let byte_count = count * 2; // 16-bit entries
@@ -596,7 +603,7 @@ impl Renderer {
                 let texel0 = self.sample_texture(tile_idx, tex_s >> 5, tex_t >> 5, cycle);
                 let color = self.combine_pixel(texel0, [255, 255, 255, 255]);
 
-                self.write_pixel(rdram, x, y, color);
+                self.write_pixel(rdram, x, y, color, 255);
             }
         }
 
@@ -784,17 +791,19 @@ impl Renderer {
         // Fill mode: shouldn't reach here (handled by fill_rect)
         if cycle == 3 { return texel0; }
 
-        // Extract cycle 0 selectors from combine_hi / combine_lo
+
+        // Extract cycle 0 selectors from combine_hi / combine_lo.
         // combine_hi[23:0]: a0[23:20] c0[19:15] Aa0[14:12] Ac0[11:9] a1[8:5] c1[4:0]
-        // combine_lo[31:0]: b0[31:28] b1[27:24] Aa1[23:21] Ab0[20:18] Ab1[17:15]
-        //                   d0[14:12] Ad0[11:9] d1[8:6] Ad1[5:3] Ac1[2:0]
+        // combine_lo (RDP hardware layout, confirmed by parallel-rdp):
+        //   b0[31:28] b1[27:24] Aa1[23:21] Ac1[20:18] d0[17:15]
+        //   Ab0[14:12] Ad0[11:9] d1[8:6] Ab1[5:3] Ad1[2:0]
         let a0_rgb = ((self.combine_hi >> 20) & 0xF) as u8;
         let c0_rgb = ((self.combine_hi >> 15) & 0x1F) as u8;
         let a0_a   = ((self.combine_hi >> 12) & 0x7) as u8;
         let c0_a   = ((self.combine_hi >> 9) & 0x7) as u8;
         let b0_rgb = ((self.combine_lo >> 28) & 0xF) as u8;
-        let d0_rgb = ((self.combine_lo >> 12) & 0x7) as u8;
-        let b0_a   = ((self.combine_lo >> 18) & 0x7) as u8;
+        let d0_rgb = ((self.combine_lo >> 15) & 0x7) as u8;
+        let b0_a   = ((self.combine_lo >> 12) & 0x7) as u8;
         let d0_a   = ((self.combine_lo >> 9) & 0x7) as u8;
 
         // Cycle 0: COMBINED input is zero (no prior cycle output)
@@ -810,11 +819,11 @@ impl Renderer {
             let a1_rgb = ((self.combine_hi >> 5) & 0xF) as u8;
             let c1_rgb = (self.combine_hi & 0x1F) as u8;
             let a1_a   = ((self.combine_lo >> 21) & 0x7) as u8;
-            let c1_a   = (self.combine_lo & 0x7) as u8;
+            let c1_a   = ((self.combine_lo >> 18) & 0x7) as u8;
             let b1_rgb = ((self.combine_lo >> 24) & 0xF) as u8;
             let d1_rgb = ((self.combine_lo >> 6) & 0x7) as u8;
-            let b1_a   = ((self.combine_lo >> 15) & 0x7) as u8;
-            let d1_a   = ((self.combine_lo >> 3) & 0x7) as u8;
+            let b1_a   = ((self.combine_lo >> 3) & 0x7) as u8;
+            let d1_a   = (self.combine_lo & 0x7) as u8;
 
             let cycle1_result = self.cc_evaluate(
                 a1_rgb, b1_rgb, c1_rgb, d1_rgb,
@@ -1235,11 +1244,16 @@ impl Renderer {
     ///
     /// Cycle 0 layout in othermode_l:
     ///   P = bits[31:30], A = bits[27:26], M = bits[23:22], B = bits[19:18]
-    fn blend_pixel(&self, pixel: [u8; 4], memory: [u8; 4]) -> [u8; 4] {
-        let p_sel = (self.othermode_l >> 30) & 0x3;
-        let a_sel = (self.othermode_l >> 26) & 0x3;
-        let m_sel = (self.othermode_l >> 22) & 0x3;
-        let b_sel = (self.othermode_l >> 18) & 0x3;
+    fn blend_pixel(&self, pixel: [u8; 4], memory: [u8; 4], shade_alpha: u8) -> [u8; 4] {
+        // In 2-cycle mode, the final output uses cycle 1 blend settings.
+        // othermode_l layout: P0[31:30] P1[29:28] A0[27:26] A1[25:24]
+        //                     M0[23:22] M1[21:20] B0[19:18] B1[17:16]
+        let cycle = self.cycle_type();
+        let shift = if cycle == 1 { 0 } else { 2 }; // cycle 1 settings are 2 bits lower
+        let p_sel = (self.othermode_l >> (30 - shift)) & 0x3;
+        let a_sel = (self.othermode_l >> (26 - shift)) & 0x3;
+        let m_sel = (self.othermode_l >> (22 - shift)) & 0x3;
+        let b_sel = (self.othermode_l >> (18 - shift)) & 0x3;
 
         // Select P color source
         let p = match p_sel {
@@ -1249,11 +1263,16 @@ impl Renderer {
             _ => self.fog_color,
         };
 
-        // Select A alpha factor (single value applied to all channels)
+        // Select A alpha factor.
+        // On N64 hardware, selector 0 = "pipeline alpha" which is the pixel's
+        // COVERAGE, not the combiner alpha directly. Coverage is 255 (full) for
+        // all rasterized pixels unless CVG_X_ALPHA is set, in which case
+        // coverage = CC_alpha. Selector 2 = shade alpha (raw vertex alpha).
+        let cvg_x_alpha = self.othermode_l & (1 << 12) != 0;
         let a: u16 = match a_sel {
-            0 => pixel[3] as u16,
+            0 => if cvg_x_alpha { pixel[3] as u16 } else { 255 },
             1 => self.fog_color[3] as u16,
-            2 => pixel[3] as u16, // shade alpha — use pixel alpha as approximation
+            2 => shade_alpha as u16,
             _ => 0,
         };
 
@@ -1288,7 +1307,8 @@ impl Renderer {
     }
 
     /// Write a pixel to the framebuffer with alpha compare and blending.
-    fn write_pixel(&self, rdram: &mut [u8], x: i32, y: i32, color: [u8; 4]) {
+    /// `shade_alpha` is the raw interpolated vertex alpha (for blender A_SEL=2).
+    fn write_pixel(&self, rdram: &mut [u8], x: i32, y: i32, color: [u8; 4], shade_alpha: u8) {
         // CVG_X_ALPHA (bit 12): coverage × alpha — if alpha is 0, pixel is fully transparent
         // This is how the N64 handles texture cutout (e.g., tree leaves, fences)
         let cvg_x_alpha = self.othermode_l & (1 << 12) != 0;
@@ -1307,7 +1327,7 @@ impl Renderer {
         let force_bl = self.othermode_l & (1 << 14) != 0;
         let final_color = if force_bl {
             let memory = self.read_pixel(rdram, x, y);
-            self.blend_pixel(color, memory)
+            self.blend_pixel(color, memory, shade_alpha)
         } else {
             color
         };
@@ -1563,7 +1583,7 @@ impl Renderer {
 
                 self.pixel_count += 1;
 
-                self.write_pixel(rdram, x, y, color);
+                self.write_pixel(rdram, x, y, color, a);
             }
         }
     }
