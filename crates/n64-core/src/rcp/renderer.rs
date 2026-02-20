@@ -148,6 +148,10 @@ pub struct Renderer {
     pub debug_dl_log: bool,
     pub wire_edges: Vec<crate::debug::WireEdge>,
     pub dl_log_entries: Vec<crate::debug::DlLogEntry>,
+
+    // ─── Snapshot of best completed frame (for diagnostic screenshot) ───
+    pub best_frame_snapshot: Vec<u8>,
+    pub best_frame_nonblack: u32,
 }
 
 impl Renderer {
@@ -212,6 +216,8 @@ impl Renderer {
             debug_dl_log: false,
             wire_edges: Vec::new(),
             dl_log_entries: Vec::new(),
+            best_frame_snapshot: Vec::new(),
+            best_frame_nonblack: 0,
         }
     }
 
@@ -779,13 +785,16 @@ impl Renderer {
         if cycle == 3 { return texel0; }
 
         // Extract cycle 0 selectors from combine_hi / combine_lo
+        // combine_hi[23:0]: a0[23:20] c0[19:15] Aa0[14:12] Ac0[11:9] a1[8:5] c1[4:0]
+        // combine_lo[31:0]: b0[31:28] b1[27:24] Aa1[23:21] Ab0[20:18] Ab1[17:15]
+        //                   d0[14:12] Ad0[11:9] d1[8:6] Ad1[5:3] Ac1[2:0]
         let a0_rgb = ((self.combine_hi >> 20) & 0xF) as u8;
         let c0_rgb = ((self.combine_hi >> 15) & 0x1F) as u8;
         let a0_a   = ((self.combine_hi >> 12) & 0x7) as u8;
         let c0_a   = ((self.combine_hi >> 9) & 0x7) as u8;
         let b0_rgb = ((self.combine_lo >> 28) & 0xF) as u8;
-        let d0_rgb = ((self.combine_lo >> 15) & 0x7) as u8;
-        let b0_a   = ((self.combine_lo >> 12) & 0x7) as u8;
+        let d0_rgb = ((self.combine_lo >> 12) & 0x7) as u8;
+        let b0_a   = ((self.combine_lo >> 18) & 0x7) as u8;
         let d0_a   = ((self.combine_lo >> 9) & 0x7) as u8;
 
         // Cycle 0: COMBINED input is zero (no prior cycle output)
@@ -801,11 +810,11 @@ impl Renderer {
             let a1_rgb = ((self.combine_hi >> 5) & 0xF) as u8;
             let c1_rgb = (self.combine_hi & 0x1F) as u8;
             let a1_a   = ((self.combine_lo >> 21) & 0x7) as u8;
-            let c1_a   = ((self.combine_lo >> 18) & 0x7) as u8;
+            let c1_a   = (self.combine_lo & 0x7) as u8;
             let b1_rgb = ((self.combine_lo >> 24) & 0xF) as u8;
             let d1_rgb = ((self.combine_lo >> 6) & 0x7) as u8;
-            let b1_a   = ((self.combine_lo >> 3) & 0x7) as u8;
-            let d1_a   = (self.combine_lo & 0x7) as u8;
+            let b1_a   = ((self.combine_lo >> 15) & 0x7) as u8;
+            let d1_a   = ((self.combine_lo >> 3) & 0x7) as u8;
 
             let cycle1_result = self.cc_evaluate(
                 a1_rgb, b1_rgb, c1_rgb, d1_rgb,

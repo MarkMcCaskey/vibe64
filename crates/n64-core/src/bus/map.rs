@@ -162,6 +162,25 @@ impl Interconnect {
                 self.renderer.color_image_addr,
             );
 
+            // Save the best frame snapshot (most non-black pixels) for diagnostics.
+            if tris_this_dl > 0 {
+                let ci = self.renderer.color_image_addr as usize;
+                let w = self.renderer.color_image_width as usize;
+                let fb_bytes = w * 240 * 2;
+                let rdram = self.rdram.data();
+                if ci > 0 && ci + fb_bytes <= rdram.len() {
+                    let mut nonblack = 0u32;
+                    for i in (0..fb_bytes).step_by(2) {
+                        let px = u16::from_be_bytes([rdram[ci + i], rdram[ci + i + 1]]);
+                        if px >> 1 != 0 { nonblack += 1; }
+                    }
+                    if nonblack > self.renderer.best_frame_nonblack {
+                        self.renderer.best_frame_snapshot = rdram[ci..ci + fb_bytes].to_vec();
+                        self.renderer.best_frame_nonblack = nonblack;
+                    }
+                }
+            }
+
             // DP interrupt: RDP finished rendering this display list.
             // Only raised for GFX tasks (audio tasks don't use the RDP).
             self.mi.set_interrupt(crate::rcp::mi::MiInterrupt::DP);

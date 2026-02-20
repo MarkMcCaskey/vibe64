@@ -172,18 +172,37 @@ impl ApplicationHandler for App {
 }
 
 /// Save the current N64 framebuffer as a PPM screenshot.
+/// Uses the VI origin, but falls back to the renderer's last completed frame
+/// if the VI buffer appears empty (caught mid-frame-clear in diagnostic mode).
 fn save_screenshot(n64: &n64_core::N64) {
-    let origin = n64.vi_origin() as usize;
+    let vi_origin = n64.vi_origin() as usize;
     let width = n64.vi_width().max(1) as usize;
     let format = n64.vi_pixel_format();
     let rdram = n64.rdram_data();
+
+    eprintln!("Screenshot: vi_origin={:#X} width={} format={}", vi_origin, width, format);
+    let snapshot = &n64.bus.renderer.best_frame_snapshot;
+    eprintln!("  Renderer: ci={:#X}, best_snapshot={} px",
+        n64.bus.renderer.color_image_addr, n64.bus.renderer.best_frame_nonblack);
+
+    // Check if VI origin has color data, or fall back to best saved snapshot
+    let use_snapshot = if format == 2 && vi_origin > 0 && vi_origin + 320 * 240 * 2 < rdram.len() {
+        let mut max_color = 0u16;
+        for i in (0..320 * 240 * 2).step_by(64) {
+            let px = u16::from_be_bytes([rdram[vi_origin + i], rdram[vi_origin + i + 1]]);
+            max_color = max_color.max(px >> 1);
+        }
+        max_color == 0 && !snapshot.is_empty()
+    } else {
+        false
+    };
+
+    if use_snapshot {
+        eprintln!("  VI blank, using best snapshot ({} nonblack pixels)", n64.bus.renderer.best_frame_nonblack);
+    }
+
     let fb_size = width * 240 * if format == 3 { 4 } else { 2 };
-
-    eprintln!("Screenshot: origin={:#X} width={} format={}", origin, width, format);
-    eprintln!("  Renderer: color_image_addr={:#X} color_image_width={}",
-        n64.bus.renderer.color_image_addr, n64.bus.renderer.color_image_width);
-
-    if origin == 0 || format < 2 || origin + fb_size >= rdram.len() {
+    if !use_snapshot && (vi_origin == 0 || format < 2 || vi_origin + fb_size >= rdram.len()) {
         eprintln!("  Cannot save: invalid framebuffer");
         return;
     }
@@ -191,29 +210,44 @@ fn save_screenshot(n64: &n64_core::N64) {
     let mut ppm = b"P6\n320 240\n255\n".to_vec();
     for y in 0..240 {
         for x in 0..320usize {
-            match format {
-                2 => {
-                    let off = origin + (y * width + x) * 2;
-                    let pixel = u16::from_be_bytes([rdram[off], rdram[off + 1]]);
+            if use_snapshot {
+                let off = (y * width + x) * 2;
+                if off + 1 < snapshot.len() {
+                    let pixel = u16::from_be_bytes([snapshot[off], snapshot[off + 1]]);
                     let r = ((pixel >> 11) & 0x1F) as u8;
                     let g = ((pixel >> 6) & 0x1F) as u8;
                     let b = ((pixel >> 1) & 0x1F) as u8;
                     ppm.push((r << 3) | (r >> 2));
                     ppm.push((g << 3) | (g >> 2));
                     ppm.push((b << 3) | (b >> 2));
+                } else {
+                    ppm.extend_from_slice(&[0, 0, 0]);
                 }
-                3 => {
-                    let off = origin + (y * width + x) * 4;
-                    ppm.push(rdram[off]);
-                    ppm.push(rdram[off + 1]);
-                    ppm.push(rdram[off + 2]);
+            } else {
+                match format {
+                    2 => {
+                        let off = vi_origin + (y * width + x) * 2;
+                        let pixel = u16::from_be_bytes([rdram[off], rdram[off + 1]]);
+                        let r = ((pixel >> 11) & 0x1F) as u8;
+                        let g = ((pixel >> 6) & 0x1F) as u8;
+                        let b = ((pixel >> 1) & 0x1F) as u8;
+                        ppm.push((r << 3) | (r >> 2));
+                        ppm.push((g << 3) | (g >> 2));
+                        ppm.push((b << 3) | (b >> 2));
+                    }
+                    3 => {
+                        let off = vi_origin + (y * width + x) * 4;
+                        ppm.push(rdram[off]);
+                        ppm.push(rdram[off + 1]);
+                        ppm.push(rdram[off + 2]);
+                    }
+                    _ => { ppm.extend_from_slice(&[0, 0, 0]); }
                 }
-                _ => { ppm.extend_from_slice(&[0, 0, 0]); }
             }
         }
     }
     std::fs::write("screenshot.ppm", &ppm).ok();
-    eprintln!("  Saved screenshot.ppm");
+    eprintln!("  Saved screenshot.ppm ({})", if use_snapshot { "from snapshot" } else { "from VI" });
 }
 
 /// Read N64 framebuffer from RDRAM and convert to RGBA8888 for display.

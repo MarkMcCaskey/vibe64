@@ -302,6 +302,21 @@ pub fn process_display_list(renderer: &mut Renderer, rdram: &mut [u8], addr: u32
 
 }
 
+/// Translate F3D geometry mode bits to F3DEX2 positions.
+///
+/// Three bits have different positions between F3D and F3DEX2:
+///   G_CULL_FRONT:     F3D 0x1000  → F3DEX2 0x0200
+///   G_CULL_BACK:      F3D 0x2000  → F3DEX2 0x0400
+///   G_SHADING_SMOOTH: F3D 0x0200  → F3DEX2 0x200000
+/// All other bits (ZBUFFER, SHADE, LIGHTING, FOG, etc.) are identical.
+fn translate_f3d_geom(bits: u32) -> u32 {
+    let mut out = bits & !(0x1000 | 0x2000 | 0x0200); // clear F3D-specific bits
+    if bits & 0x1000 != 0 { out |= 0x0200; }      // cull front
+    if bits & 0x2000 != 0 { out |= 0x0400; }      // cull back
+    if bits & 0x0200 != 0 { out |= 0x0020_0000; }  // smooth shading
+    out
+}
+
 /// Walk a display list using F3D (original) opcode table.
 /// Used by earlier games: Super Mario 64, Mario Kart 64, etc.
 pub fn process_display_list_f3d(renderer: &mut Renderer, rdram: &mut [u8], addr: u32) {
@@ -321,9 +336,7 @@ pub fn process_display_list_f3d(renderer: &mut Renderer, rdram: &mut [u8], addr:
     const F3D_POPMTX: u8        = 0xBD;
     const F3D_TRI1: u8          = 0xBF;
 
-    // F3D geometry mode uses different cull bits
-    const F3D_CULL_FRONT: u32 = 0x0000_1000;
-    const F3D_CULL_BACK: u32  = 0x0000_2000;
+    // F3D geometry mode bits differ from F3DEX2 — see translate_f3d_geom().
 
     let mut pc = addr & 0x00FF_FFFF;
     let mut stack: Vec<u32> = Vec::with_capacity(MAX_DL_STACK);
@@ -418,25 +431,13 @@ pub fn process_display_list_f3d(renderer: &mut Renderer, rdram: &mut [u8], addr:
             }
 
             // ─── F3D geometry mode (split into two commands) ───
+            // Translate F3D-specific bits to F3DEX2 positions before applying.
             F3D_CLEARGEOMETRYMODE => {
-                // Translate F3D cull bits to F3DEX2 cull bits
-                let mut bits = w1;
-                if bits & F3D_CULL_FRONT != 0 {
-                    bits = (bits & !F3D_CULL_FRONT) | 0x0200;
-                }
-                if bits & F3D_CULL_BACK != 0 {
-                    bits = (bits & !F3D_CULL_BACK) | 0x0400;
-                }
+                let bits = translate_f3d_geom(w1);
                 renderer.geometry_mode &= !bits;
             }
             F3D_SETGEOMETRYMODE => {
-                let mut bits = w1;
-                if bits & F3D_CULL_FRONT != 0 {
-                    bits = (bits & !F3D_CULL_FRONT) | 0x0200;
-                }
-                if bits & F3D_CULL_BACK != 0 {
-                    bits = (bits & !F3D_CULL_BACK) | 0x0400;
-                }
+                let bits = translate_f3d_geom(w1);
                 renderer.geometry_mode |= bits;
             }
 
