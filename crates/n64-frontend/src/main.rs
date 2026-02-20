@@ -365,7 +365,7 @@ fn main() {
     };
 
     if use_diag {
-        let total_steps = 300_000_000u64;
+        let total_steps = 100_000_000u64;
         eprintln!("=== Boot diagnostic ({}M steps) ===", total_steps / 1_000_000);
 
         // PC histogram: sample every 1024 steps to keep overhead low
@@ -431,6 +431,24 @@ fn main() {
         // Track PI DMA timing
         let mut pi_dma_steps: Vec<u64> = Vec::new();
         let mut prev_pi_count = 0u32;
+        // Game thread state monitoring
+        // Thread at 0x8033AA90 (phys 0x0033AA90), state u16 at offset 0x10 (phys 0x0033AAA0)
+        // 1=STOP, 2=RUNNABLE, 4=RUNNING, 8=WAITING
+        let game_thread_state_addr = 0x0033AAA0usize;
+        let mut prev_game_thread_state: u16 = 0;
+        let mut game_thread_stop_step: u64 = 0;
+        // PC trace around crash window
+        let mut crash_pc_trace: Vec<(u64, u32)> = Vec::new();
+        // VBlank queue monitoring: 0x8033B010, validCount at phys 0x0033B018
+        let vblank_q_valid_addr = 0x0033B018usize;
+        let mut prev_vblank_q_valid: u32 = 0;
+        let mut vblank_q_log: Vec<(u64, u32, u32)> = Vec::new();
+        // Track display_and_vsync sub-calls
+        let mut dav_entry_count: u64 = 0; // 0x80248090
+        let mut dav_recv1_count: u64 = 0; // 0x802480B0 (GFX done recv)
+        let mut dav_exec_count: u64 = 0;  // 0x802480EC (exec_display_list)
+        let mut dav_recv2_count: u64 = 0; // 0x8024810C (VBlank recv)
+        let mut dav_log: Vec<(u64, &str, u64)> = Vec::new(); // (step, event, count)
         // Press Start at 200M to open menu, release at 210M
         let start_press_step: u64 = 200_000_000;
         let start_release_step: u64 = 210_000_000;
@@ -476,8 +494,32 @@ fn main() {
                 }
                 render_gate_check_count += 1;
             }
+            // PC trace around game thread crash
+            if i >= 87099000 && i <= 87103000 && crash_pc_trace.len() < 5000 {
+                crash_pc_trace.push((i, pc32));
+            }
             // Track function entry of game_loop body (look for call at 0x80248B68)
             if pc32 == 0x80248B68 { game_loop_body_hits += 1; }
+            // Track display_and_vsync sub-calls
+            match pc32 {
+                0x80248090 => {
+                    dav_entry_count += 1;
+                    if dav_log.len() < 50 { dav_log.push((i, "ENTRY", dav_entry_count)); }
+                }
+                0x802480B0 => {
+                    dav_recv1_count += 1;
+                    if dav_log.len() < 50 { dav_log.push((i, "RECV_GFX", dav_recv1_count)); }
+                }
+                0x802480EC => {
+                    dav_exec_count += 1;
+                    if dav_log.len() < 50 { dav_log.push((i, "EXEC_DL", dav_exec_count)); }
+                }
+                0x8024810C => {
+                    dav_recv2_count += 1;
+                    if dav_log.len() < 50 { dav_log.push((i, "RECV_VBLANK", dav_recv2_count)); }
+                }
+                _ => {}
+            }
             // Monitor rendering gate
             {
                 let rd = n64.rdram_data();
@@ -487,6 +529,44 @@ fn main() {
                         render_gate_log.push((i, val, pc32));
                     }
                     prev_render_gate = val;
+                }
+            }
+            // Game thread state monitoring (check every 16 steps)
+            if i & 0xF == 0 {
+                let rd = n64.rdram_data();
+                if game_thread_state_addr + 1 < rd.len() {
+                    let state = u16::from_be_bytes([rd[game_thread_state_addr], rd[game_thread_state_addr + 1]]);
+                    if state != prev_game_thread_state {
+                        let s = match state { 1 => "STOP", 2 => "RUNNABLE", 4 => "RUNNING", 8 => "WAITING", _ => "?" };
+                        eprintln!("  ** Game thread state: {} → {} ({}) at step {} PC={:#010X}",
+                            prev_game_thread_state, state, s, i, pc32);
+                        if state == 1 {
+                            game_thread_stop_step = i;
+                            // Dump game thread saved PC and RA
+                            let thread_phys = 0x0033AA90usize;
+                            if thread_phys + 0x120 < rd.len() {
+                                let saved_pc = u32::from_be_bytes([rd[thread_phys+0x11C], rd[thread_phys+0x11D], rd[thread_phys+0x11E], rd[thread_phys+0x11F]]);
+                                let saved_ra = u32::from_be_bytes([rd[thread_phys+0x104], rd[thread_phys+0x105], rd[thread_phys+0x106], rd[thread_phys+0x107]]);
+                                let saved_sp = u32::from_be_bytes([rd[thread_phys+0xF4], rd[thread_phys+0xF5], rd[thread_phys+0xF6], rd[thread_phys+0xF7]]);
+                                eprintln!("  ** Game thread STOPPED: saved_pc={:#010X} saved_ra={:#010X} saved_sp={:#010X}", saved_pc, saved_ra, saved_sp);
+                            }
+                        }
+                        prev_game_thread_state = state;
+                    }
+                }
+            }
+            // VBlank queue monitoring
+            {
+                let rd = n64.rdram_data();
+                if vblank_q_valid_addr + 3 < rd.len() {
+                    let cur = u32::from_be_bytes([
+                        rd[vblank_q_valid_addr], rd[vblank_q_valid_addr+1],
+                        rd[vblank_q_valid_addr+2], rd[vblank_q_valid_addr+3],
+                    ]);
+                    if cur != prev_vblank_q_valid && vblank_q_log.len() < 100 {
+                        vblank_q_log.push((i, cur, pc32));
+                    }
+                    prev_vblank_q_valid = cur;
                 }
             }
             // GFX completion queue monitoring
@@ -738,6 +818,47 @@ fn main() {
             let rd = n64.rdram_data();
             let cur = rd[render_gate_addr];
             eprintln!("  Rendering gate CURRENT value: {} ({})", cur, if cur == 0 { "RENDER" } else { "SKIP" });
+        }
+
+        // Game thread state
+        if game_thread_stop_step > 0 {
+            eprintln!("  *** GAME THREAD STOPPED at step {} ***", game_thread_stop_step);
+        }
+        eprintln!("  TLB miss count: {}", n64.cpu.tlb_miss_count);
+        // Crash PC trace
+        if !crash_pc_trace.is_empty() {
+            eprintln!("  Crash window PC trace ({} entries, steps {}..{}):",
+                crash_pc_trace.len(), crash_pc_trace.first().unwrap().0, crash_pc_trace.last().unwrap().0);
+            // Group PCs into function ranges and annotate
+            let rdram = n64.rdram_data();
+            for &(step, pc) in &crash_pc_trace {
+                let phys = (pc & 0x1FFF_FFFF) as usize;
+                let opcode = if phys + 3 < rdram.len() {
+                    u32::from_be_bytes([rdram[phys], rdram[phys+1], rdram[phys+2], rdram[phys+3]])
+                } else { 0 };
+                // Annotate known OS functions
+                let note = match pc {
+                    0x80322800..=0x80322BFF => " [osRecvMesg]",
+                    0x80322C20..=0x80322FFF => " [osSendMesg]",
+                    0x80327C00..=0x80327DFF => " [__osDispatch]",
+                    0x80000180 => " [EXCEPTION]",
+                    _ => "",
+                };
+                eprintln!("    step={}: PC={:#010X} op={:#010X}{}", step, pc, opcode, note);
+            }
+        }
+
+        // display_and_vsync sub-call tracking
+        eprintln!("  display_and_vsync: entry={} recv_gfx={} exec_dl={} recv_vblank={}",
+            dav_entry_count, dav_recv1_count, dav_exec_count, dav_recv2_count);
+        for &(step, event, count) in dav_log.iter().take(30) {
+            eprintln!("    step={}: {} #{}", step, event, count);
+        }
+
+        // VBlank queue transitions
+        eprintln!("  VBlank queue (0x8033B010) transitions ({}):", vblank_q_log.len());
+        for &(step, valid, pc) in vblank_q_log.iter().take(30) {
+            eprintln!("    step={}: validCount={} PC={:#010X}", step, valid, pc);
         }
 
         // PI DMA timing

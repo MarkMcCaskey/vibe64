@@ -65,6 +65,8 @@ pub struct Vr4300 {
     pub pc_history: [u32; 64],
     pub pc_history_idx: usize,
     pub step_count: u64,
+    /// Count of TLB miss exceptions taken
+    pub tlb_miss_count: u64,
 }
 
 impl Vr4300 {
@@ -87,6 +89,7 @@ impl Vr4300 {
             pc_history: [0u32; 64],
             pc_history_idx: 0,
             step_count: 0,
+            tlb_miss_count: 0,
         };
 
         // COP0 initial state after cold reset
@@ -183,6 +186,12 @@ impl Vr4300 {
 
         // 5. Check for TLB miss during data access (set by load/store ops)
         if let Some((bad_vaddr, code)) = self.tlb_miss.take() {
+            // Track TLB misses for debugging
+            self.tlb_miss_count += 1;
+            if self.tlb_miss_count <= 5 {
+                log::warn!("TLB {:?} #{} at PC={:#010X} bad_vaddr={:#018X} step={}",
+                    code, self.tlb_miss_count, current_pc as u32, bad_vaddr, self.step_count);
+            }
             let epc = if was_delay_slot {
                 current_pc.wrapping_sub(4) // branch instruction
             } else {

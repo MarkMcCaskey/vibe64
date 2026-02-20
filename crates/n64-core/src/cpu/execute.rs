@@ -77,7 +77,7 @@ impl Vr4300 {
             0x06 => self.op_srlv(instr),
             0x07 => self.op_srav(instr),
             0x08 => self.op_jr(instr, _bus),
-            0x09 => self.op_jalr(instr),
+            0x09 => self.op_jalr(instr, current_pc),
             0x0C => {
                 // SYSCALL: EPC must point to the SYSCALL instruction itself
                 self.pc = current_pc;
@@ -684,10 +684,9 @@ impl Vr4300 {
         self.in_delay_slot = true;
     }
 
-    fn op_jalr(&mut self, instr: Instruction) {
-        let return_addr = self.pc; // already advanced past delay slot
+    fn op_jalr(&mut self, instr: Instruction, pc: u64) {
+        self.gpr[instr.rd()] = pc.wrapping_add(8); // return address (skip delay slot)
         self.next_pc = self.gpr[instr.rs()];
-        self.gpr[instr.rd()] = return_addr;
         self.in_delay_slot = true;
     }
 
