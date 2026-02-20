@@ -19,7 +19,6 @@ pub struct AudioOutput {
 
 impl AudioOutput {
     /// Create audio output. Returns None if no audio device is available.
-    /// Audio starts muted by default.
     pub fn new() -> Option<Self> {
         let host = cpal::default_host();
         let device = host.default_output_device()?;
@@ -71,7 +70,7 @@ impl AudioOutput {
             buffer,
             host_sample_rate,
             host_channels,
-            muted: true, // muted by default
+            muted: false, // unmuted by default
         })
     }
 

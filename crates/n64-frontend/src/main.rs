@@ -29,6 +29,8 @@ struct App {
     arrow_down: bool,
     arrow_left: bool,
     arrow_right: bool,
+    /// Current save state slot (0-9)
+    save_slot: u8,
 }
 
 impl ApplicationHandler for App {
@@ -58,7 +60,10 @@ impl ApplicationHandler for App {
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                self.n64.save_eeprom(); self.n64.save_flash();
+                event_loop.exit();
+            }
             WindowEvent::Resized(size) => {
                 if let Some(pixels) = &mut self.pixels {
                     let _ = pixels.resize_surface(size.width.max(1), size.height.max(1));
@@ -113,6 +118,7 @@ impl ApplicationHandler for App {
 
                     // Escape to quit
                     if key == KeyCode::Escape && pressed {
+                        self.n64.save_eeprom(); self.n64.save_flash();
                         event_loop.exit();
                     }
                     // P = save screenshot
@@ -126,7 +132,33 @@ impl ApplicationHandler for App {
                             log::info!("Audio: {}", if muted { "muted" } else { "unmuted" });
                         }
                     }
-                    // F1-F8 = debug overlays
+                    // Save state controls
+                    if pressed {
+                        match key {
+                            KeyCode::F5 => {
+                                match self.n64.save_state(self.save_slot) {
+                                    Ok(()) => eprintln!("State saved to slot {}", self.save_slot),
+                                    Err(e) => eprintln!("Save state error: {}", e),
+                                }
+                            }
+                            KeyCode::F6 => {
+                                self.save_slot = (self.save_slot + 1) % 10;
+                                eprintln!("Save slot: {}", self.save_slot);
+                            }
+                            KeyCode::F7 => {
+                                match self.n64.load_state(self.save_slot) {
+                                    Ok(()) => eprintln!("State loaded from slot {}", self.save_slot),
+                                    Err(e) => eprintln!("Load state error: {}", e),
+                                }
+                            }
+                            KeyCode::F8 => {
+                                self.save_slot = if self.save_slot == 0 { 9 } else { self.save_slot - 1 };
+                                eprintln!("Save slot: {}", self.save_slot);
+                            }
+                            _ => {}
+                        }
+                    }
+                    // F1-F4 = debug overlays
                     if pressed {
                         debug_overlay::handle_f_key(&mut self.n64.debug, key);
                     }
@@ -152,6 +184,11 @@ impl ApplicationHandler for App {
                 self.n64.debug.fps_samples[pos] = dt;
                 self.n64.debug.fps_write_pos = (pos + 1) % 60;
                 self.n64.debug.frame_count += 1;
+
+                // Periodic EEPROM save (every ~5 seconds)
+                if self.n64.debug.frame_count % 300 == 0 {
+                    self.n64.save_eeprom(); self.n64.save_flash();
+                }
 
                 if let Some(pixels) = &mut self.pixels {
                     blit_framebuffer(&self.n64, pixels.frame_mut());
@@ -372,7 +409,20 @@ fn main() {
         // PC trace for critical window (after last DMA wait, before blocked acquire)
         let mut pc_trace: Vec<(u64, u32)> = Vec::new();
         let mut pc_trace_active = false;
+        // Press Start at 200M to open menu, release at 210M
+        let start_press_step: u64 = 200_000_000;
+        let start_release_step: u64 = 210_000_000;
         for i in 0..total_steps {
+            // Simulate Start button press for menu testing
+            if i == start_press_step {
+                n64.bus.pif.controller.buttons |= n64_core::memory::pif::buttons::START;
+                eprintln!("  ** Pressing START at step {}", i);
+            }
+            if i == start_release_step {
+                n64.bus.pif.controller.buttons &= !n64_core::memory::pif::buttons::START;
+                eprintln!("  ** Releasing START at step {}", i);
+            }
+
             let pc32 = n64.cpu.pc as u32;
             if i & 0x3FF == 0 {
                 *pc_hist.entry(pc32).or_default() += 1;
@@ -530,6 +580,11 @@ fn main() {
             n64.bus.vi.v_current, n64.bus.vi.v_intr, n64.bus.vi.v_sync);
         eprintln!("  SI: {} DMAs  AI: {} DMAs (dacrate={})",
             n64.bus.si.dma_count, n64.bus.ai.dma_count, n64.bus.ai.dacrate);
+        // Audio sample check: count nonzero samples captured from AI DMA
+        let total = n64.bus.audio_samples.len();
+        let nonzero = n64.bus.audio_samples.iter().filter(|&&s| s != 0).count();
+        eprintln!("  Audio samples: {} total, {} nonzero ({:.1}%)",
+            total, nonzero, if total > 0 { nonzero as f64 / total as f64 * 100.0 } else { 0.0 });
         // PI DMA start vs completion: check for lost interrupts
         let pi_starts = n64.bus.pi.dma_count as u64;
         let pi_completions = n64.bus.mi.set_counts[4] as u64; // PI interrupt fires
@@ -555,6 +610,8 @@ fn main() {
             let nonzero = (0..fb_size).filter(|&i| rdram[origin + i] != 0).count();
             eprintln!("  Framebuffer: {}% non-zero at RDRAM[{:#X}]", nonzero * 100 / fb_size, origin);
         }
+        // Save diag screenshot
+        save_screenshot(&n64);
         eprintln!("  Exception entries: {}  DP interrupts: {}  SP_STATUS reads: {}",
             exception_count, dp_interrupt_count, n64.bus.rsp.status_read_count.get());
 
@@ -1531,6 +1588,7 @@ fn main() {
             n64, window: None, pixels: None, audio,
             last_frame_time: std::time::Instant::now(),
             arrow_up: false, arrow_down: false, arrow_left: false, arrow_right: false,
+            save_slot: 0,
         };
         event_loop.run_app(&mut app).expect("run event loop");
     }

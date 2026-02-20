@@ -76,7 +76,7 @@ impl Vr4300 {
             0x04 => self.op_sllv(instr),
             0x06 => self.op_srlv(instr),
             0x07 => self.op_srav(instr),
-            0x08 => self.op_jr(instr),
+            0x08 => self.op_jr(instr, _bus),
             0x09 => self.op_jalr(instr),
             0x0C => {
                 // SYSCALL: EPC must point to the SYSCALL instruction itself
@@ -651,13 +651,36 @@ impl Vr4300 {
     }
 
     fn op_jal(&mut self, instr: Instruction, pc: u64) {
+        // No extra tracing
         self.gpr[31] = pc.wrapping_add(8); // return address (skip delay slot)
         self.next_pc = (pc & 0xFFFF_FFFF_F000_0000) | ((instr.target() as u64) << 2);
         self.in_delay_slot = true;
     }
 
-    fn op_jr(&mut self, instr: Instruction) {
-        self.next_pc = self.gpr[instr.rs()];
+    fn op_jr(&mut self, instr: Instruction, bus: &mut impl Bus) {
+        let target = self.gpr[instr.rs()];
+        // Crash detector: catch jump-to-zero
+        if (target as u32) < 0x1000 && target != 0xFFFF_FFFF_8000_0000 {
+            static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                let crash_pc = self.pc.wrapping_sub(4);
+                log::error!("JR to zero at step {}! rs={} target={:#018X} PC={:#010X}",
+                    self.step_count, instr.rs(), target, crash_pc as u32);
+                // Dump PC history (last 64 PCs)
+                log::error!("  PC history (last 64 instructions):");
+                let start = self.pc_history_idx;
+                for i in 0..64 {
+                    let idx = (start + i) & 63;
+                    let pc = self.pc_history[idx];
+                    if pc != 0 {
+                        let phys = self.translate_address(pc as u64);
+                        let opcode = bus.read_u32(phys);
+                        log::error!("    [{:2}] {:#010X}: {:#010X}", i, pc, opcode);
+                    }
+                }
+            }
+        }
+        self.next_pc = target;
         self.in_delay_slot = true;
     }
 

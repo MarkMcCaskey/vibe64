@@ -6,5 +6,6 @@ pub mod jit;
 pub mod memory;
 pub mod n64;
 pub mod rcp;
+pub mod savestate;
 
 pub use n64::N64;

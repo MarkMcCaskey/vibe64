@@ -1,4 +1,6 @@
 pub mod ai;
+pub mod audio_hle;
+pub mod flashram;
 pub mod gbi;
 pub mod mi;
 pub mod pi;

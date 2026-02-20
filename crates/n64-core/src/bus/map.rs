@@ -3,6 +3,8 @@ use crate::cart::Cartridge;
 use crate::memory::pif::Pif;
 use crate::memory::rdram::Rdram;
 use crate::rcp::ai::Ai;
+use crate::rcp::audio_hle::AudioHle;
+use crate::rcp::flashram::FlashRam;
 use crate::rcp::mi::Mi;
 use crate::rcp::pi::Pi;
 use crate::rcp::rdp::Rdp;
@@ -27,6 +29,8 @@ pub struct Interconnect {
     pub rdp: Rdp,
     pub pif: Pif,
     pub renderer: Renderer,
+    pub audio_hle: AudioHle,
+    pub flashram: FlashRam,
     pub ucode: crate::rcp::gbi::UcodeType,
     /// ISViewer debug output buffer (512 bytes at physical 0x13FF0020)
     is_viewer_buf: [u8; 512],
@@ -50,6 +54,8 @@ impl Interconnect {
             rdp: Rdp::new(),
             pif: Pif::new(),
             renderer: Renderer::new(),
+            audio_hle: AudioHle::new(),
+            flashram: FlashRam::new(),
             ucode: crate::rcp::gbi::UcodeType::F3dex2,
             is_viewer_buf: [0u8; 512],
             audio_samples: Vec::with_capacity(16384),
@@ -67,6 +73,26 @@ impl Interconnect {
         let cart_addr = self.pi.cart_addr & 0x0FFF_FFFF;
         let dram_addr = self.pi.dram_addr & 0x00FF_FFFF;
         let len = self.pi.pending_dma_len;
+
+        // FlashRAM DMA: cart addr in 0x0800_0000 range
+        if cart_addr >= 0x0800_0000 && cart_addr < 0x0802_0000 {
+            let flash_offset = cart_addr - 0x0800_0000;
+            let rdram = self.rdram.data_mut();
+            let dest_start = dram_addr as usize;
+            let dest_end = (dest_start + len as usize).min(rdram.len());
+            self.flashram.dma_read(flash_offset, &mut rdram[dest_start..dest_end]);
+
+            log::debug!(
+                "PI DMA (FlashRAM→RDRAM): Flash[{:#010X}] → RDRAM[{:#010X}], len={:#X}",
+                flash_offset, dram_addr, len
+            );
+
+            let delay = (len as u64 * 19).max(200);
+            self.pi.dma_busy_cycles = delay;
+            self.pi.pending_dma_len = 0;
+            self.pi.dma_count += 1;
+            return;
+        }
 
         for i in 0..len {
             let byte = self.cart.read_u8(cart_addr.wrapping_add(i));
@@ -94,12 +120,28 @@ impl Interconnect {
     /// PI DMA from RDRAM → Cart (save writes). We don't store the data,
     /// but must fire the completion interrupt so the game doesn't hang.
     pub fn pi_dma_from_rdram(&mut self) {
+        let cart_addr = self.pi.cart_addr & 0x0FFF_FFFF;
+        let dram_addr = self.pi.dram_addr & 0x00FF_FFFF;
         let len = self.pi.pending_dma_len;
-        log::debug!(
-            "PI DMA (save): RDRAM[{:#010X}] → Cart[{:#010X}], len={:#X}",
-            self.pi.dram_addr, self.pi.cart_addr, len
-        );
-        // Same timing as cart→RDRAM DMA
+
+        // FlashRAM page buffer write: RDRAM → Flash
+        if cart_addr >= 0x0800_0000 && cart_addr < 0x0802_0000 {
+            let rdram = self.rdram.data();
+            let src_start = dram_addr as usize;
+            let src_end = (src_start + len as usize).min(rdram.len());
+            self.flashram.dma_write(&rdram[src_start..src_end]);
+
+            log::debug!(
+                "PI DMA (RDRAM→FlashRAM): RDRAM[{:#010X}] → Flash page buffer, len={:#X}",
+                dram_addr, len
+            );
+        } else {
+            log::debug!(
+                "PI DMA (save): RDRAM[{:#010X}] → Cart[{:#010X}], len={:#X}",
+                dram_addr, cart_addr, len
+            );
+        }
+
         let delay = (len as u64 * 93_750_000) / (5 * 1024 * 1024);
         self.pi.dma_busy_cycles = delay.max(20);
         self.pi.pending_dma_len = 0;
@@ -128,6 +170,21 @@ impl Interconnect {
         // Read OSTask fields from DMEM
         let task_type = self.rsp.read_dmem_u32(gbi::TASK_TYPE);
 
+        if task_type == gbi::M_AUDTASK {
+            let data_ptr = self.rsp.read_dmem_u32(gbi::TASK_DATA_PTR);
+            let data_size = self.rsp.read_dmem_u32(gbi::TASK_DATA_SIZE);
+
+            let phys = match data_ptr {
+                0x8000_0000..=0x9FFF_FFFF => data_ptr - 0x8000_0000,
+                0xA000_0000..=0xBFFF_FFFF => data_ptr - 0xA000_0000,
+                _ => data_ptr & 0x00FF_FFFF,
+            };
+
+            log::debug!("RSP audio task: data={:#X} size={}", phys, data_size);
+            let rdram = self.rdram.data_mut();
+            self.audio_hle.process_audio_list(rdram, phys, data_size);
+        }
+
         if task_type == gbi::M_GFXTASK {
             let data_ptr = self.rsp.read_dmem_u32(gbi::TASK_DATA_PTR);
 
@@ -146,15 +203,32 @@ impl Interconnect {
             // Walk display list, rendering into RDRAM
             let rdram = self.rdram.data_mut();
             let tris_before = self.renderer.tri_count;
-            match self.ucode {
+            self.renderer.task_nonblack_writes = 0;
+            self.renderer.task_total_writes = 0;
+            let cmd_count = match self.ucode {
                 gbi::UcodeType::F3dex2 => {
-                    gbi::process_display_list(&mut self.renderer, rdram, phys_addr);
+                    gbi::process_display_list(&mut self.renderer, rdram, phys_addr)
                 }
                 gbi::UcodeType::F3d => {
                     gbi::process_display_list_f3d(&mut self.renderer, rdram, phys_addr);
+                    0 // F3D doesn't return count yet
                 }
-            }
+            };
             let tris_this_dl = self.renderer.tri_count - tris_before;
+
+            if cmd_count >= gbi::MAX_COMMANDS {
+                log::warn!("GFX #{}: HIT COMMAND LIMIT ({} commands)!", self.rsp.start_count, cmd_count);
+            }
+
+            // Log per-task info for diagnostics
+            log::debug!(
+                "GFX #{}: {} cmds, {} tris, ci={:#X} w={} scissor=({},{})..({},{})",
+                self.rsp.start_count, cmd_count, tris_this_dl,
+                self.renderer.color_image_addr,
+                self.renderer.color_image_width,
+                self.renderer.scissor_ulx >> 2, self.renderer.scissor_uly >> 2,
+                self.renderer.scissor_lrx >> 2, self.renderer.scissor_lry >> 2,
+            );
 
             log::debug!(
                 "GFX #{}: {} tris, ci={:#X}",
@@ -163,22 +237,30 @@ impl Interconnect {
             );
 
             // Save the best frame snapshot (most non-black pixels) for diagnostics.
-            if tris_this_dl > 0 {
+            {
                 let ci = self.renderer.color_image_addr as usize;
                 let w = self.renderer.color_image_width as usize;
                 let fb_bytes = w * 240 * 2;
                 let rdram = self.rdram.data();
-                if ci > 0 && ci + fb_bytes <= rdram.len() {
-                    let mut nonblack = 0u32;
+                let nonblack = if ci > 0 && ci + fb_bytes <= rdram.len() {
+                    let mut nb = 0u32;
                     for i in (0..fb_bytes).step_by(2) {
                         let px = u16::from_be_bytes([rdram[ci + i], rdram[ci + i + 1]]);
-                        if px >> 1 != 0 { nonblack += 1; }
+                        if px >> 1 != 0 { nb += 1; }
                     }
-                    if nonblack > self.renderer.best_frame_nonblack {
+                    if nb > self.renderer.best_frame_nonblack {
                         self.renderer.best_frame_snapshot = rdram[ci..ci + fb_bytes].to_vec();
-                        self.renderer.best_frame_nonblack = nonblack;
+                        self.renderer.best_frame_nonblack = nb;
                     }
+                    nb
+                } else { 0 };
+                // Record CI history (last 30 GFX tasks)
+                if self.renderer.ci_history.len() >= 30 {
+                    self.renderer.ci_history.remove(0);
                 }
+                let tw = self.renderer.task_total_writes;
+                let tnb = self.renderer.task_nonblack_writes;
+                self.renderer.ci_history.push((ci as u32, tris_this_dl, nonblack, tw, tnb));
             }
 
             // DP interrupt: RDP finished rendering this display list.
@@ -344,6 +426,9 @@ impl Bus for Interconnect {
             0x0460_0000..=0x046F_FFFF => self.pi.read_u32(addr),
             0x0470_0000..=0x047F_FFFF => self.ri.read_u32(addr),
             0x0480_0000..=0x048F_FFFF => self.si.read_u32(addr),
+            // FlashRAM status/data at 0x0800_0000
+            0x0800_0000..=0x0800_FFFF => self.flashram.read_status(),
+            0x0801_0000..=0x0801_FFFF => 0, // FlashRAM command register (write-only)
             // ISViewer debug port (must be checked before cart range)
             0x13FF_0000..=0x13FF_0FFF => self.is_viewer_read(addr),
             0x1000_0000..=0x1FBF_FFFF => self.cart.read_u32(addr),
@@ -447,6 +532,9 @@ impl Bus for Interconnect {
                     }
                 }
             }
+            // FlashRAM command register at 0x0801_0000
+            0x0800_0000..=0x0800_FFFF => {} // FlashRAM data range (read-only for direct access)
+            0x0801_0000..=0x0801_FFFF => self.flashram.command(val),
             // ISViewer debug port (must be checked before cart range)
             0x13FF_0000..=0x13FF_0FFF => self.is_viewer_write(addr, val),
             0x1FC0_07C0..=0x1FC0_07FF => self.pif.write_ram_u32(addr, val),

@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::bus::map::Interconnect;
 use crate::bus::Bus;
@@ -21,6 +21,8 @@ pub struct N64 {
     engine: Interpreter,
     pub cycles: u64,
     pub debug: crate::debug::DebugState,
+    /// Path to the loaded ROM (used for deriving save file paths).
+    pub rom_path: PathBuf,
 }
 
 impl N64 {
@@ -118,13 +120,20 @@ impl N64 {
         // COP0 state that the IPL3 would have left
         cpu.cop0.regs[crate::cpu::cop0::Cop0::STATUS] = 0x3400_0000; // CU0+CU1 enabled
 
-        Ok(Self {
+        let mut n64 = Self {
             cpu,
             bus,
             engine: Interpreter,
             cycles: 0,
             debug: crate::debug::DebugState::new(),
-        })
+            rom_path: rom_path.to_path_buf(),
+        };
+
+        // Load save data from disk if it exists
+        n64.load_eeprom();
+        n64.load_flash();
+
+        Ok(n64)
     }
 
     /// Video info for the frontend: pixel format, framebuffer dimensions.
@@ -136,6 +145,116 @@ impl N64 {
     /// Audio: drain buffered samples. Returns 16-bit signed stereo PCM (L,R,L,R...).
     pub fn drain_audio_samples(&mut self) -> Vec<i16> {
         std::mem::take(&mut self.bus.audio_samples)
+    }
+
+    /// Path for EEPROM save file (same directory as ROM, .eeprom extension).
+    pub fn eeprom_save_path(&self) -> PathBuf {
+        self.rom_path.with_extension("eeprom")
+    }
+
+    /// Path for FlashRAM save file (same directory as ROM, .flash extension).
+    pub fn flash_save_path(&self) -> PathBuf {
+        self.rom_path.with_extension("flash")
+    }
+
+    /// Load EEPROM data from disk if a save file exists.
+    fn load_eeprom(&mut self) {
+        if self.bus.pif.eeprom_type == crate::memory::pif::EepromType::None {
+            return;
+        }
+        let path = self.eeprom_save_path();
+        match std::fs::read(&path) {
+            Ok(data) => {
+                let expected = self.bus.pif.eeprom.len();
+                if data.len() == expected {
+                    self.bus.pif.load_eeprom_data(&data);
+                    log::info!("Loaded EEPROM save from {:?} ({} bytes)", path, data.len());
+                } else {
+                    log::warn!(
+                        "EEPROM save {:?} has wrong size ({} bytes, expected {}), ignoring",
+                        path, data.len(), expected
+                    );
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                log::info!("No EEPROM save file at {:?}, starting fresh", path);
+            }
+            Err(e) => {
+                log::warn!("Failed to read EEPROM save {:?}: {}", path, e);
+            }
+        }
+    }
+
+    /// Load FlashRAM data from disk if a save file exists.
+    fn load_flash(&mut self) {
+        let path = self.flash_save_path();
+        match std::fs::read(&path) {
+            Ok(data) => {
+                self.bus.flashram.load_data(&data);
+                log::info!("Loaded FlashRAM save from {:?} ({} bytes)", path, data.len());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                log::info!("No FlashRAM save file at {:?}, starting fresh", path);
+            }
+            Err(e) => {
+                log::warn!("Failed to read FlashRAM save {:?}: {}", path, e);
+            }
+        }
+    }
+
+    /// Flush FlashRAM data to disk if modified.
+    pub fn save_flash(&mut self) {
+        if !self.bus.flashram.dirty {
+            return;
+        }
+        let path = self.flash_save_path();
+        match std::fs::write(&path, self.bus.flashram.save_data()) {
+            Ok(()) => {
+                self.bus.flashram.dirty = false;
+                log::info!("Saved FlashRAM to {:?}", path);
+            }
+            Err(e) => {
+                log::error!("Failed to save FlashRAM to {:?}: {}", path, e);
+            }
+        }
+    }
+
+    /// Flush EEPROM data to disk if it has been modified.
+    pub fn save_eeprom(&mut self) {
+        if self.bus.pif.eeprom_type == crate::memory::pif::EepromType::None {
+            return;
+        }
+        if !self.bus.pif.eeprom_dirty {
+            return;
+        }
+        let path = self.eeprom_save_path();
+        match std::fs::write(&path, self.bus.pif.eeprom_data()) {
+            Ok(()) => {
+                self.bus.pif.eeprom_dirty = false;
+                log::info!("Saved EEPROM to {:?} ({} bytes)", path, self.bus.pif.eeprom.len());
+            }
+            Err(e) => {
+                log::error!("Failed to save EEPROM to {:?}: {}", path, e);
+            }
+        }
+    }
+
+    /// Path for save state files: `<rom>.state<slot>`
+    pub fn save_state_path(&self, slot: u8) -> PathBuf {
+        self.rom_path.with_extension(format!("state{}", slot))
+    }
+
+    /// Save the emulator state to a numbered slot (0-9).
+    pub fn save_state(&self, slot: u8) -> Result<(), String> {
+        let path = self.save_state_path(slot);
+        crate::savestate::save_to_file(self, &path)
+            .map_err(|e| format!("Save state failed: {}", e))
+    }
+
+    /// Load emulator state from a numbered slot (0-9).
+    pub fn load_state(&mut self, slot: u8) -> Result<(), String> {
+        let path = self.save_state_path(slot);
+        crate::savestate::load_from_file(self, &path)
     }
 
     /// Audio: N64 sample rate from AI dacrate register.
@@ -285,9 +404,17 @@ fn detect_eeprom(game_code: &[u8; 4]) -> crate::memory::pif::EepromType {
 
     // 16Kbit EEPROM games (common ones)
     const EEPROM_16K: &[&str] = &[
-        "NZLE", "NZLJ", "NZLP", // Majora's Mask
         "NCLB", "NCLE", "NCLJ", // Cruis'n World
         "NYBE",                   // Yoshi's Story
+    ];
+
+    // FlashRAM games — no EEPROM (uses 128KB Flash at 0x0800_0000)
+    const FLASHRAM_GAMES: &[&str] = &[
+        "NZSE", "NZSJ", "NZSP",  // Majora's Mask (US/JP/PAL)
+        "NZLE", "NZLJ", "NZLP",  // Majora's Mask (PAL alt codes)
+        "NPFE", "NPFJ", "NPFP",  // Pokemon Stadium 2
+        "NPOE", "NPOJ", "NPOP",  // Pokemon Stadium
+        "NPME",                    // Paper Mario
     ];
 
     // 4Kbit EEPROM games (most games that use EEPROM)
@@ -298,8 +425,12 @@ fn detect_eeprom(game_code: &[u8; 4]) -> crate::memory::pif::EepromType {
         "NSSE",                    // Star Fox 64
         "NFZE", "NFZJ",           // F-Zero X
         "NWRE",                    // Wave Race 64
-        "NPME",                    // Paper Mario
     ];
+
+    // FlashRAM games don't use EEPROM
+    for &c in FLASHRAM_GAMES {
+        if code == c { return EepromType::None; }
+    }
 
     for &c in EEPROM_16K {
         if code == c { return EepromType::Eeprom16K; }

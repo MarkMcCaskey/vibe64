@@ -24,6 +24,11 @@ impl Cartridge {
         }
     }
 
+    /// ROM CRC from the header (used for save state identification).
+    pub fn crc(&self) -> u32 {
+        self.header.crc1
+    }
+
     pub fn read_u32(&self, addr: u32) -> u32 {
         let offset = (addr & 0x0FFF_FFFF) as usize;
         if offset + 3 < self.data.len() {

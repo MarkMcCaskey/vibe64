@@ -142,6 +142,9 @@ pub struct Renderer {
     pub pixel_count: u64,
     pub z_fail_count: u64,
     pub cull_count: u32,
+    /// Per-task non-black write count (reset at each GFX task start)
+    pub task_nonblack_writes: u32,
+    pub task_total_writes: u32,
 
     // ─── Debug overlay recording (mirrored from DebugFlags) ───
     pub debug_wireframe: bool,
@@ -152,6 +155,8 @@ pub struct Renderer {
     // ─── Snapshot of best completed frame (for diagnostic screenshot) ───
     pub best_frame_snapshot: Vec<u8>,
     pub best_frame_nonblack: u32,
+    /// Track all unique color image addresses used by GFX tasks
+    pub ci_history: Vec<(u32, u32, u32, u32, u32)>,  // (ci_addr, tris, fb_nonblack, task_writes, task_nb_writes)
 
 }
 
@@ -213,12 +218,15 @@ impl Renderer {
             pixel_count: 0,
             z_fail_count: 0,
             cull_count: 0,
+            task_nonblack_writes: 0,
+            task_total_writes: 0,
             debug_wireframe: false,
             debug_dl_log: false,
             wire_edges: Vec::new(),
             dl_log_entries: Vec::new(),
             best_frame_snapshot: Vec::new(),
             best_frame_nonblack: 0,
+            ci_history: Vec::new(),
         }
     }
 
@@ -387,7 +395,7 @@ impl Renderer {
         let _tl = w0 & 0xFFF;
         let tile_idx = ((w1 >> 24) & 0x7) as usize;
         let texels = ((w1 >> 12) & 0xFFF) + 1; // number of texels
-        let _dxt = w1 & 0xFFF;
+        let dxt = w1 & 0xFFF;
 
         let tile = &self.tiles[tile_idx];
         let tmem_offset = (tile.tmem as usize) * 8; // TMEM offset in bytes
@@ -409,13 +417,43 @@ impl Renderer {
         let src = self.texture_image_addr as usize;
         let copy_len = byte_count.min(4096 - tmem_offset).min(rdram.len().saturating_sub(src));
 
-        for i in 0..copy_len {
-            let src_idx = (src + i) & (rdram.len() - 1);
-            if tmem_offset + i < 4096 {
-                self.tmem[tmem_offset + i] = rdram[src_idx];
+        if dxt == 0 {
+            // No interleaving — simple copy
+            for i in 0..copy_len {
+                let src_idx = (src + i) & (rdram.len() - 1);
+                if tmem_offset + i < 4096 {
+                    self.tmem[tmem_offset + i] = rdram[src_idx];
+                }
+            }
+        } else {
+            // Copy with TMEM word interleaving.
+            // dxt is 1.11 fixed-point: each 64-bit word advances a counter by dxt.
+            // When the counter's bit 11 (integer part) is odd, swap the two 32-bit
+            // halves of each 64-bit TMEM word.
+            // First, do a straight copy
+            for i in 0..copy_len {
+                let src_idx = (src + i) & (rdram.len() - 1);
+                if tmem_offset + i < 4096 {
+                    self.tmem[tmem_offset + i] = rdram[src_idx];
+                }
+            }
+            // Then apply interleaving: swap 32-bit halves on odd rows
+            let num_qwords = copy_len / 8;
+            let mut t: u32 = 0; // dxt accumulator (1.11 fixed-point)
+            for qw in 0..num_qwords {
+                let odd_row = (t >> 11) & 1;
+                if odd_row != 0 {
+                    // Swap the two 32-bit halves of this 64-bit word in TMEM
+                    let base = tmem_offset + qw * 8;
+                    if base + 7 < 4096 {
+                        for k in 0..4 {
+                            self.tmem.swap(base + k, base + 4 + k);
+                        }
+                    }
+                }
+                t = t.wrapping_add(dxt);
             }
         }
-
     }
 
     /// G_LOADTILE: Copy a rectangular region of texture data from RDRAM to TMEM.
@@ -502,8 +540,14 @@ impl Renderer {
         let x1 = ((lrx >> 2) + 1).min(self.scissor_lrx as i32 >> 2);
         let y1 = ((lry >> 2) + 1).min(self.scissor_lry as i32 >> 2);
 
-
         if x0 >= x1 || y0 >= y1 || self.color_image_addr == 0 {
+            return;
+        }
+
+        // G_FILLRECT only performs a raw fill in fill mode (cycle_type=3).
+        // In 1-cycle/2-cycle mode, it runs through the full RDP pipeline,
+        // not a direct fill — skip these to avoid destroying rendered content.
+        if self.cycle_type() != 3 {
             return;
         }
 
@@ -1157,6 +1201,34 @@ impl Renderer {
         self.mvp = mat4_mul(&self.modelview, &self.projection);
     }
 
+    /// G_MODIFYVTX: Modify a loaded vertex attribute in-place.
+    /// Used by menus and HUD elements to update vertex colors/ST coords/positions
+    /// without reloading the full vertex buffer.
+    pub fn cmd_modify_vtx(&mut self, w0: u32, w1: u32) {
+        let where_field = (w0 >> 16) & 0xFF;
+        let vtx_idx = ((w0 & 0xFFFF) / 2) as usize; // byte offset into vertex buffer / 2
+        if vtx_idx >= 32 { return; }
+
+        match where_field {
+            0x10 => {
+                // Modify ST texture coordinates (s16.16 each, packed into w1)
+                self.vertex_buffer[vtx_idx].s = (w1 >> 16) as i16 as f32;
+                self.vertex_buffer[vtx_idx].t = (w1 & 0xFFFF) as i16 as f32;
+            }
+            0x14 => {
+                // Modify RGBA vertex color
+                self.vertex_buffer[vtx_idx].r = (w1 >> 24) as u8;
+                self.vertex_buffer[vtx_idx].g = (w1 >> 16) as u8;
+                self.vertex_buffer[vtx_idx].b = (w1 >> 8) as u8;
+                self.vertex_buffer[vtx_idx].a = w1 as u8;
+            }
+            _ => {
+                log::trace!("G_MODIFYVTX: unhandled where={:#X} vtx={} val={:#X}",
+                    where_field, vtx_idx, w1);
+            }
+        }
+    }
+
     /// G_GEOMETRYMODE: Set/clear geometry mode flags.
     pub fn cmd_geometry_mode(&mut self, w0: u32, w1: u32) {
         let clear_bits = !(w0 & 0x00FF_FFFF);
@@ -1305,7 +1377,7 @@ impl Renderer {
 
     /// Write a pixel to the framebuffer with alpha compare and blending.
     /// `shade_alpha` is the raw interpolated vertex alpha (for blender A_SEL=2).
-    fn write_pixel(&self, rdram: &mut [u8], x: i32, y: i32, color: [u8; 4], shade_alpha: u8) {
+    fn write_pixel(&mut self, rdram: &mut [u8], x: i32, y: i32, color: [u8; 4], shade_alpha: u8) {
         // CVG_X_ALPHA (bit 12): coverage × alpha — if alpha is 0, pixel is fully transparent
         // This is how the N64 handles texture cutout (e.g., tree leaves, fences)
         let cvg_x_alpha = self.othermode_l & (1 << 12) != 0;
@@ -1328,6 +1400,11 @@ impl Renderer {
         } else {
             color
         };
+
+        self.task_total_writes += 1;
+        if final_color[0] > 0 || final_color[1] > 0 || final_color[2] > 0 {
+            self.task_nonblack_writes += 1;
+        }
 
         let addr = self.color_image_addr as usize;
         let width = self.color_image_width as i32;

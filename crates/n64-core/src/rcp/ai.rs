@@ -5,16 +5,25 @@
 /// When a buffer finishes playing, the AI fires an interrupt via MI.
 /// Registers at physical 0x0450_0000.
 
+/// An entry in the AI's 2-deep DMA FIFO.
+#[derive(Clone, Copy, Default)]
+struct AiFifoEntry {
+    dram_addr: u32,
+    len: u32,
+    cycles: u64,
+}
+
 pub struct Ai {
     pub dram_addr: u32,
     pub len: u32,
     pub control: u32,
     pub dacrate: u32,
     pub bitrate: u32,
-    /// Countdown in CPU cycles until current DMA buffer finishes.
+    /// 2-deep FIFO: [0] = currently playing, [1] = queued.
+    fifo: [AiFifoEntry; 2],
+    fifo_count: u8, // 0, 1, or 2
+    /// Countdown in CPU cycles until current buffer finishes.
     pub dma_cycles: u64,
-    /// Whether a DMA is currently active (playing audio).
-    pub dma_active: bool,
     /// Debug counter.
     pub dma_count: u32,
 }
@@ -24,8 +33,8 @@ pub enum AiRegWrite {
     None,
     /// AI_STATUS written — caller should clear MI AI interrupt.
     ClearInterrupt,
-    /// AI_LEN written — a DMA was started. Caller should capture audio samples
-    /// from RDRAM at (dram_addr, len) for audio output.
+    /// AI_LEN written — a DMA was started/queued. Caller should capture audio
+    /// samples from RDRAM at (dram_addr, len) for audio output.
     DmaStarted { dram_addr: u32, len: u32 },
 }
 
@@ -37,10 +46,20 @@ impl Ai {
             control: 0,
             dacrate: 0,
             bitrate: 0,
+            fifo: [AiFifoEntry::default(); 2],
+            fifo_count: 0,
             dma_cycles: 0,
-            dma_active: false,
             dma_count: 0,
         }
+    }
+
+    /// Calculate DMA duration in CPU cycles for a given buffer length.
+    fn calc_dma_cycles(&self, len: u32) -> u64 {
+        let dacrate = self.dacrate.max(1) as u64;
+        let samples = len as u64 / 4; // 16-bit stereo = 4 bytes per sample pair
+        // cycles = samples * cpu_freq * (dacrate+1) / vi_clock
+        let cycles = samples * (dacrate + 1) * 93_750_000 / 48_681_812;
+        cycles.max(1000) // minimum to avoid tight loops
     }
 
     pub fn read_u32(&self, addr: u32) -> u32 {
@@ -48,7 +67,10 @@ impl Ai {
             0x04 => self.len,
             0x0C => {
                 // AI_STATUS: bit 30 = DMA busy, bit 0 = FIFO full
-                if self.dma_active { 1 << 30 } else { 0 }
+                let mut status = 0u32;
+                if self.fifo_count >= 1 { status |= 1 << 30; } // DMA busy
+                if self.fifo_count >= 2 { status |= 1; }       // FIFO full
+                status
             }
             _ => 0,
         }
@@ -58,21 +80,25 @@ impl Ai {
         match addr & 0x0F_FFFF {
             0x00 => { self.dram_addr = val & 0x00FF_FFFF; AiRegWrite::None }
             0x04 => {
-                // AI_LEN: start DMA playback
+                // AI_LEN: queue DMA playback
                 self.len = val & 0x0003_FFF8;
-                if self.len > 0 && !self.dma_active {
-                    self.dma_active = true;
-                    // Calculate how many CPU cycles this buffer takes to play.
-                    // samples = len / 4 (16-bit stereo)
-                    // sample_rate = vi_clock / (dacrate + 1)
-                    // cycles = samples * cpu_freq / sample_rate
-                    //        = (len/4) * cpu_freq * (dacrate+1) / vi_clock
-                    let dacrate = self.dacrate.max(1) as u64;
-                    let samples = self.len as u64 / 4;
-                    // 93_750_000 * (dacrate+1) / 48_681_812 ≈ (dacrate+1) * 1.926
-                    self.dma_cycles = samples * (dacrate + 1) * 93_750_000 / 48_681_812;
-                    // Minimum 1000 cycles to avoid tight loops
-                    if self.dma_cycles < 1000 { self.dma_cycles = 1000; }
+                if self.len > 0 && self.fifo_count < 2 {
+                    let cycles = self.calc_dma_cycles(self.len);
+                    let entry = AiFifoEntry {
+                        dram_addr: self.dram_addr,
+                        len: self.len,
+                        cycles,
+                    };
+
+                    let idx = self.fifo_count as usize;
+                    self.fifo[idx] = entry;
+                    self.fifo_count += 1;
+
+                    // If this is the first entry, start playing immediately
+                    if self.fifo_count == 1 {
+                        self.dma_cycles = cycles;
+                    }
+
                     self.dma_count += 1;
                     return AiRegWrite::DmaStarted {
                         dram_addr: self.dram_addr,
@@ -92,18 +118,33 @@ impl Ai {
         }
     }
 
-    /// Tick the AI DMA timer. Returns true if the buffer just finished
+    /// Tick the AI DMA timer. Returns true if a buffer just finished
     /// (caller should fire MI AI interrupt).
     pub fn tick(&mut self, elapsed: u64) -> bool {
-        if !self.dma_active {
+        if self.fifo_count == 0 {
             return false;
         }
         if elapsed >= self.dma_cycles {
-            self.dma_active = false;
-            self.dma_cycles = 0;
-            return true; // buffer done — fire interrupt
+            // Current buffer finished
+            // Shift FIFO: move queued entry to playing position
+            self.fifo[0] = self.fifo[1];
+            self.fifo[1] = AiFifoEntry::default();
+            self.fifo_count -= 1;
+
+            // Auto-start next buffer if queued
+            if self.fifo_count > 0 {
+                self.dma_cycles = self.fifo[0].cycles;
+            } else {
+                self.dma_cycles = 0;
+            }
+            return true; // fire AI interrupt
         }
         self.dma_cycles -= elapsed;
         false
+    }
+
+    /// Check if DMA is currently active (for backwards compatibility).
+    pub fn dma_active(&self) -> bool {
+        self.fifo_count > 0
     }
 }

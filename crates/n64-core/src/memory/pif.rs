@@ -61,6 +61,8 @@ pub struct Pif {
     /// EEPROM save data (accessed via joybus channel 4)
     pub eeprom: Vec<u8>,
     pub eeprom_type: EepromType,
+    /// Dirty flag: true if EEPROM has been written since last disk flush
+    pub eeprom_dirty: bool,
     /// Debug: count of unhandled joybus commands
     pub unhandled_cmds: std::collections::HashMap<u8, u32>,
 }
@@ -74,6 +76,7 @@ impl Pif {
             controller: ControllerState::default(),
             eeprom: Vec::new(),
             eeprom_type: EepromType::None,
+            eeprom_dirty: false,
             unhandled_cmds: std::collections::HashMap::new(),
         }
     }
@@ -156,15 +159,15 @@ impl Pif {
         let mut i = 0usize;
         let mut channel = 0u8;
 
-
         while i < 63 {
             let tx_len = self.ram[i];
 
             // Special markers
             if tx_len == 0xFE { break; }          // End of commands
-            if tx_len == 0x00 { i += 1; channel += 1; continue; } // Skip channel
-            if tx_len == 0xFD { i += 1; channel += 1; continue; } // Skip channel
-            // Bit 7 set = channel already processed / skip (e.g. 0xFF = no device)
+            if tx_len == 0x00 { i += 1; channel += 1; continue; } // Channel present, skip
+            if tx_len == 0xFD { i += 1; channel += 1; continue; } // Channel skip
+            if tx_len == 0xFF { i += 1; continue; }               // NOP pad byte (no channel advance)
+            // Bit 7 set (but not 0xFF/0xFE/0xFD) = channel already processed
             if tx_len & 0x80 != 0 { i += 1; channel += 1; continue; }
 
             let tx = (tx_len & 0x3F) as usize;
@@ -247,6 +250,7 @@ impl Pif {
                             for b in 0..8 {
                                 self.eeprom[offset + b] = self.ram[cmd_start + 2 + b];
                             }
+                            self.eeprom_dirty = true;
                         }
                         self.ram[rx_start] = 0x00; // Success
                     } else {
@@ -263,6 +267,18 @@ impl Pif {
             i = rx_start + rx;
             channel += 1;
         }
+    }
+
+    /// Load EEPROM data from a byte slice (e.g., from a save file).
+    pub fn load_eeprom_data(&mut self, data: &[u8]) {
+        let len = data.len().min(self.eeprom.len());
+        self.eeprom[..len].copy_from_slice(&data[..len]);
+        self.eeprom_dirty = false;
+    }
+
+    /// Get EEPROM data for saving to disk.
+    pub fn eeprom_data(&self) -> &[u8] {
+        &self.eeprom
     }
 
     /// CIC-NUS-6105 challenge-response algorithm.

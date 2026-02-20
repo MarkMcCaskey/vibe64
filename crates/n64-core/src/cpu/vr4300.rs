@@ -60,6 +60,11 @@ pub struct Vr4300 {
     /// When true, log every FPU operation with input/output values.
     /// Set by the diagnostic loop to trace specific functions.
     pub fpu_trace: bool,
+
+    /// Ring buffer of recent PCs for crash debugging
+    pub pc_history: [u32; 64],
+    pub pc_history_idx: usize,
+    pub step_count: u64,
 }
 
 impl Vr4300 {
@@ -79,6 +84,9 @@ impl Vr4300 {
             reserved_instr: false,
             unimpl_opcodes: HashMap::new(),
             fpu_trace: false,
+            pc_history: [0u32; 64],
+            pc_history_idx: 0,
+            step_count: 0,
         };
 
         // COP0 initial state after cold reset
@@ -128,6 +136,13 @@ impl Vr4300 {
 
     /// Execute one instruction. Returns number of cycles consumed.
     pub fn step(&mut self, bus: &mut impl Bus) -> u64 {
+        // Record PC in ring buffer for crash debugging
+        self.pc_history[self.pc_history_idx] = self.pc as u32;
+        self.pc_history_idx = (self.pc_history_idx + 1) & 63;
+        self.step_count += 1;
+
+        let pc32 = self.pc as u32;
+
         // Save and clear delay slot flag. execute() will set it for branches.
         let was_delay_slot = self.in_delay_slot;
         self.in_delay_slot = false;
@@ -277,19 +292,7 @@ impl Vr4300 {
             0xA000_0000..=0xBFFF_FFFF => Some(addr32 - 0xA000_0000),
             _ => {
                 let asid = self.cop0.regs[Cop0::ENTRY_HI] as u8;
-                self.tlb.lookup(vaddr, asid).or_else(|| {
-                    // Identity-map kuseg addresses within RDRAM (0-8MB).
-                    // The N64 OS normally sets up a wired TLB entry for this
-                    // during boot (__osTlbInit), but some games (CIC-6105)
-                    // rely on this mapping being present before the game's
-                    // own TLB init runs. Providing it here as a fallback
-                    // avoids the chicken-and-egg problem.
-                    if addr32 < 0x0080_0000 {
-                        Some(addr32)
-                    } else {
-                        None
-                    }
-                })
+                self.tlb.lookup(vaddr, asid)
             }
         }
     }

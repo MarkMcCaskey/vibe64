@@ -124,13 +124,13 @@ const MAX_DL_STACK: usize = 18;
 
 /// Maximum commands to process per display list (safety limit).
 /// OoT draws 3D world geometry before overlay/text, requiring >100K commands.
-const MAX_COMMANDS: usize = 1_000_000;
+pub const MAX_COMMANDS: usize = 1_000_000;
 
 use super::renderer::Renderer;
 
 /// Walk a display list starting at the given physical RDRAM address.
 /// Dispatches each GBI command to the renderer.
-pub fn process_display_list(renderer: &mut Renderer, rdram: &mut [u8], addr: u32) {
+pub fn process_display_list(renderer: &mut Renderer, rdram: &mut [u8], addr: u32) -> usize {
     let mut pc = addr & 0x00FF_FFFF; // mask to RDRAM range
     let mut stack: Vec<u32> = Vec::with_capacity(MAX_DL_STACK);
     let mut cmd_count = 0usize;
@@ -284,8 +284,9 @@ pub fn process_display_list(renderer: &mut Renderer, rdram: &mut [u8], addr: u32
                 }
             }
             G_QUAD => renderer.cmd_tri2(w0, w1, rdram),
+            G_MODIFYVTX => renderer.cmd_modify_vtx(w0, w1),
             G_SETCONVERT | G_SETKEYR | G_SETKEYGB
-            | G_SPECIAL_1 | G_MODIFYVTX => {}
+            | G_SPECIAL_1 => {}
 
             G_RDPHALF_1 | G_RDPHALF_2 => {
                 // These store half-words for the next texture rect command.
@@ -300,6 +301,7 @@ pub fn process_display_list(renderer: &mut Renderer, rdram: &mut [u8], addr: u32
         }
     }
 
+    cmd_count
 }
 
 /// Translate F3D geometry mode bits to F3DEX2 positions.
