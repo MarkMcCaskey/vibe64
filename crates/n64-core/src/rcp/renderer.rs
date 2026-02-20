@@ -680,9 +680,9 @@ impl Renderer {
                         let a = if nibble & 1 != 0 { 0xFF } else { 0x00 };
                         [i, i, i, a]
                     } else {
-                        // I4: expand 4-bit to 8-bit
+                        // I4: expand 4-bit to 8-bit; alpha = intensity
                         let i = nibble | (nibble << 4);
-                        [i, i, i, 0xFF]
+                        [i, i, i, i]
                     }
                 } else {
                     [0, 0, 0, 0xFF]
@@ -702,7 +702,7 @@ impl Renderer {
                             let a = (lo << 4) | lo;
                             [i, i, i, a]
                         }
-                        4 | _ => [val, val, val, 0xFF], // I8
+                        4 | _ => [val, val, val, val], // I8: alpha = intensity
                     }
                 } else {
                     [0, 0, 0, 0xFF]
@@ -1249,7 +1249,7 @@ impl Renderer {
         // othermode_l layout: P0[31:30] P1[29:28] A0[27:26] A1[25:24]
         //                     M0[23:22] M1[21:20] B0[19:18] B1[17:16]
         let cycle = self.cycle_type();
-        let shift = if cycle == 1 { 0 } else { 2 }; // cycle 1 settings are 2 bits lower
+        let shift = if cycle == 1 { 2 } else { 0 }; // 2-cycle: shift 2 to read P1/A1/M1/B1
         let p_sel = (self.othermode_l >> (30 - shift)) & 0x3;
         let a_sel = (self.othermode_l >> (26 - shift)) & 0x3;
         let m_sel = (self.othermode_l >> (22 - shift)) & 0x3;
@@ -1263,14 +1263,13 @@ impl Renderer {
             _ => self.fog_color,
         };
 
-        // Select A alpha factor.
-        // On N64 hardware, selector 0 = "pipeline alpha" which is the pixel's
-        // COVERAGE, not the combiner alpha directly. Coverage is 255 (full) for
-        // all rasterized pixels unless CVG_X_ALPHA is set, in which case
-        // coverage = CC_alpha. Selector 2 = shade alpha (raw vertex alpha).
-        let cvg_x_alpha = self.othermode_l & (1 << 12) != 0;
+        // Select A alpha factor (IN_ALPHA / pipeline alpha).
+        // ALPHA_CVG_SEL (bit 13): when set, pipeline alpha = coverage (255).
+        // When clear, pipeline alpha = CC alpha (combiner output).
+        // CVG_X_ALPHA (bit 12): coverage *= CC alpha (for alpha cutout).
+        let alpha_cvg_sel = self.othermode_l & (1 << 13) != 0;
         let a: u16 = match a_sel {
-            0 => if cvg_x_alpha { pixel[3] as u16 } else { 255 },
+            0 => if alpha_cvg_sel { 255 } else { pixel[3] as u16 },
             1 => self.fog_color[3] as u16,
             2 => shade_alpha as u16,
             _ => 0,
@@ -1292,14 +1291,12 @@ impl Renderer {
             _ => 0,
         };
 
-        let denom = a + b;
-        if denom == 0 {
-            return pixel;
-        }
-
+        // N64 blender uses fixed-point: result = (P*A + M*B) >> 8
+        // This is NOT normalized by (A+B). This allows additive blending
+        // (B=255) to ADD brightness rather than averaging.
         let mut result = [0u8; 4];
         for i in 0..3 {
-            let val = (p[i] as u16 * a + m[i] as u16 * b) / denom;
+            let val = (p[i] as u16 * a + m[i] as u16 * b) >> 8;
             result[i] = val.min(255) as u8;
         }
         result[3] = pixel[3]; // preserve incoming alpha
