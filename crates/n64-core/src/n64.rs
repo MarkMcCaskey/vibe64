@@ -192,6 +192,15 @@ impl N64 {
                 log::warn!("Failed to read EEPROM save {:?}: {}", path, e);
             }
         }
+
+        if repair_eeprom_for_game(&self.bus.cart.header.game_code, &mut self.bus.pif) {
+            // Persist repaired data on next save flush.
+            self.bus.pif.eeprom_dirty = true;
+            log::warn!(
+                "Repaired EEPROM header for game {:?} to avoid known boot deadlock",
+                std::str::from_utf8(&self.bus.cart.header.game_code).unwrap_or("????")
+            );
+        }
     }
 
     /// Load FlashRAM data from disk if a save file exists.
@@ -518,16 +527,26 @@ fn is_flashram_game(game_code: &[u8; 4]) -> bool {
 /// proceed normally; the game detects invalid checksums in the remaining data
 /// and initializes fresh save slots.
 fn init_eeprom_for_game(game_code: &[u8; 4], pif: &mut crate::memory::pif::Pif) {
+    let _ = repair_eeprom_for_game(game_code, pif);
+}
+
+/// Repair malformed EEPROM data for games with strict boot-time checks.
+///
+/// Returns true when data was modified.
+fn repair_eeprom_for_game(game_code: &[u8; 4], pif: &mut crate::memory::pif::Pif) -> bool {
     let code = std::str::from_utf8(game_code).unwrap_or("");
 
     match code {
-        // Super Mario 64: save header magic at start of each 128-byte save slot
+        // Super Mario 64: block 0 must start with 0x8000 or a libultra wrapper
+        // returns early without releasing __osContAccessQueue.
         "NSME" | "NSMJ" => {
-            if pif.eeprom.len() >= 2 {
+            if pif.eeprom.len() >= 2 && (pif.eeprom[0] != 0x80 || pif.eeprom[1] != 0x00) {
                 pif.eeprom[0] = 0x80;
                 pif.eeprom[1] = 0x00;
+                return true;
             }
         }
         _ => {}
     }
+    false
 }

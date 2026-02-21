@@ -385,6 +385,9 @@ impl Interconnect {
     /// Copies 64 bytes immediately but defers the SI interrupt by ~6000
     /// CPU cycles to match real PIF bus timing (~64 µs at 1 MHz bus).
     fn si_dma_read(&mut self) {
+        // On hardware, Joybus commands in PIF RAM are executed as part of the
+        // SI transfer that reads PIF RAM back to RDRAM.
+        self.pif.process_commands();
         let dram_addr = self.si.dram_addr & 0x00FF_FFFF;
         for i in 0..64u32 {
             let byte = self.pif.ram[i as usize];
@@ -406,7 +409,6 @@ impl Interconnect {
         for i in 0..64u32 {
             self.pif.ram[i as usize] = self.rdram.read_u8(dram_addr + i);
         }
-        self.pif.process_commands();
         // Defer SI interrupt — tick_si_dma will fire it after the delay.
         self.si.dma_busy_cycles = 6000;
         self.si.dma_count += 1;
