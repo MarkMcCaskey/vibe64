@@ -2,7 +2,10 @@
 ///
 /// The hardware rasterizer. Receives commands from the RSP.
 /// Registers at physical 0x0410_0000.
-/// Fully stubbed for now.
+///
+/// In HLE mode the display list is processed by the software renderer,
+/// so the RDP is never actually busy. We still model DPC status control
+/// bits because libultra reads/writes DPC_STATUS for freeze/flush logic.
 
 pub struct Rdp {
     pub start: u32,
@@ -17,7 +20,8 @@ impl Rdp {
             start: 0,
             end: 0,
             current: 0,
-            status: 0,
+            // cbuf_ready (bit 7) set in HLE mode
+            status: 0x80,
         }
     }
 
@@ -39,6 +43,11 @@ impl Rdp {
                 // DPC_STATUS write: set/clear pairs
                 if val & 0x01 != 0 { self.status &= !0x01; } // Clear XBUS
                 if val & 0x02 != 0 { self.status |= 0x01; }  // Set XBUS
+                if val & 0x04 != 0 { self.status &= !0x02; } // Clear FREEZE
+                if val & 0x08 != 0 { self.status |= 0x02; }  // Set FREEZE
+                if val & 0x10 != 0 { self.status &= !0x04; } // Clear FLUSH
+                if val & 0x20 != 0 { self.status |= 0x04; }  // Set FLUSH
+                // Bits 6-9 clear counters on hardware; no-op in HLE.
             }
             _ => {}
         }

@@ -223,22 +223,22 @@ impl Pif {
                     }
                 }
                 0x02 => {
-                    // Controller Pak read: tx=[cmd, addr_hi, addr_lo], rx=[32 data bytes, 1 CRC]
-                    // No pak present: return all zeros (game detects via CRC mismatch)
-                    if channel == 0 && rx >= 33 {
+                    if std::env::var_os("N64_FAKE_PAK").is_some() && channel == 0 && rx >= 33 {
+                        // Optional debug mode: return zeroed data/CRC for absent pak.
                         for b in 0..33 {
                             self.ram[rx_start + b] = 0x00;
                         }
                     } else {
+                        // Controller Pak read (no pak emulated): report channel error.
                         self.ram[i + 1] = rx_len | 0x80;
                     }
                 }
                 0x03 => {
-                    // Controller Pak write: tx=[cmd, addr_hi, addr_lo, 32 data bytes], rx=[1 CRC]
-                    // No pak present: return zero CRC (game detects mismatch)
-                    if channel == 0 && rx >= 1 {
+                    if std::env::var_os("N64_FAKE_PAK").is_some() && channel == 0 && rx >= 1 {
+                        // Optional debug mode: return zero CRC for absent pak.
                         self.ram[rx_start] = 0x00;
                     } else {
+                        // Controller Pak write (no pak emulated): report channel error.
                         self.ram[i + 1] = rx_len | 0x80;
                     }
                 }
