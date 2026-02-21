@@ -219,9 +219,14 @@ impl ApplicationHandler for App {
                 let frames_to_run = self.speed_frame_budget.floor() as u32;
                 self.speed_frame_budget -= frames_to_run as f32;
 
-                for _ in 0..frames_to_run {
+                for i in 0..frames_to_run {
+                    // For fast-forward, skip expensive GFX tasks on intermediate
+                    // emulated frames to keep clock/time acceleration responsive.
+                    self.n64.bus.skip_gfx_tasks =
+                        self.speed_percent > DEFAULT_SPEED_PERCENT && i + 1 < frames_to_run;
                     self.n64.run_frame();
                 }
+                self.n64.bus.skip_gfx_tasks = false;
 
                 // Feed audio samples to output device
                 if let Some(audio) = &self.audio {
