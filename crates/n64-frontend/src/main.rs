@@ -255,7 +255,7 @@ impl ApplicationHandler for App {
                 }
 
                 // Feed audio samples to output device
-                if let Some(audio) = &self.audio {
+                if let Some(audio) = &mut self.audio {
                     let samples = self.n64.drain_audio_samples();
                     if !samples.is_empty() {
                         let rate = self.n64.audio_sample_rate();

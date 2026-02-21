@@ -1468,19 +1468,25 @@ impl Renderer {
 
     /// Write a pixel to the framebuffer with alpha compare and blending.
     /// `shade_alpha` is the raw interpolated vertex alpha (for blender A_SEL=2).
-    fn write_pixel(&mut self, rdram: &mut [u8], x: i32, y: i32, color: [u8; 4], shade_alpha: u8) {
+    /// Returns true when the color buffer is updated.
+    fn write_pixel(&mut self, rdram: &mut [u8], x: i32, y: i32, color: [u8; 4], shade_alpha: u8) -> bool {
+        // Fully transparent texels should not emit color/depth.
+        if color[3] == 0 {
+            return false;
+        }
+
         // CVG_X_ALPHA (bit 12): coverage × alpha — if alpha is 0, pixel is fully transparent
         // This is how the N64 handles texture cutout (e.g., tree leaves, fences)
         let cvg_x_alpha = self.othermode_l & (1 << 12) != 0;
         if cvg_x_alpha && color[3] == 0 {
-            return;
+            return false;
         }
 
         // Alpha compare: othermode_l bits 0-1
         // 0 = none, 1 = threshold compare, 2/3 = dither
         let alpha_compare = self.othermode_l & 0x3;
         if alpha_compare == 1 && color[3] < self.blend_color[3] {
-            return; // Fail alpha threshold test
+            return false; // Fail alpha threshold test
         }
 
         // Blender: FORCE_BL (bit 14) forces the blender to execute
@@ -1503,21 +1509,23 @@ impl Renderer {
         match self.color_image_size {
             2 => {
                 let offset = addr + ((y * width + x) as usize) * 2;
-                if offset + 1 >= rdram.len() { return; }
+                if offset + 1 >= rdram.len() { return false; }
                 let pixel = pack_rgba5551(final_color[0], final_color[1], final_color[2], final_color[3]);
                 let bytes = pixel.to_be_bytes();
                 rdram[offset] = bytes[0];
                 rdram[offset + 1] = bytes[1];
+                true
             }
             3 => {
                 let offset = addr + ((y * width + x) as usize) * 4;
-                if offset + 3 >= rdram.len() { return; }
+                if offset + 3 >= rdram.len() { return false; }
                 rdram[offset] = final_color[0];
                 rdram[offset + 1] = final_color[1];
                 rdram[offset + 2] = final_color[2];
                 rdram[offset + 3] = final_color[3];
+                true
             }
-            _ => {}
+            _ => false,
         }
     }
 
@@ -1530,13 +1538,15 @@ impl Renderer {
             self.vertex_buffer[i2],
         ];
 
-        const NEAR_W: f32 = 0.01;
+        // Clip against the homogeneous near plane: z + w >= 0.
+        // Using only w > 0 can drop/warp triangles at shallow camera angles.
+        const NEAR_PLANE_EPS: f32 = 1e-4;
 
         // Count how many vertices are in front of the near plane
         let inside = [
-            verts[0].clip_w > NEAR_W,
-            verts[1].clip_w > NEAR_W,
-            verts[2].clip_w > NEAR_W,
+            verts[0].clip_z + verts[0].clip_w >= NEAR_PLANE_EPS,
+            verts[1].clip_z + verts[1].clip_w >= NEAR_PLANE_EPS,
+            verts[2].clip_z + verts[2].clip_w >= NEAR_PLANE_EPS,
         ];
         let inside_count = inside.iter().filter(|&&b| b).count();
 
@@ -1549,7 +1559,7 @@ impl Renderer {
                 // All behind camera — cull entirely
             }
             _ => {
-                // Sutherland-Hodgman clip against near plane (W = NEAR_W)
+                // Sutherland-Hodgman clip against near plane (z + w = 0)
                 let mut output: [Vertex; 4] = [Vertex::default(); 4];
                 let mut count = 0;
 
@@ -1564,12 +1574,12 @@ impl Renderer {
                         count += 1;
                         if !next_in {
                             // Edge exits: emit intersection
-                            output[count] = clip_lerp(&curr, &next, NEAR_W, &self.viewport_scale, &self.viewport_trans);
+                            output[count] = clip_lerp_near(&curr, &next, &self.viewport_scale, &self.viewport_trans);
                             count += 1;
                         }
                     } else if next_in {
                         // Edge enters: emit intersection
-                        output[count] = clip_lerp(&curr, &next, NEAR_W, &self.viewport_scale, &self.viewport_trans);
+                        output[count] = clip_lerp_near(&curr, &next, &self.viewport_scale, &self.viewport_trans);
                         count += 1;
                     }
                 }
@@ -1695,23 +1705,23 @@ impl Renderer {
                 if w0 < 0.0 || w1 < 0.0 || w2 < 0.0 { continue; }
 
                 // Z-buffer depth test
+                let mut z_pass = true;
+                let mut z_offset = 0usize;
+                let mut z_value = 0u16;
                 if z_enabled {
                     let z = (w0 * v0.z + w1 * v1.z + w2 * v2.z).clamp(0.0, 0xFFFF as f32) as u16;
-                    let z_offset = z_addr + ((y * width + x) as usize) * 2;
+                    z_offset = z_addr + ((y * width + x) as usize) * 2;
+                    z_value = z;
                     if z_offset + 1 < rdram.len() {
                         let old_z = u16::from_be_bytes([rdram[z_offset], rdram[z_offset + 1]]);
                         // Z compare: lower Z = closer to camera
                         if z_cmp && z > old_z {
                             self.z_fail_count += 1;
-                            continue; // Fail depth test — farther than existing pixel
-                        }
-                        if z_upd {
-                            let z_bytes = z.to_be_bytes();
-                            rdram[z_offset] = z_bytes[0];
-                            rdram[z_offset + 1] = z_bytes[1];
+                            z_pass = false;
                         }
                     }
                 }
+                if !z_pass { continue; }
 
                 // Interpolate vertex color
                 let r = (w0 * v0.r as f32 + w1 * v1.r as f32 + w2 * v2.r as f32)
@@ -1748,7 +1758,12 @@ impl Renderer {
 
                 self.pixel_count += 1;
 
-                self.write_pixel(rdram, x, y, color, a);
+                let wrote_color = self.write_pixel(rdram, x, y, color, a);
+                if wrote_color && z_enabled && z_upd && z_offset + 1 < rdram.len() {
+                    let z_bytes = z_value.to_be_bytes();
+                    rdram[z_offset] = z_bytes[0];
+                    rdram[z_offset + 1] = z_bytes[1];
+                }
             }
         }
     }
@@ -1854,11 +1869,13 @@ fn read_u16(rdram: &[u8], offset: usize) -> u16 {
 ///   - When evaluated at all 3 edges, the signs tell us if p is inside
 ///   - The values give us barycentric coordinates (after dividing by total area)
 ///   - For a CCW triangle, positive means p is to the left of edge v0→v1
-/// Interpolate two vertices at the near-plane intersection (clip_w = near_w).
+/// Interpolate two vertices at the near-plane intersection (clip_z + clip_w = 0).
 /// Computes the parametric t where the edge crosses the plane, interpolates
 /// all attributes, and performs the perspective divide on the result.
-fn clip_lerp(a: &Vertex, b: &Vertex, near_w: f32, vp_scale: &[f32; 3], vp_trans: &[f32; 3]) -> Vertex {
-    let t = (a.clip_w - near_w) / (a.clip_w - b.clip_w);
+fn clip_lerp_near(a: &Vertex, b: &Vertex, vp_scale: &[f32; 3], vp_trans: &[f32; 3]) -> Vertex {
+    let fa = a.clip_z + a.clip_w;
+    let fb = b.clip_z + b.clip_w;
+    let t = fa / (fa - fb);
     let t = t.clamp(0.0, 1.0);
     let inv_t = 1.0 - t;
 
