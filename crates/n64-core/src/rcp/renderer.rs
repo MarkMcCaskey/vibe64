@@ -701,8 +701,20 @@ impl Renderer {
     fn sample_texel_point(&self, tile_idx: usize, si: i32, ti: i32) -> [u8; 4] {
         let tile = &self.tiles[tile_idx];
 
-        let si = self.wrap_coord(si, tile.mask_s, tile.cm_s);
-        let ti = self.wrap_coord(ti, tile.mask_t, tile.cm_t);
+        // Tile coordinates are relative to SETTILESIZE sl/tl (10.2 fixed-point).
+        let mut si = si - ((tile.sl as i32) >> 2);
+        let mut ti = ti - ((tile.tl as i32) >> 2);
+
+        // Apply tile coordinate shift from G_SETTILE.
+        si = Self::apply_tile_shift(si, tile.shift_s);
+        ti = Self::apply_tile_shift(ti, tile.shift_t);
+
+        // Tile span (for clamp when mask=0).
+        let span_s = (((tile.sh.saturating_sub(tile.sl)) >> 2) as i32 + 1).max(1);
+        let span_t = (((tile.th.saturating_sub(tile.tl)) >> 2) as i32 + 1).max(1);
+
+        let si = self.wrap_coord(si, tile.mask_s, tile.cm_s, span_s);
+        let ti = self.wrap_coord(ti, tile.mask_t, tile.cm_t, span_t);
 
         let tmem_base = (tile.tmem as usize) * 8;
         let line_bytes = (tile.line as usize) * 8;
@@ -789,14 +801,28 @@ impl Renderer {
         }
     }
 
+    fn apply_tile_shift(coord: i32, shift: u8) -> i32 {
+        if shift == 0 {
+            coord
+        } else if shift <= 10 {
+            coord >> shift
+        } else {
+            coord << (16 - shift)
+        }
+    }
+
     /// Wrap/clamp a texture coordinate.
-    fn wrap_coord(&self, coord: i32, mask: u8, cm: u8) -> i32 {
+    fn wrap_coord(&self, coord: i32, mask: u8, cm: u8, span: i32) -> i32 {
+        let clamp = cm & 1 != 0;
+        let mirror = cm & 2 != 0;
+
         if mask == 0 {
+            if clamp {
+                return coord.clamp(0, span - 1);
+            }
             return coord.max(0);
         }
         let size = 1i32 << mask;
-        let clamp = cm & 1 != 0;
-        let mirror = cm & 2 != 0;
 
         if clamp {
             coord.clamp(0, size - 1)
@@ -815,7 +841,14 @@ impl Renderer {
             let hi = self.tmem[offset];
             let lo = self.tmem[offset + 1];
             let val = ((hi as u16) << 8) | lo as u16;
-            unpack_rgba5551(val)
+            let textlut = (self.othermode_h >> 14) & 0x3;
+            if textlut == 0x3 {
+                // IA16 TLUT entry
+                [hi, hi, hi, lo]
+            } else {
+                // RGBA16 TLUT entry (default)
+                unpack_rgba5551(val)
+            }
         } else {
             [0, 0, 0, 0xFF]
         }

@@ -205,9 +205,9 @@ impl Interconnect {
         // Read OSTask fields from DMEM
         let task_type = self.rsp.read_dmem_u32(gbi::TASK_TYPE);
         let data_ptr_raw = self.rsp.read_dmem_u32(gbi::TASK_DATA_PTR);
-        // Only log non-audio tasks or periodic audio tasks
-        if task_type != gbi::M_AUDTASK || self.rsp.start_count <= 5 || self.rsp.start_count % 50 == 0 {
-            log::error!("RSP task #{}: type={} data_ptr={:#010X} flags={:#X}",
+        // Keep task logging quiet by default; use debug for diagnostics.
+        if task_type != gbi::M_AUDTASK || self.rsp.start_count <= 5 || self.rsp.start_count % 200 == 0 {
+            log::debug!("RSP task #{}: type={} data_ptr={:#010X} flags={:#X}",
                 self.rsp.start_count, task_type, data_ptr_raw,
                 self.rsp.read_dmem_u32(gbi::TASK_FLAGS));
         }
@@ -237,20 +237,22 @@ impl Interconnect {
                 _ => data_ptr & 0x00FF_FFFF,
             };
 
-            // Dump first 60 display list commands for debugging
-            let rdram = self.rdram.data();
-            log::error!("GFX DL at phys {:#010X}, ucode={:?}, first 60 cmds:", phys_addr, self.ucode);
-            for i in 0..60 {
-                let off = phys_addr as usize + i * 8;
-                if off + 8 <= rdram.len() {
-                    let w0 = u32::from_be_bytes([rdram[off], rdram[off+1], rdram[off+2], rdram[off+3]]);
-                    let w1 = u32::from_be_bytes([rdram[off+4], rdram[off+5], rdram[off+6], rdram[off+7]]);
-                    let cmd = w0 >> 24;
-                    if cmd == 0xB8 { // G_ENDDL
-                        log::error!("  DL[{:2}]: {:#010X} {:#010X} (G_ENDDL)", i, w0, w1);
-                        break;
+            // Optional display-list dump for targeted debugging.
+            if std::env::var_os("N64_DUMP_GFX_DL").is_some() {
+                let rdram = self.rdram.data();
+                log::debug!("GFX DL at phys {:#010X}, ucode={:?}, first 60 cmds:", phys_addr, self.ucode);
+                for i in 0..60 {
+                    let off = phys_addr as usize + i * 8;
+                    if off + 8 <= rdram.len() {
+                        let w0 = u32::from_be_bytes([rdram[off], rdram[off+1], rdram[off+2], rdram[off+3]]);
+                        let w1 = u32::from_be_bytes([rdram[off+4], rdram[off+5], rdram[off+6], rdram[off+7]]);
+                        let cmd = w0 >> 24;
+                        if cmd == 0xB8 { // G_ENDDL
+                            log::debug!("  DL[{:2}]: {:#010X} {:#010X} (G_ENDDL)", i, w0, w1);
+                            break;
+                        }
+                        log::debug!("  DL[{:2}]: {:#010X} {:#010X} (cmd={:#04X})", i, w0, w1, cmd);
                     }
-                    log::error!("  DL[{:2}]: {:#010X} {:#010X} (cmd={:#04X})", i, w0, w1, cmd);
                 }
             }
 

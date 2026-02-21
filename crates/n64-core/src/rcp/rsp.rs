@@ -200,7 +200,7 @@ impl Rsp {
         // by the bus only for GFX tasks (after display list processing),
         // matching real hardware where DP fires when the RDP finishes.
         if was_halted && (self.status & 0x01 == 0) {
-            log::error!("RSP auto-complete #{}: write={:#010X} → status={:#010X}",
+            log::debug!("RSP auto-complete #{}: write={:#010X} → status={:#010X}",
                 self.start_count + 1, val, self.status | 0x01 | 0x02 | (1 << 7) | (1 << 8));
             self.status |= 0x01 | 0x02 | (1 << 7) | (1 << 8); // halt + broke + sig0 + sig1
             mi.set_interrupt(super::mi::MiInterrupt::SP);
@@ -211,7 +211,7 @@ impl Rsp {
             return true;
         } else if val & 0x01 != 0 {
             // Tried to clear halt but didn't trigger auto-complete
-            log::error!("RSP clear-halt NO-OP: was_halted={} status={:#010X} write={:#010X}",
+            log::debug!("RSP clear-halt NO-OP: was_halted={} status={:#010X} write={:#010X}",
                 was_halted, self.status, val);
         }
         if self.status_log.len() < 100 {
