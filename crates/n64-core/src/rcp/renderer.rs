@@ -722,7 +722,8 @@ impl Renderer {
         match tile.size {
             0 => {
                 // 4-bit (CI4 or I4)
-                let byte_offset = tmem_base + ti as usize * line_bytes + (si as usize / 2);
+                let mut byte_offset = tmem_base + ti as usize * line_bytes + (si as usize / 2);
+                byte_offset = Self::swizzle_tmem_addr(byte_offset, ti);
                 if byte_offset < 4096 {
                     let byte = self.tmem[byte_offset];
                     let nibble = if si & 1 == 0 { byte >> 4 } else { byte & 0x0F };
@@ -746,7 +747,8 @@ impl Renderer {
             }
             1 => {
                 // 8-bit
-                let byte_offset = tmem_base + ti as usize * line_bytes + si as usize;
+                let mut byte_offset = tmem_base + ti as usize * line_bytes + si as usize;
+                byte_offset = Self::swizzle_tmem_addr(byte_offset, ti);
                 if byte_offset < 4096 {
                     let val = self.tmem[byte_offset];
                     match tile.format {
@@ -766,7 +768,8 @@ impl Renderer {
             }
             2 => {
                 // 16-bit
-                let byte_offset = tmem_base + ti as usize * line_bytes + si as usize * 2;
+                let mut byte_offset = tmem_base + ti as usize * line_bytes + si as usize * 2;
+                byte_offset = Self::swizzle_tmem_addr(byte_offset, ti);
                 if byte_offset + 1 < 4096 {
                     let hi = self.tmem[byte_offset];
                     let lo = self.tmem[byte_offset + 1];
@@ -785,7 +788,8 @@ impl Renderer {
             }
             3 => {
                 // 32-bit RGBA
-                let byte_offset = tmem_base + ti as usize * line_bytes + si as usize * 4;
+                let mut byte_offset = tmem_base + ti as usize * line_bytes + si as usize * 4;
+                byte_offset = Self::swizzle_tmem_addr(byte_offset, ti);
                 if byte_offset + 3 < 4096 {
                     [
                         self.tmem[byte_offset],
@@ -809,6 +813,11 @@ impl Renderer {
         } else {
             coord << (16 - shift)
         }
+    }
+
+    fn swizzle_tmem_addr(addr: usize, ti: i32) -> usize {
+        // TMEM swaps 32-bit halves on odd T rows.
+        if (ti & 1) != 0 { addr ^ 0x4 } else { addr }
     }
 
     /// Wrap/clamp a texture coordinate.
