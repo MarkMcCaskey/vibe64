@@ -113,7 +113,7 @@ impl GamepadInput {
         }
 
         out.stick_x = axis_to_n64(g.value(Axis::LeftStickX), self.deadzone);
-        out.stick_y = axis_to_n64(-g.value(Axis::LeftStickY), self.deadzone);
+        out.stick_y = axis_to_n64(g.value(Axis::LeftStickY), self.deadzone);
 
         out
     }
