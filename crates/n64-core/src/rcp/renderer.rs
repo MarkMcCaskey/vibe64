@@ -464,38 +464,87 @@ impl Renderer {
         let sh = ((w1 >> 12) & 0xFFF) >> 2;
         let th = (w1 & 0xFFF) >> 2;
 
+        if sh < sl || th < tl {
+            return;
+        }
+
         let tile = &self.tiles[tile_idx];
         let tmem_offset = (tile.tmem as usize) * 8;
+        let row_texels = (sh - sl + 1) as usize;
+        // LOADTILE commonly uses G_TX_LOADTILE whose line field is 0.
+        // In that case rows are packed by transfer width.
+        let line_bytes = if tile.line != 0 {
+            (tile.line as usize) * 8
+        } else {
+            match tile.size {
+                0 => (row_texels + 1) / 2, // 4bpp
+                1 => row_texels,           // 8bpp
+                2 => row_texels * 2,       // 16bpp
+                3 => row_texels * 4,       // 32bpp
+                _ => row_texels,
+            }
+        };
         let src_width = self.texture_image_width as usize;
+        let src_base = self.texture_image_addr as usize;
 
-        let bpp = match self.texture_image_size {
-            0 => 1, // 4-bit, handled specially
+        if tile.size == 0 {
+            // 4-bit path: preserve nibble alignment, use tile.line stride, and
+            // keep nibble packing intact.
+            for t in tl..=th {
+                let dy = (t - tl) as usize;
+                for s in sl..=sh {
+                    let dx = (s - sl) as usize;
+
+                    let src_bit_idx = t as usize * src_width + s as usize;
+                    let src_byte = (src_base + (src_bit_idx >> 1)) & (rdram.len() - 1);
+                    let src_nibble = if (src_bit_idx & 1) == 0 {
+                        rdram[src_byte] >> 4
+                    } else {
+                        rdram[src_byte] & 0x0F
+                    };
+
+                    let dst = tmem_offset + dy * line_bytes + (dx >> 1);
+                    if dst < 4096 {
+                        let old = self.tmem[dst];
+                        self.tmem[dst] = if (dx & 1) == 0 {
+                            (src_nibble << 4) | (old & 0x0F)
+                        } else {
+                            (old & 0xF0) | src_nibble
+                        };
+                    }
+                }
+            }
+            return;
+        }
+
+        let bpp = match tile.size {
             1 => 1,
             2 => 2,
             3 => 4,
-            _ => 2,
+            _ => 1,
         };
 
-        let src_base = self.texture_image_addr as usize;
-        let mut tmem_pos = tmem_offset;
-
         for t in tl..=th {
+            let dy = (t - tl) as usize;
             for s in sl..=sh {
-                let src_offset = if self.texture_image_size == 0 {
-                    (t as usize * src_width + s as usize) / 2
-                } else {
-                    (t as usize * src_width + s as usize) * bpp
+                let dx = (s - sl) as usize;
+                let src_offset = match self.texture_image_size {
+                    0 => (t as usize * src_width + s as usize) >> 1,
+                    1 => t as usize * src_width + s as usize,
+                    2 => (t as usize * src_width + s as usize) * 2,
+                    3 => (t as usize * src_width + s as usize) * 4,
+                    _ => t as usize * src_width + s as usize,
                 };
                 let src_addr = (src_base + src_offset) & (rdram.len() - 1);
+                let dst_base = tmem_offset + dy * line_bytes + dx * bpp;
                 for b in 0..bpp {
-                    if tmem_pos < 4096 && src_addr + b < rdram.len() {
-                        self.tmem[tmem_pos] = rdram[src_addr + b];
+                    let dst = dst_base + b;
+                    if dst < 4096 && src_addr + b < rdram.len() {
+                        self.tmem[dst] = rdram[src_addr + b];
                     }
-                    tmem_pos += 1;
                 }
             }
         }
-
     }
 
     /// G_LOADTLUT: Load texture lookup table (palette) into TMEM.
@@ -658,6 +707,17 @@ impl Renderer {
     /// S and T are in 10.5 fixed-point.
     /// Checks othermode_h text_filt bits to select point or bilinear.
     fn sample_texture(&self, tile_idx: usize, s: i32, t: i32, _cycle: u8) -> [u8; 4] {
+        let tile = &self.tiles[tile_idx];
+
+        // Tile origin is 10.2 fixed-point; convert to 10.5 so sub-texel
+        // animation offsets (used heavily by OoT UI/text) are preserved.
+        let mut s = s - ((tile.sl as i32) << 3);
+        let mut t = t - ((tile.tl as i32) << 3);
+
+        // Apply G_SETTILE shift in fixed-point before integer/fraction split.
+        s = Self::apply_tile_shift_fixed(s, tile.shift_s);
+        t = Self::apply_tile_shift_fixed(t, tile.shift_t);
+
         // Text filter mode: othermode_h bits 13-12
         // 0 = point, 2 = bilinear, 3 = average (treat as bilinear)
         let text_filt = (self.othermode_h >> 12) & 0x3;
@@ -700,14 +760,6 @@ impl Renderer {
     /// Point-sample a single texel at integer coordinates.
     fn sample_texel_point(&self, tile_idx: usize, si: i32, ti: i32) -> [u8; 4] {
         let tile = &self.tiles[tile_idx];
-
-        // Tile coordinates are relative to SETTILESIZE sl/tl (10.2 fixed-point).
-        let mut si = si - ((tile.sl as i32) >> 2);
-        let mut ti = ti - ((tile.tl as i32) >> 2);
-
-        // Apply tile coordinate shift from G_SETTILE.
-        si = Self::apply_tile_shift(si, tile.shift_s);
-        ti = Self::apply_tile_shift(ti, tile.shift_t);
 
         // Tile span (for clamp when mask=0).
         let span_s = (((tile.sh.saturating_sub(tile.sl)) >> 2) as i32 + 1).max(1);
@@ -805,7 +857,12 @@ impl Renderer {
         }
     }
 
-    fn apply_tile_shift(coord: i32, shift: u8) -> i32 {
+    fn swizzle_tmem_addr(addr: usize, ti: i32) -> usize {
+        // TMEM swaps 32-bit halves on odd T rows.
+        if (ti & 1) != 0 { addr ^ 0x4 } else { addr }
+    }
+
+    fn apply_tile_shift_fixed(coord: i32, shift: u8) -> i32 {
         if shift == 0 {
             coord
         } else if shift <= 10 {
@@ -813,11 +870,6 @@ impl Renderer {
         } else {
             coord << (16 - shift)
         }
-    }
-
-    fn swizzle_tmem_addr(addr: usize, ti: i32) -> usize {
-        // TMEM swaps 32-bit halves on odd T rows.
-        if (ti & 1) != 0 { addr ^ 0x4 } else { addr }
     }
 
     /// Wrap/clamp a texture coordinate.
@@ -942,11 +994,11 @@ impl Renderer {
 
         let mut result = [0u8; 4];
         for i in 0..3 {
-            let v = (a_rgb[i] as i16 - b_rgb[i] as i16) * c_rgb[i] as i16 / 256
-                + d_rgb[i] as i16;
+            let v = ((a_rgb[i] as i32 - b_rgb[i] as i32) * c_rgb[i] as i32) / 256
+                + d_rgb[i] as i32;
             result[i] = v.clamp(0, 255) as u8;
         }
-        let v = (a_a as i16 - b_a as i16) * c_a as i16 / 256 + d_a as i16;
+        let v = ((a_a as i32 - b_a as i32) * c_a as i32) / 256 + d_a as i32;
         result[3] = v.clamp(0, 255) as u8;
         result
     }
