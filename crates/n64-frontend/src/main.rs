@@ -17,6 +17,11 @@ use n64_core::memory::pif::buttons;
 const N64_WIDTH: u32 = 320;
 const N64_HEIGHT: u32 = 240;
 const SCALE: u32 = 2;
+const SPEED_STEP_PERCENT: u32 = 25;
+const MIN_SPEED_PERCENT: u32 = 25;
+const MAX_SPEED_PERCENT: u32 = 400;
+const DEFAULT_SPEED_PERCENT: u32 = 100;
+const SPEED_MESSAGE_MS: u64 = 1400;
 
 struct App {
     n64: n64_core::N64,
@@ -31,6 +36,38 @@ struct App {
     arrow_right: bool,
     /// Current save state slot (0-9)
     save_slot: u8,
+    /// Emulation speed in percent (25..400, step 25).
+    speed_percent: u32,
+    /// Fractional frame budget for sub-1x and non-integer speed multipliers.
+    speed_frame_budget: f32,
+    /// If set and not expired, draw a temporary on-screen speed message.
+    speed_message_until: Option<std::time::Instant>,
+}
+
+impl App {
+    fn speed_multiplier(&self) -> f32 {
+        self.speed_percent as f32 / 100.0
+    }
+
+    fn bump_speed(&mut self, delta_percent: i32) {
+        let next = (self.speed_percent as i32 + delta_percent)
+            .clamp(MIN_SPEED_PERCENT as i32, MAX_SPEED_PERCENT as i32) as u32;
+        if next != self.speed_percent {
+            self.speed_percent = next;
+        }
+        self.speed_message_until = Some(
+            std::time::Instant::now() + std::time::Duration::from_millis(SPEED_MESSAGE_MS),
+        );
+        eprintln!("Emulation speed: {}%", self.speed_percent);
+    }
+
+    fn reset_speed(&mut self) {
+        self.speed_percent = DEFAULT_SPEED_PERCENT;
+        self.speed_message_until = Some(
+            std::time::Instant::now() + std::time::Duration::from_millis(SPEED_MESSAGE_MS),
+        );
+        eprintln!("Emulation speed: {}%", self.speed_percent);
+    }
 }
 
 impl ApplicationHandler for App {
@@ -155,6 +192,17 @@ impl ApplicationHandler for App {
                                 self.save_slot = if self.save_slot == 0 { 9 } else { self.save_slot - 1 };
                                 eprintln!("Save slot: {}", self.save_slot);
                             }
+                            // Speed controls for debugging:
+                            // '-' slower, '=' faster, '0' reset to 100%.
+                            KeyCode::Minus | KeyCode::NumpadSubtract => {
+                                self.bump_speed(-(SPEED_STEP_PERCENT as i32));
+                            }
+                            KeyCode::Equal | KeyCode::NumpadAdd => {
+                                self.bump_speed(SPEED_STEP_PERCENT as i32);
+                            }
+                            KeyCode::Digit0 | KeyCode::Numpad0 => {
+                                self.reset_speed();
+                            }
                             _ => {}
                         }
                     }
@@ -165,7 +213,15 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::RedrawRequested => {
-                self.n64.run_frame();
+                // Run a variable number of emulated frames per display refresh.
+                // This supports speed control in 25% increments, including <1x.
+                self.speed_frame_budget += self.speed_multiplier();
+                let frames_to_run = self.speed_frame_budget.floor() as u32;
+                self.speed_frame_budget -= frames_to_run as f32;
+
+                for _ in 0..frames_to_run {
+                    self.n64.run_frame();
+                }
 
                 // Feed audio samples to output device
                 if let Some(audio) = &self.audio {
@@ -183,16 +239,22 @@ impl ApplicationHandler for App {
                 let pos = self.n64.debug.fps_write_pos;
                 self.n64.debug.fps_samples[pos] = dt;
                 self.n64.debug.fps_write_pos = (pos + 1) % 60;
-                self.n64.debug.frame_count += 1;
+                let old_frame_count = self.n64.debug.frame_count;
+                self.n64.debug.frame_count += frames_to_run as u64;
 
                 // Periodic EEPROM save (every ~5 seconds)
-                if self.n64.debug.frame_count % 300 == 0 {
+                if frames_to_run > 0 && (old_frame_count / 300 != self.n64.debug.frame_count / 300) {
                     self.n64.save_eeprom(); self.n64.save_flash(); self.n64.save_sram();
                 }
 
                 if let Some(pixels) = &mut self.pixels {
-                    blit_framebuffer(&self.n64, pixels.frame_mut());
-                    debug_overlay::draw_overlays(pixels.frame_mut(), &mut self.n64.debug, &self.n64.bus);
+                    let frame = pixels.frame_mut();
+                    blit_framebuffer(&self.n64, frame);
+                    debug_overlay::draw_overlays(frame, &mut self.n64.debug, &self.n64.bus);
+                    if self.speed_message_until.is_some_and(|t| now <= t) {
+                        let msg = format!("Speed: {}%", self.speed_percent);
+                        debug_overlay::draw_status_message(frame, &msg);
+                    }
                     if let Err(e) = pixels.render() {
                         log::error!("Render error: {}", e);
                         event_loop.exit();
@@ -1915,6 +1977,9 @@ fn main() {
             last_frame_time: std::time::Instant::now(),
             arrow_up: false, arrow_down: false, arrow_left: false, arrow_right: false,
             save_slot: 0,
+            speed_percent: DEFAULT_SPEED_PERCENT,
+            speed_frame_budget: 0.0,
+            speed_message_until: None,
         };
         event_loop.run_app(&mut app).expect("run event loop");
     }

@@ -598,6 +598,17 @@ pub fn scan_os_threads(bus: &Interconnect) -> Vec<n64_core::debug::ThreadInfo> {
 // Public API
 // ═══════════════════════════════════════════════════════════
 
+/// Draw a centered temporary status message near the top of the screen.
+pub fn draw_status_message(buf: &mut [u8], text: &str) {
+    let text_w = text.len() * FONT_CHAR_W;
+    let box_w = (text_w + 12).min(WIDTH.saturating_sub(8));
+    let box_h = FONT_CHAR_H + 6;
+    let x = (WIDTH.saturating_sub(box_w)) / 2;
+    let y = 8;
+    draw_rect_bg(buf, x, y, box_w, box_h);
+    draw_text(buf, x + 6, y + 2, text, 0xFF, 0xFF, 0xFF);
+}
+
 /// Main entry: draw all active debug overlays onto the pixel buffer.
 pub fn draw_overlays(buf: &mut [u8], debug: &mut DebugState, bus: &Interconnect) {
     let flags = &debug.flags;
