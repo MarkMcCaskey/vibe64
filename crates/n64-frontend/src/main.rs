@@ -458,7 +458,10 @@ fn main() {
     };
 
     if use_diag {
-        let total_steps = 100_000_000u64;
+        let total_steps = std::env::var("N64_DIAG_STEPS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(100_000_000u64);
         eprintln!("=== Boot diagnostic ({}M steps) ===", total_steps / 1_000_000);
 
         // PC histogram: sample every 1024 steps to keep overhead low

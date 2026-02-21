@@ -878,10 +878,7 @@ impl Renderer {
         let mirror = cm & 2 != 0;
 
         if mask == 0 {
-            if clamp {
-                return coord.clamp(0, span - 1);
-            }
-            return coord.max(0);
+            return coord.clamp(0, span - 1);
         }
         let size = 1i32 << mask;
 
