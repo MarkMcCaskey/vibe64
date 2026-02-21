@@ -8,6 +8,14 @@ use std::sync::{Arc, Mutex};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
+fn f32_to_i16(v: f32) -> i16 {
+    (v.clamp(-1.0, 1.0) * i16::MAX as f32) as i16
+}
+
+fn f32_to_u16(v: f32) -> u16 {
+    (((v.clamp(-1.0, 1.0) + 1.0) * 0.5) * u16::MAX as f32) as u16
+}
+
 pub struct AudioOutput {
     _stream: cpal::Stream,
     buffer: Arc<Mutex<VecDeque<f32>>>,
@@ -26,45 +34,101 @@ impl AudioOutput {
         let host = cpal::default_host();
         let device = host.default_output_device()?;
 
-        let config = device.default_output_config().ok()?;
-        let host_sample_rate = config.sample_rate().0;
-        let host_channels = config.channels();
+        let supported = device.default_output_config().ok()?;
+        let sample_format = supported.sample_format();
+        let host_sample_rate = supported.sample_rate().0;
+        let host_channels = supported.channels();
+        let config: cpal::StreamConfig = supported.into();
 
         log::info!(
-            "Audio: {} @ {} Hz, {} ch",
+            "Audio: {} @ {} Hz, {} ch ({:?})",
             device.name().unwrap_or_default(),
             host_sample_rate,
-            host_channels
+            host_channels,
+            sample_format,
         );
 
         let buffer: Arc<Mutex<VecDeque<f32>>> =
             Arc::new(Mutex::new(VecDeque::with_capacity(65536)));
-        let buf_ref = buffer.clone();
-
-        let channels = host_channels as usize;
-        let stream = device
-            .build_output_stream(
-                &config.into(),
-                move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                    let mut buf = buf_ref.lock().unwrap();
-                    for frame in data.chunks_mut(channels) {
-                        // Our buffer stores stereo f32 pairs (L, R)
-                        let left = buf.pop_front().unwrap_or(0.0);
-                        let right = buf.pop_front().unwrap_or(0.0);
-                        frame[0] = left;
-                        if channels > 1 {
-                            frame[1] = right;
-                        }
-                        // Fill extra channels with silence
-                        for ch in frame.iter_mut().skip(2) {
-                            *ch = 0.0;
-                        }
-                    }
-                },
-                |err| log::error!("Audio stream error: {}", err),
-                None,
-            )
-            .ok()?;
+        let channels = config.channels as usize;
+        let stream = match sample_format {
+            cpal::SampleFormat::F32 => {
+                let buf_ref = buffer.clone();
+                device
+                    .build_output_stream(
+                        &config,
+                        move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                            let mut buf = buf_ref.lock().unwrap();
+                            for frame in data.chunks_mut(channels) {
+                                let left = buf.pop_front().unwrap_or(0.0);
+                                let right = buf.pop_front().unwrap_or(0.0);
+                                frame[0] = left;
+                                if channels > 1 {
+                                    frame[1] = right;
+                                }
+                                for ch in frame.iter_mut().skip(2) {
+                                    *ch = 0.0;
+                                }
+                            }
+                        },
+                        |err| log::error!("Audio stream error: {}", err),
+                        None,
+                    )
+                    .ok()?
+            }
+            cpal::SampleFormat::I16 => {
+                let buf_ref = buffer.clone();
+                device
+                    .build_output_stream(
+                        &config,
+                        move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
+                            let mut buf = buf_ref.lock().unwrap();
+                            for frame in data.chunks_mut(channels) {
+                                let left = buf.pop_front().unwrap_or(0.0);
+                                let right = buf.pop_front().unwrap_or(0.0);
+                                frame[0] = f32_to_i16(left);
+                                if channels > 1 {
+                                    frame[1] = f32_to_i16(right);
+                                }
+                                for ch in frame.iter_mut().skip(2) {
+                                    *ch = 0;
+                                }
+                            }
+                        },
+                        |err| log::error!("Audio stream error: {}", err),
+                        None,
+                    )
+                    .ok()?
+            }
+            cpal::SampleFormat::U16 => {
+                let buf_ref = buffer.clone();
+                device
+                    .build_output_stream(
+                        &config,
+                        move |data: &mut [u16], _: &cpal::OutputCallbackInfo| {
+                            let mut buf = buf_ref.lock().unwrap();
+                            for frame in data.chunks_mut(channels) {
+                                let left = buf.pop_front().unwrap_or(0.0);
+                                let right = buf.pop_front().unwrap_or(0.0);
+                                frame[0] = f32_to_u16(left);
+                                if channels > 1 {
+                                    frame[1] = f32_to_u16(right);
+                                }
+                                for ch in frame.iter_mut().skip(2) {
+                                    *ch = u16::MIN;
+                                }
+                            }
+                        },
+                        |err| log::error!("Audio stream error: {}", err),
+                        None,
+                    )
+                    .ok()?
+            }
+            _ => {
+                log::error!("Audio: unsupported host sample format {:?}", sample_format);
+                return None;
+            }
+        };
 
         stream.play().ok()?;
 
@@ -87,8 +151,6 @@ impl AudioOutput {
             return;
         }
 
-        let mut buf = self.buffer.lock().unwrap();
-
         // Resample from n64_rate to host_sample_rate with phase continuity
         // across calls, to avoid zipper noise at DMA boundaries.
         let in_pairs = samples.len() / 2;
@@ -103,6 +165,7 @@ impl AudioOutput {
 
         let has_prev = self.prev_pair.is_some();
         let src_len = in_pairs + if has_prev { 1 } else { 0 };
+        let mut produced: Vec<f32> = Vec::with_capacity(in_pairs * 4);
         if src_len >= 2 {
             let prev = self.prev_pair.unwrap_or([0.0, 0.0]);
             let sample_pair = |idx: usize| -> [f32; 2] {
@@ -130,8 +193,8 @@ impl AudioOutput {
                 let frac = (src_pos - idx as f64) as f32;
                 let s0 = sample_pair(idx);
                 let s1 = sample_pair(idx + 1);
-                buf.push_back(s0[0] + (s1[0] - s0[0]) * frac);
-                buf.push_back(s0[1] + (s1[1] - s0[1]) * frac);
+                produced.push(s0[0] + (s1[0] - s0[0]) * frac);
+                produced.push(s0[1] + (s1[1] - s0[1]) * frac);
                 src_pos += step;
             }
 
@@ -147,6 +210,9 @@ impl AudioOutput {
             samples[last * 2] as f32 / 32768.0,
             samples[last * 2 + 1] as f32 / 32768.0,
         ]);
+
+        let mut buf = self.buffer.lock().unwrap();
+        buf.extend(produced);
 
         // Cap buffer at ~0.5 seconds to prevent growing unbounded.
         // If we're producing faster than consuming, drop oldest samples.

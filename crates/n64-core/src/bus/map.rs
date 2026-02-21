@@ -192,8 +192,29 @@ impl Interconnect {
     }
 
     pub fn tick_ai_dma(&mut self, elapsed: u64) {
-        if self.ai.tick(elapsed) {
-            self.mi.set_interrupt(crate::rcp::mi::MiInterrupt::AI);
+        use crate::rcp::ai::AiTickResult;
+        match self.ai.tick(elapsed) {
+            AiTickResult::None => {}
+            AiTickResult::BufferFinished { next_dma } => {
+                if let Some((dram_addr, len)) = next_dma {
+                    self.capture_ai_samples(dram_addr, len);
+                }
+                self.mi.set_interrupt(crate::rcp::mi::MiInterrupt::AI);
+            }
+        }
+    }
+
+    fn capture_ai_samples(&mut self, dram_addr: u32, len: u32) {
+        // N64 audio: 16-bit signed PCM, big-endian, stereo interleaved.
+        let base = dram_addr as usize;
+        let sample_count = len as usize / 2; // 2 bytes per i16
+        let rdram = self.rdram.data();
+        for i in 0..sample_count {
+            let off = base + i * 2;
+            if off + 1 < rdram.len() {
+                let sample = i16::from_be_bytes([rdram[off], rdram[off + 1]]);
+                self.audio_samples.push(sample);
+            }
         }
     }
 
@@ -565,20 +586,7 @@ impl Bus for Interconnect {
                         self.mi.clear_interrupt(crate::rcp::mi::MiInterrupt::AI);
                     }
                     AiRegWrite::DmaStarted { dram_addr, len } => {
-                        // Capture audio samples from RDRAM for frontend playback.
-                        // N64 audio: 16-bit signed PCM, big-endian, stereo interleaved.
-                        let base = dram_addr as usize;
-                        let sample_count = len as usize / 2; // 2 bytes per i16
-                        for i in 0..sample_count {
-                            let off = base + i * 2;
-                            if off + 1 < self.rdram.data().len() {
-                                let sample = i16::from_be_bytes([
-                                    self.rdram.data()[off],
-                                    self.rdram.data()[off + 1],
-                                ]);
-                                self.audio_samples.push(sample);
-                            }
-                        }
+                        self.capture_ai_samples(dram_addr, len);
                     }
                     AiRegWrite::None => {}
                 }

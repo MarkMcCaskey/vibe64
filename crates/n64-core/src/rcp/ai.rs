@@ -8,6 +8,7 @@
 /// An entry in the AI's 2-deep DMA FIFO.
 #[derive(Clone, Copy, Default)]
 struct AiFifoEntry {
+    dram_addr: u32,
     len: u32,
     cycles: u64,
 }
@@ -38,6 +39,13 @@ pub enum AiRegWrite {
         dram_addr: u32,
         len: u32,
     },
+}
+
+/// Return value from ticking AI DMA.
+pub enum AiTickResult {
+    None,
+    /// Current DMA finished; optional tuple is next DMA that auto-started.
+    BufferFinished { next_dma: Option<(u32, u32)> },
 }
 
 impl Ai {
@@ -113,7 +121,9 @@ impl Ai {
                     }
 
                     let cycles = self.calc_dma_cycles(self.len);
+                    let started_now = self.fifo_count == 0;
                     let entry = AiFifoEntry {
+                        dram_addr: self.dram_addr,
                         len: self.len,
                         cycles,
                     };
@@ -123,15 +133,17 @@ impl Ai {
                     self.fifo_count += 1;
 
                     // If this is the first entry, start playing immediately
-                    if self.fifo_count == 1 {
+                    if started_now {
                         self.dma_cycles = cycles;
                     }
 
                     self.dma_count += 1;
-                    return AiRegWrite::DmaStarted {
-                        dram_addr: self.dram_addr,
-                        len: self.len,
-                    };
+                    if started_now {
+                        return AiRegWrite::DmaStarted {
+                            dram_addr: self.dram_addr,
+                            len: self.len,
+                        };
+                    }
                 }
                 AiRegWrite::None
             }
@@ -155,11 +167,10 @@ impl Ai {
         }
     }
 
-    /// Tick the AI DMA timer. Returns true if a buffer just finished
-    /// (caller should fire MI AI interrupt).
-    pub fn tick(&mut self, elapsed: u64) -> bool {
+    /// Tick the AI DMA timer.
+    pub fn tick(&mut self, elapsed: u64) -> AiTickResult {
         if self.control & 1 == 0 || self.fifo_count == 0 {
-            return false;
+            return AiTickResult::None;
         }
         if elapsed >= self.dma_cycles {
             // Current buffer finished
@@ -171,13 +182,16 @@ impl Ai {
             // Auto-start next buffer if queued
             if self.fifo_count > 0 {
                 self.dma_cycles = self.fifo[0].cycles;
+                return AiTickResult::BufferFinished {
+                    next_dma: Some((self.fifo[0].dram_addr, self.fifo[0].len)),
+                };
             } else {
                 self.dma_cycles = 0;
             }
-            return true; // fire AI interrupt
+            return AiTickResult::BufferFinished { next_dma: None };
         }
         self.dma_cycles -= elapsed;
-        false
+        AiTickResult::None
     }
 
     /// Check if DMA is currently active (for backwards compatibility).
@@ -188,7 +202,7 @@ impl Ai {
 
 #[cfg(test)]
 mod tests {
-    use super::{Ai, AiRegWrite};
+    use super::{Ai, AiRegWrite, AiTickResult};
 
     #[test]
     fn status_bits_use_busy_and_full_flags() {
@@ -206,10 +220,7 @@ mod tests {
         assert_eq!(status_one & (1 << 31), 0, "full should be clear");
 
         ai.write_u32(0x00, 0x0000_2000);
-        assert!(matches!(
-            ai.write_u32(0x04, 0x0000_0200),
-            AiRegWrite::DmaStarted { .. }
-        ));
+        assert!(matches!(ai.write_u32(0x04, 0x0000_0200), AiRegWrite::None));
         let status_two = ai.read_u32(0x0C);
         assert_ne!(status_two & (1 << 30), 0, "busy should stay set");
         assert_ne!(status_two & (1 << 31), 0, "full should be set");
@@ -243,5 +254,29 @@ mod tests {
 
         assert!(matches!(ai.write_u32(0x04, 0x0000_0200), AiRegWrite::None));
         assert_eq!(ai.read_u32(0x0C), 0);
+    }
+
+    #[test]
+    fn queued_dma_starts_when_previous_finishes() {
+        let mut ai = Ai::new();
+        ai.write_u32(0x08, 1); // AI_CONTROL enable
+        ai.write_u32(0x10, 0x80); // AI_DACRATE
+
+        ai.write_u32(0x00, 0x0000_5000);
+        assert!(matches!(
+            ai.write_u32(0x04, 0x0000_0200),
+            AiRegWrite::DmaStarted { .. }
+        ));
+
+        ai.write_u32(0x00, 0x0000_6000);
+        assert!(matches!(ai.write_u32(0x04, 0x0000_0300), AiRegWrite::None));
+
+        let elapsed = ai.dma_cycles + 1;
+        match ai.tick(elapsed) {
+            AiTickResult::BufferFinished { next_dma } => {
+                assert_eq!(next_dma, Some((0x0000_6000, 0x0000_0300)));
+            }
+            AiTickResult::None => panic!("expected buffer-finished tick result"),
+        }
     }
 }
