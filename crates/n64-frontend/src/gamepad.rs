@@ -67,7 +67,7 @@ impl GamepadInput {
         if g.is_pressed(Button::South) {
             out.buttons |= n64_buttons::A;
         }
-        if g.is_pressed(Button::East) {
+        if g.is_pressed(Button::West) {
             out.buttons |= n64_buttons::B;
         }
         if g.is_pressed(Button::Start) {
@@ -99,10 +99,10 @@ impl GamepadInput {
         // Right stick as C-buttons.
         let rs_x = g.value(Axis::RightStickX);
         let rs_y = g.value(Axis::RightStickY);
-        if rs_y <= -0.5 {
+        if rs_y >= 0.5 {
             out.buttons |= n64_buttons::C_UP;
         }
-        if rs_y >= 0.5 {
+        if rs_y <= -0.5 {
             out.buttons |= n64_buttons::C_DOWN;
         }
         if rs_x <= -0.5 {
