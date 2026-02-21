@@ -42,9 +42,6 @@ pub struct Interconnect {
     /// Audio sample buffer: 16-bit signed PCM, stereo interleaved (L,R,L,R...).
     /// Populated from RDRAM when AI DMA starts. Frontend drains each frame.
     pub audio_samples: Vec<i16>,
-    /// Fast-forward hint from the frontend: when true, skip expensive GFX task
-    /// display-list execution but still signal task completion interrupts.
-    pub skip_gfx_tasks: bool,
 }
 
 impl Interconnect {
@@ -70,7 +67,6 @@ impl Interconnect {
             ucode: crate::rcp::gbi::UcodeType::F3dex2,
             is_viewer_buf: [0u8; 512],
             audio_samples: Vec::with_capacity(16384),
-            skip_gfx_tasks: false,
         }
     }
 
@@ -265,79 +261,67 @@ impl Interconnect {
                 self.rsp.start_count, data_ptr, phys_addr
             );
 
-            let (cmd_count, tris_this_dl) = if self.skip_gfx_tasks {
-                // Fast-forward mode: skip heavy software RDP work to let CPU/clock
-                // time advance faster. We still raise DP interrupt below.
-                log::trace!(
-                    "Skipping GFX task #{} at {:#010X} (fast-forward)",
-                    self.rsp.start_count, phys_addr
-                );
-                (0usize, 0u32)
-            } else {
-                // Walk display list, rendering into RDRAM.
-                let rdram = self.rdram.data_mut();
-                let tris_before = self.renderer.tri_count;
-                self.renderer.task_nonblack_writes = 0;
-                self.renderer.task_total_writes = 0;
-                let cmd_count = match self.ucode {
-                    gbi::UcodeType::F3dex2 => {
-                        gbi::process_display_list(&mut self.renderer, rdram, phys_addr)
-                    }
-                    gbi::UcodeType::F3d => {
-                        gbi::process_display_list_f3d(&mut self.renderer, rdram, phys_addr);
-                        0 // F3D doesn't return count yet
-                    }
-                };
-                let tris_this_dl = self.renderer.tri_count - tris_before;
-                (cmd_count, tris_this_dl)
+            // Walk display list, rendering into RDRAM
+            let rdram = self.rdram.data_mut();
+            let tris_before = self.renderer.tri_count;
+            self.renderer.task_nonblack_writes = 0;
+            self.renderer.task_total_writes = 0;
+            let cmd_count = match self.ucode {
+                gbi::UcodeType::F3dex2 => {
+                    gbi::process_display_list(&mut self.renderer, rdram, phys_addr)
+                }
+                gbi::UcodeType::F3d => {
+                    gbi::process_display_list_f3d(&mut self.renderer, rdram, phys_addr);
+                    0 // F3D doesn't return count yet
+                }
             };
-            if !self.skip_gfx_tasks {
-                if cmd_count >= gbi::MAX_COMMANDS {
-                    log::warn!("GFX #{}: HIT COMMAND LIMIT ({} commands)!", self.rsp.start_count, cmd_count);
-                }
+            let tris_this_dl = self.renderer.tri_count - tris_before;
 
-                // Log per-task info for diagnostics
-                log::debug!(
-                    "GFX #{}: {} cmds, {} tris, ci={:#X} w={} scissor=({},{})..({},{})",
-                    self.rsp.start_count, cmd_count, tris_this_dl,
-                    self.renderer.color_image_addr,
-                    self.renderer.color_image_width,
-                    self.renderer.scissor_ulx >> 2, self.renderer.scissor_uly >> 2,
-                    self.renderer.scissor_lrx >> 2, self.renderer.scissor_lry >> 2,
-                );
+            if cmd_count >= gbi::MAX_COMMANDS {
+                log::warn!("GFX #{}: HIT COMMAND LIMIT ({} commands)!", self.rsp.start_count, cmd_count);
+            }
 
-                log::debug!(
-                    "GFX #{}: {} tris, ci={:#X}",
-                    self.rsp.start_count, tris_this_dl,
-                    self.renderer.color_image_addr,
-                );
+            // Log per-task info for diagnostics
+            log::debug!(
+                "GFX #{}: {} cmds, {} tris, ci={:#X} w={} scissor=({},{})..({},{})",
+                self.rsp.start_count, cmd_count, tris_this_dl,
+                self.renderer.color_image_addr,
+                self.renderer.color_image_width,
+                self.renderer.scissor_ulx >> 2, self.renderer.scissor_uly >> 2,
+                self.renderer.scissor_lrx >> 2, self.renderer.scissor_lry >> 2,
+            );
 
-                // Save the best frame snapshot (most non-black pixels) for diagnostics.
-                {
-                    let ci = self.renderer.color_image_addr as usize;
-                    let w = self.renderer.color_image_width as usize;
-                    let fb_bytes = w * 240 * 2;
-                    let rdram = self.rdram.data();
-                    let nonblack = if ci > 0 && ci + fb_bytes <= rdram.len() {
-                        let mut nb = 0u32;
-                        for i in (0..fb_bytes).step_by(2) {
-                            let px = u16::from_be_bytes([rdram[ci + i], rdram[ci + i + 1]]);
-                            if px >> 1 != 0 { nb += 1; }
-                        }
-                        if nb > self.renderer.best_frame_nonblack {
-                            self.renderer.best_frame_snapshot = rdram[ci..ci + fb_bytes].to_vec();
-                            self.renderer.best_frame_nonblack = nb;
-                        }
-                        nb
-                    } else { 0 };
-                    // Record CI history (last 30 GFX tasks)
-                    if self.renderer.ci_history.len() >= 30 {
-                        self.renderer.ci_history.remove(0);
+            log::debug!(
+                "GFX #{}: {} tris, ci={:#X}",
+                self.rsp.start_count, tris_this_dl,
+                self.renderer.color_image_addr,
+            );
+
+            // Save the best frame snapshot (most non-black pixels) for diagnostics.
+            {
+                let ci = self.renderer.color_image_addr as usize;
+                let w = self.renderer.color_image_width as usize;
+                let fb_bytes = w * 240 * 2;
+                let rdram = self.rdram.data();
+                let nonblack = if ci > 0 && ci + fb_bytes <= rdram.len() {
+                    let mut nb = 0u32;
+                    for i in (0..fb_bytes).step_by(2) {
+                        let px = u16::from_be_bytes([rdram[ci + i], rdram[ci + i + 1]]);
+                        if px >> 1 != 0 { nb += 1; }
                     }
-                    let tw = self.renderer.task_total_writes;
-                    let tnb = self.renderer.task_nonblack_writes;
-                    self.renderer.ci_history.push((ci as u32, tris_this_dl, nonblack, tw, tnb));
+                    if nb > self.renderer.best_frame_nonblack {
+                        self.renderer.best_frame_snapshot = rdram[ci..ci + fb_bytes].to_vec();
+                        self.renderer.best_frame_nonblack = nb;
+                    }
+                    nb
+                } else { 0 };
+                // Record CI history (last 30 GFX tasks)
+                if self.renderer.ci_history.len() >= 30 {
+                    self.renderer.ci_history.remove(0);
                 }
+                let tw = self.renderer.task_total_writes;
+                let tnb = self.renderer.task_nonblack_writes;
+                self.renderer.ci_history.push((ci as u32, tris_this_dl, nonblack, tw, tnb));
             }
 
             // DP interrupt: RDP finished rendering this display list.
