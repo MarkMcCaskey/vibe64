@@ -61,7 +61,7 @@ impl ApplicationHandler for App {
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => {
-                self.n64.save_eeprom(); self.n64.save_flash();
+                self.n64.save_eeprom(); self.n64.save_flash(); self.n64.save_sram();
                 event_loop.exit();
             }
             WindowEvent::Resized(size) => {
@@ -118,7 +118,7 @@ impl ApplicationHandler for App {
 
                     // Escape to quit
                     if key == KeyCode::Escape && pressed {
-                        self.n64.save_eeprom(); self.n64.save_flash();
+                        self.n64.save_eeprom(); self.n64.save_flash(); self.n64.save_sram();
                         event_loop.exit();
                     }
                     // P = save screenshot
@@ -187,7 +187,7 @@ impl ApplicationHandler for App {
 
                 // Periodic EEPROM save (every ~5 seconds)
                 if self.n64.debug.frame_count % 300 == 0 {
-                    self.n64.save_eeprom(); self.n64.save_flash();
+                    self.n64.save_eeprom(); self.n64.save_flash(); self.n64.save_sram();
                 }
 
                 if let Some(pixels) = &mut self.pixels {

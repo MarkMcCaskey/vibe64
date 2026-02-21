@@ -31,6 +31,11 @@ pub struct Interconnect {
     pub renderer: Renderer,
     pub audio_hle: AudioHle,
     pub flashram: FlashRam,
+    /// SRAM save memory (32KB) used by games like Zelda OoT.
+    pub sram: Vec<u8>,
+    pub sram_dirty: bool,
+    /// True for games that use FlashRAM at 0x0800_0000.
+    pub use_flashram: bool,
     pub ucode: crate::rcp::gbi::UcodeType,
     /// ISViewer debug output buffer (512 bytes at physical 0x13FF0020)
     is_viewer_buf: [u8; 512],
@@ -56,6 +61,9 @@ impl Interconnect {
             renderer: Renderer::new(),
             audio_hle: AudioHle::new(),
             flashram: FlashRam::new(),
+            sram: vec![0u8; 0x8000],
+            sram_dirty: false,
+            use_flashram: false,
             ucode: crate::rcp::gbi::UcodeType::F3dex2,
             is_viewer_buf: [0u8; 512],
             audio_samples: Vec::with_capacity(16384),
@@ -74,18 +82,31 @@ impl Interconnect {
         let dram_addr = self.pi.dram_addr & 0x00FF_FFFF;
         let len = self.pi.pending_dma_len;
 
-        // FlashRAM DMA: cart addr in 0x0800_0000 range
+        // Save memory DMA space (0x0800_0000..0x0801_FFFF):
+        // either FlashRAM or SRAM depending on game.
         if cart_addr >= 0x0800_0000 && cart_addr < 0x0802_0000 {
-            let flash_offset = cart_addr - 0x0800_0000;
-            let rdram = self.rdram.data_mut();
-            let dest_start = dram_addr as usize;
-            let dest_end = (dest_start + len as usize).min(rdram.len());
-            self.flashram.dma_read(flash_offset, &mut rdram[dest_start..dest_end]);
+            if self.use_flashram {
+                let flash_offset = cart_addr - 0x0800_0000;
+                let rdram = self.rdram.data_mut();
+                let dest_start = dram_addr as usize;
+                let dest_end = (dest_start + len as usize).min(rdram.len());
+                self.flashram.dma_read(flash_offset, &mut rdram[dest_start..dest_end]);
 
-            log::debug!(
-                "PI DMA (FlashRAM→RDRAM): Flash[{:#010X}] → RDRAM[{:#010X}], len={:#X}",
-                flash_offset, dram_addr, len
-            );
+                log::debug!(
+                    "PI DMA (FlashRAM→RDRAM): Flash[{:#010X}] → RDRAM[{:#010X}], len={:#X}",
+                    flash_offset, dram_addr, len
+                );
+            } else {
+                let sram_base = (cart_addr - 0x0800_0000) as usize;
+                for i in 0..len as usize {
+                    let byte = self.sram[(sram_base + i) & 0x7FFF];
+                    self.rdram.write_u8(dram_addr.wrapping_add(i as u32), byte);
+                }
+                log::debug!(
+                    "PI DMA (SRAM→RDRAM): SRAM[{:#06X}] → RDRAM[{:#010X}], len={:#X}",
+                    sram_base, dram_addr, len
+                );
+            }
 
             let delay = (len as u64 * 19).max(200);
             self.pi.dma_busy_cycles = delay;
@@ -124,17 +145,31 @@ impl Interconnect {
         let dram_addr = self.pi.dram_addr & 0x00FF_FFFF;
         let len = self.pi.pending_dma_len;
 
-        // FlashRAM page buffer write: RDRAM → Flash
+        // Save memory DMA space (0x0800_0000..0x0801_FFFF):
+        // either FlashRAM or SRAM depending on game.
         if cart_addr >= 0x0800_0000 && cart_addr < 0x0802_0000 {
-            let rdram = self.rdram.data();
-            let src_start = dram_addr as usize;
-            let src_end = (src_start + len as usize).min(rdram.len());
-            self.flashram.dma_write(&rdram[src_start..src_end]);
+            if self.use_flashram {
+                let rdram = self.rdram.data();
+                let src_start = dram_addr as usize;
+                let src_end = (src_start + len as usize).min(rdram.len());
+                self.flashram.dma_write(&rdram[src_start..src_end]);
 
-            log::debug!(
-                "PI DMA (RDRAM→FlashRAM): RDRAM[{:#010X}] → Flash page buffer, len={:#X}",
-                dram_addr, len
-            );
+                log::debug!(
+                    "PI DMA (RDRAM→FlashRAM): RDRAM[{:#010X}] → Flash page buffer, len={:#X}",
+                    dram_addr, len
+                );
+            } else {
+                let sram_base = (cart_addr - 0x0800_0000) as usize;
+                for i in 0..len as usize {
+                    let byte = self.rdram.read_u8(dram_addr.wrapping_add(i as u32));
+                    self.sram[(sram_base + i) & 0x7FFF] = byte;
+                }
+                self.sram_dirty = true;
+                log::debug!(
+                    "PI DMA (RDRAM→SRAM): RDRAM[{:#010X}] → SRAM[{:#06X}], len={:#X}",
+                    dram_addr, sram_base, len
+                );
+            }
         } else {
             log::debug!(
                 "PI DMA (save): RDRAM[{:#010X}] → Cart[{:#010X}], len={:#X}",
@@ -450,9 +485,21 @@ impl Bus for Interconnect {
             0x0460_0000..=0x046F_FFFF => self.pi.read_u32(addr),
             0x0470_0000..=0x047F_FFFF => self.ri.read_u32(addr),
             0x0480_0000..=0x048F_FFFF => self.si.read_u32(addr),
-            // FlashRAM status/data at 0x0800_0000
-            0x0800_0000..=0x0800_FFFF => self.flashram.read_status(),
-            0x0801_0000..=0x0801_FFFF => 0, // FlashRAM command register (write-only)
+            // Save memory space at 0x0800_0000:
+            // FlashRAM (status/data) or SRAM depending on game.
+            0x0800_0000..=0x0801_FFFF => {
+                if self.use_flashram {
+                    self.flashram.read_status()
+                } else {
+                    let off = ((addr - 0x0800_0000) as usize) & 0x7FFF;
+                    u32::from_be_bytes([
+                        self.sram[off],
+                        self.sram[(off + 1) & 0x7FFF],
+                        self.sram[(off + 2) & 0x7FFF],
+                        self.sram[(off + 3) & 0x7FFF],
+                    ])
+                }
+            }
             // ISViewer debug port (must be checked before cart range)
             0x13FF_0000..=0x13FF_0FFF => self.is_viewer_read(addr),
             0x1000_0000..=0x1FBF_FFFF => self.cart.read_u32(addr),
@@ -556,9 +603,14 @@ impl Bus for Interconnect {
                     }
                 }
             }
-            // FlashRAM command register at 0x0801_0000
-            0x0800_0000..=0x0800_FFFF => {} // FlashRAM data range (read-only for direct access)
-            0x0801_0000..=0x0801_FFFF => self.flashram.command(val),
+            // Save memory command/data space at 0x0800_0000.
+            // SRAM is handled via PI DMA; direct CPU writes are ignored.
+            0x0800_0000..=0x0800_FFFF => {}
+            0x0801_0000..=0x0801_FFFF => {
+                if self.use_flashram {
+                    self.flashram.command(val);
+                }
+            }
             // ISViewer debug port (must be checked before cart range)
             0x13FF_0000..=0x13FF_0FFF => self.is_viewer_write(addr, val),
             0x1FC0_07C0..=0x1FC0_07FF => self.pif.write_ram_u32(addr, val),

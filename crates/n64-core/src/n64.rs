@@ -40,8 +40,10 @@ impl N64 {
         let cic = cart::cic::detect(&rom_data);
         log::info!("Detected CIC: {}", cic);
 
-        // Detect EEPROM type from game code
+        // Detect cartridge save backend and EEPROM type from game code
+        let uses_flashram = is_flashram_game(&header.game_code);
         let eeprom_type = detect_eeprom(&header.game_code);
+        log::info!("Cart save backend: {}", if uses_flashram { "FlashRAM" } else { "SRAM" });
         log::info!("EEPROM: {:?} (game code: {:?})",
             match eeprom_type {
                 crate::memory::pif::EepromType::None => "None",
@@ -58,6 +60,7 @@ impl N64 {
         let game_code = header.game_code;
         let cart = Cartridge::new(rom_data, header);
         let mut bus = Interconnect::new(cart);
+        bus.use_flashram = uses_flashram;
         bus.pif.set_cic(cic);
         bus.pif.set_eeprom(eeprom_type);
         init_eeprom_for_game(&game_code, &mut bus.pif);
@@ -132,6 +135,7 @@ impl N64 {
         // Load save data from disk if it exists
         n64.load_eeprom();
         n64.load_flash();
+        n64.load_sram();
 
         Ok(n64)
     }
@@ -155,6 +159,11 @@ impl N64 {
     /// Path for FlashRAM save file (same directory as ROM, .flash extension).
     pub fn flash_save_path(&self) -> PathBuf {
         self.rom_path.with_extension("flash")
+    }
+
+    /// Path for SRAM save file (same directory as ROM, .sram extension).
+    pub fn sram_save_path(&self) -> PathBuf {
+        self.rom_path.with_extension("sram")
     }
 
     /// Load EEPROM data from disk if a save file exists.
@@ -187,6 +196,9 @@ impl N64 {
 
     /// Load FlashRAM data from disk if a save file exists.
     fn load_flash(&mut self) {
+        if !self.bus.use_flashram {
+            return;
+        }
         let path = self.flash_save_path();
         match std::fs::read(&path) {
             Ok(data) => {
@@ -202,8 +214,33 @@ impl N64 {
         }
     }
 
+    /// Load SRAM data from disk if a save file exists.
+    fn load_sram(&mut self) {
+        if self.bus.use_flashram {
+            return;
+        }
+        let path = self.sram_save_path();
+        match std::fs::read(&path) {
+            Ok(data) => {
+                let len = data.len().min(self.bus.sram.len());
+                self.bus.sram[..len].copy_from_slice(&data[..len]);
+                self.bus.sram_dirty = false;
+                log::info!("Loaded SRAM save from {:?} ({} bytes)", path, data.len());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                log::info!("No SRAM save file at {:?}, starting fresh", path);
+            }
+            Err(e) => {
+                log::warn!("Failed to read SRAM save {:?}: {}", path, e);
+            }
+        }
+    }
+
     /// Flush FlashRAM data to disk if modified.
     pub fn save_flash(&mut self) {
+        if !self.bus.use_flashram {
+            return;
+        }
         if !self.bus.flashram.dirty {
             return;
         }
@@ -215,6 +252,23 @@ impl N64 {
             }
             Err(e) => {
                 log::error!("Failed to save FlashRAM to {:?}: {}", path, e);
+            }
+        }
+    }
+
+    /// Flush SRAM data to disk if modified.
+    pub fn save_sram(&mut self) {
+        if self.bus.use_flashram || !self.bus.sram_dirty {
+            return;
+        }
+        let path = self.sram_save_path();
+        match std::fs::write(&path, &self.bus.sram) {
+            Ok(()) => {
+                self.bus.sram_dirty = false;
+                log::info!("Saved SRAM to {:?}", path);
+            }
+            Err(e) => {
+                log::error!("Failed to save SRAM to {:?}: {}", path, e);
             }
         }
     }
@@ -402,35 +456,34 @@ fn detect_eeprom(game_code: &[u8; 4]) -> crate::memory::pif::EepromType {
     use crate::memory::pif::EepromType;
     let code = std::str::from_utf8(game_code).unwrap_or("");
 
+    if is_flashram_game(game_code) {
+        return EepromType::None;
+    }
+
+    // SRAM games also don't use EEPROM.
+    const SRAM_GAMES: &[&str] = &[
+        "CZLE", "CZLJ", "CZLP", // Zelda OoT
+    ];
+    for &c in SRAM_GAMES {
+        if code == c {
+            return EepromType::None;
+        }
+    }
+
     // 16Kbit EEPROM games (common ones)
     const EEPROM_16K: &[&str] = &[
         "NCLB", "NCLE", "NCLJ", // Cruis'n World
         "NYBE",                   // Yoshi's Story
     ];
 
-    // FlashRAM games — no EEPROM (uses 128KB Flash at 0x0800_0000)
-    const FLASHRAM_GAMES: &[&str] = &[
-        "NZSE", "NZSJ", "NZSP",  // Majora's Mask (US/JP/PAL)
-        "NZLE", "NZLJ", "NZLP",  // Majora's Mask (PAL alt codes)
-        "NPFE", "NPFJ", "NPFP",  // Pokemon Stadium 2
-        "NPOE", "NPOJ", "NPOP",  // Pokemon Stadium
-        "NPME",                    // Paper Mario
-    ];
-
     // 4Kbit EEPROM games (most games that use EEPROM)
     const EEPROM_4K: &[&str] = &[
-        "CZLE", "CZLJ", "CZLP",  // Zelda OoT
         "NSME", "NSMJ",           // Super Mario 64
         "NMKE", "NMKJ",           // Mario Kart 64
         "NSSE",                    // Star Fox 64
         "NFZE", "NFZJ",           // F-Zero X
         "NWRE",                    // Wave Race 64
     ];
-
-    // FlashRAM games don't use EEPROM
-    for &c in FLASHRAM_GAMES {
-        if code == c { return EepromType::None; }
-    }
 
     for &c in EEPROM_16K {
         if code == c { return EepromType::Eeprom16K; }
@@ -441,6 +494,18 @@ fn detect_eeprom(game_code: &[u8; 4]) -> crate::memory::pif::EepromType {
 
     // Default: try 4K EEPROM for unrecognized games (most common save type)
     EepromType::Eeprom4K
+}
+
+fn is_flashram_game(game_code: &[u8; 4]) -> bool {
+    let code = std::str::from_utf8(game_code).unwrap_or("");
+    const FLASHRAM_GAMES: &[&str] = &[
+        "NZSE", "NZSJ", "NZSP",  // Majora's Mask (US/JP/PAL)
+        "NZLE", "NZLJ", "NZLP",  // Majora's Mask (PAL alt codes)
+        "NPFE", "NPFJ", "NPFP",  // Pokemon Stadium 2
+        "NPOE", "NPOJ", "NPOP",  // Pokemon Stadium
+        "NPME",                    // Paper Mario
+    ];
+    FLASHRAM_GAMES.contains(&code)
 }
 
 /// Initialize EEPROM with game-specific header data for known games.
