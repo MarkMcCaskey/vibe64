@@ -14,6 +14,7 @@ use n64_dynarec::{
 pub struct DynarecRuntimeStats {
     pub native_blocks_executed: u64,
     pub native_instructions_executed: u64,
+    pub native_interp_delegated_instructions: u64,
     pub fallback_instructions_executed: u64,
     pub fallback_early_guard: u64,
     pub fallback_guard_after_lookup: u64,
@@ -166,6 +167,14 @@ unsafe extern "C" fn cb_cop0_write<B: Bus>(user: *mut u8, reg: u64, value: u64) 
     cpu.cop0.write_reg((reg as usize) & 0x1F, value);
 }
 
+unsafe extern "C" fn cb_cop1_condition<B: Bus>(user: *mut u8) -> u64 {
+    // SAFETY: user pointer is created from `CallbackContext<B>` in `run_native_block`.
+    let ctx = unsafe { &mut *(user as *mut CallbackContext<B>) };
+    // SAFETY: pointers come from live mutable references held by `run_native_block`.
+    let cpu = unsafe { &mut *ctx.cpu };
+    u64::from(cpu.cop1.condition())
+}
+
 unsafe extern "C" fn cb_interp_exec<B: Bus>(user: *mut u8, raw: u64, current_pc: u64) {
     // SAFETY: user pointer is created from `CallbackContext<B>` in `run_native_block`.
     let ctx = unsafe { &mut *(user as *mut CallbackContext<B>) };
@@ -272,9 +281,10 @@ impl DynarecEngine {
     pub fn stats_line(&self) -> String {
         let stats = self.stats();
         format!(
-            "native_blocks={} native_instr={} fallback_instr={} fallback_early_guard={} fallback_guard_after_lookup={} fallback_no_block={} fallback_failed_cache={} fallback_cold={} ensure_calls={} ensure_compiled={} ensure_compile_failed={} ensure_cache_hit={} recompiler_cache_hits={} recompiler_failed_cache_hits={} recompiler_blocks_compiled={} recompiler_compile_failures={} recompiler_invalidated_blocks={} block_cache_len={} failed_cache_len={} hot_entries={} hot_threshold={} min_block_insns={} chain_limit={}",
+            "native_blocks={} native_instr={} native_interp_instr={} fallback_instr={} fallback_early_guard={} fallback_guard_after_lookup={} fallback_no_block={} fallback_failed_cache={} fallback_cold={} ensure_calls={} ensure_compiled={} ensure_compile_failed={} ensure_cache_hit={} recompiler_cache_hits={} recompiler_failed_cache_hits={} recompiler_blocks_compiled={} recompiler_compile_failures={} recompiler_invalidated_blocks={} block_cache_len={} failed_cache_len={} hot_entries={} hot_threshold={} min_block_insns={} chain_limit={}",
             stats.runtime.native_blocks_executed,
             stats.runtime.native_instructions_executed,
+            stats.runtime.native_interp_delegated_instructions,
             stats.runtime.fallback_instructions_executed,
             stats.runtime.fallback_early_guard,
             stats.runtime.fallback_guard_after_lookup,
@@ -422,6 +432,7 @@ impl DynarecEngine {
             store_u64: cb_store_u64::<B>,
             cop0_read: cb_cop0_read::<B>,
             cop0_write: cb_cop0_write::<B>,
+            cop1_condition: cb_cop1_condition::<B>,
             interp_exec: cb_interp_exec::<B>,
             hi_read: cb_hi_read::<B>,
             hi_write: cb_hi_write::<B>,
@@ -435,8 +446,13 @@ impl DynarecEngine {
         let count = execution.retired_instructions;
         let next_pc = execution.next_pc;
 
-        for i in 0..u64::from(count) {
-            let pc = start_pc.wrapping_add((i as u64) * 4);
+        // PC history ring stores only the most recent 64 entries; when native
+        // chunks are larger, older entries would be overwritten anyway.
+        let history_count = count.min(64);
+        let history_start =
+            start_pc.wrapping_add(u64::from(count.saturating_sub(history_count)) * 4);
+        for i in 0..u64::from(history_count) {
+            let pc = history_start.wrapping_add(i * 4);
             cpu.pc_history[cpu.pc_history_idx] = pc as u32;
             cpu.pc_history_idx = (cpu.pc_history_idx + 1) & 63;
         }
@@ -446,11 +462,7 @@ impl DynarecEngine {
         cpu.next_pc = next_pc.wrapping_add(4);
         cpu.gpr[0] = 0;
 
-        for _ in 0..count {
-            cpu.cop0.increment_count();
-            cpu.cop0.decrement_random();
-            cpu.cop0.check_timer_interrupt();
-        }
+        cpu.cop0.advance_by_instructions(count);
 
         if bus.pending_interrupts() {
             cpu.cop0.set_ip2();
@@ -463,6 +475,10 @@ impl DynarecEngine {
             .runtime
             .native_instructions_executed
             .wrapping_add(count as u64);
+        self.runtime.native_interp_delegated_instructions = self
+            .runtime
+            .native_interp_delegated_instructions
+            .wrapping_add(block.interp_op_count as u64);
 
         u64::from(count)
     }

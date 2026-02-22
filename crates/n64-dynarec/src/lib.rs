@@ -40,6 +40,7 @@ pub struct RuntimeCallbacks {
     pub store_u64: unsafe extern "C" fn(*mut u8, u64, u64),
     pub cop0_read: unsafe extern "C" fn(*mut u8, u64) -> u64,
     pub cop0_write: unsafe extern "C" fn(*mut u8, u64, u64),
+    pub cop1_condition: unsafe extern "C" fn(*mut u8) -> u64,
     pub interp_exec: unsafe extern "C" fn(*mut u8, u64, u64),
     pub hi_read: unsafe extern "C" fn(*mut u8) -> u64,
     pub hi_write: unsafe extern "C" fn(*mut u8, u64),
@@ -123,6 +124,13 @@ unsafe extern "C" fn n64_jit_cop0_write(ctx: *mut u8, reg: u64, value: u64) {
     unsafe { (cbs.cop0_write)(cbs.user, reg, value) }
 }
 
+unsafe extern "C" fn n64_jit_cop1_condition(ctx: *mut u8) -> u64 {
+    // SAFETY: `ctx` is provided by the caller as a valid RuntimeCallbacks pointer.
+    let cbs = unsafe { &mut *(ctx as *mut RuntimeCallbacks) };
+    // SAFETY: callback function pointer is provided by caller.
+    unsafe { (cbs.cop1_condition)(cbs.user) }
+}
+
 unsafe extern "C" fn n64_jit_interp_exec(ctx: *mut u8, raw: u64, current_pc: u64) {
     // SAFETY: `ctx` is provided by the caller as a valid RuntimeCallbacks pointer.
     let cbs = unsafe { &mut *(ctx as *mut RuntimeCallbacks) };
@@ -191,6 +199,8 @@ pub struct CompiledBlock {
     pub interp_op_count: u32,
     /// True if the block ended on a control-transfer boundary.
     pub has_control_flow: bool,
+    /// True when compilation stopped at an unsupported non-branch opcode.
+    pub ended_on_unsupported: bool,
     entry: BlockEntry,
 }
 
@@ -502,6 +512,10 @@ enum BranchTerminator {
     Bgez { rs: u8, offset: i16 },
     Bltzl { rs: u8, offset: i16 },
     Bgezl { rs: u8, offset: i16 },
+    Bc1f { offset: i16 },
+    Bc1t { offset: i16 },
+    Bc1fl { offset: i16 },
+    Bc1tl { offset: i16 },
     J { target: u32 },
     Jal { target: u32 },
     Jalr { rs: u8, rd: u8 },
@@ -553,6 +567,13 @@ fn decode_branch(raw: u32) -> Option<BranchTerminator> {
             0x01 => Some(BranchTerminator::Bgez { rs, offset }),
             0x02 => Some(BranchTerminator::Bltzl { rs, offset }),
             0x03 => Some(BranchTerminator::Bgezl { rs, offset }),
+            _ => None,
+        },
+        0x11 if rs == 0x08 => match rt {
+            0x00 => Some(BranchTerminator::Bc1f { offset }),
+            0x01 => Some(BranchTerminator::Bc1t { offset }),
+            0x02 => Some(BranchTerminator::Bc1fl { offset }),
+            0x03 => Some(BranchTerminator::Bc1tl { offset }),
             _ => None,
         },
         0x00 if funct == 0x08 => Some(BranchTerminator::Jr { rs }),
@@ -788,6 +809,23 @@ fn decode_supported_non_branch(raw: u32) -> Option<Op> {
     }
 }
 
+fn can_inline_interp_non_branch(raw: u32) -> bool {
+    let opcode = (raw >> 26) as u8;
+    let rs = ((raw >> 21) & 0x1F) as u8;
+    let funct = (raw & 0x3F) as u8;
+    match opcode {
+        // All branch/jump forms must be explicit terminators.
+        0x01 | 0x02 | 0x03 | 0x04 | 0x05 | 0x06 | 0x07 | 0x14 | 0x15 | 0x16 | 0x17 => false,
+        // COP0 branch-like/system returns must terminate.
+        0x10 if rs == 0x10 && funct == 0x18 => false, // eret
+        // COP1 branch format must terminate.
+        0x11 if rs == 0x08 => false,
+        // Special control-flow and explicit exception traps should terminate.
+        0x00 if matches!(funct, 0x08 | 0x09 | 0x0C | 0x0D | 0x30..=0x37) => false,
+        _ => true,
+    }
+}
+
 fn iconst_u64(builder: &mut FunctionBuilder<'_>, value: u64) -> Value {
     builder
         .ins()
@@ -885,6 +923,7 @@ struct ImportedFuncRefs {
     store_u64: FuncRef,
     cop0_read: FuncRef,
     cop0_write: FuncRef,
+    cop1_condition: FuncRef,
     interp_exec: FuncRef,
     hi_read: FuncRef,
     hi_write: FuncRef,
@@ -912,40 +951,24 @@ fn fastmem_guard_and_addr(
     builder: &mut FunctionBuilder<'_>,
     fastmem: FastmemValues,
     vaddr: Value,
-    align: u8,
 ) -> (Value, Value) {
     let vaddr32 = builder.ins().ireduce(types::I32, vaddr);
     let seg_mask = builder
         .ins()
-        .iconst(types::I32, i64::from(0xE000_0000u32 as i32));
+        .iconst(types::I32, i64::from(0xC000_0000u32 as i32));
     let seg = builder.ins().band(vaddr32, seg_mask);
-    let kseg0 = builder
+    let direct = builder
         .ins()
         .iconst(types::I32, i64::from(0x8000_0000u32 as i32));
-    let kseg1 = builder
-        .ins()
-        .iconst(types::I32, i64::from(0xA000_0000u32 as i32));
-    let is_kseg0 = builder.ins().icmp(IntCC::Equal, seg, kseg0);
-    let is_kseg1 = builder.ins().icmp(IntCC::Equal, seg, kseg1);
-    let is_direct = builder.ins().bor(is_kseg0, is_kseg1);
+    let is_direct = builder.ins().icmp(IntCC::Equal, seg, direct);
 
     let phys_mask_const = iconst_u64(builder, 0x1FFF_FFFF);
     let phys = builder.ins().band(vaddr, phys_mask_const);
     let in_range = builder
         .ins()
         .icmp(IntCC::UnsignedLessThan, phys, fastmem.phys_limit);
-    let null = builder.ins().iconst(fastmem.ptr_ty, 0);
-    let has_base = builder.ins().icmp(IntCC::NotEqual, fastmem.base, null);
-
-    let mut fast_cond = builder.ins().band(has_base, is_direct);
+    let mut fast_cond = is_direct;
     fast_cond = builder.ins().band(fast_cond, in_range);
-    if align > 1 {
-        let align_mask = iconst_u64(builder, u64::from(align - 1));
-        let aligned_bits = builder.ins().band(vaddr, align_mask);
-        let zero = iconst_u64(builder, 0);
-        let aligned = builder.ins().icmp(IntCC::Equal, aligned_bits, zero);
-        fast_cond = builder.ins().band(fast_cond, aligned);
-    }
 
     let masked_phys = builder.ins().band(phys, fastmem.phys_mask);
     let offset = i64_to_ptr_sized(builder, fastmem.ptr_ty, masked_phys);
@@ -1020,7 +1043,7 @@ fn emit_load_via_fastmem(
     vaddr: Value,
     width: u8,
 ) -> Value {
-    let (fast_cond, fast_addr) = fastmem_guard_and_addr(builder, fastmem, vaddr, width);
+    let (fast_cond, fast_addr) = fastmem_guard_and_addr(builder, fastmem, vaddr);
 
     let fast_block = builder.create_block();
     let slow_block = builder.create_block();
@@ -1033,7 +1056,6 @@ fn emit_load_via_fastmem(
     builder.switch_to_block(fast_block);
     let mut fast_flags = MemFlags::new();
     fast_flags.set_notrap();
-    fast_flags.set_aligned();
     let fast_val = load_be_from_fastmem(builder, fast_addr, width, fast_flags);
     let args = [fast_val.into()];
     builder.ins().jump(done_block, &args);
@@ -1057,7 +1079,7 @@ fn emit_store_via_fastmem(
     value64: Value,
     width: u8,
 ) {
-    let (fast_cond, fast_addr) = fastmem_guard_and_addr(builder, fastmem, vaddr, width);
+    let (fast_cond, fast_addr) = fastmem_guard_and_addr(builder, fastmem, vaddr);
 
     let fast_block = builder.create_block();
     let slow_block = builder.create_block();
@@ -1069,7 +1091,6 @@ fn emit_store_via_fastmem(
     builder.switch_to_block(fast_block);
     let mut fast_flags = MemFlags::new();
     fast_flags.set_notrap();
-    fast_flags.set_aligned();
     store_be_to_fastmem(builder, fast_addr, value64, width, fast_flags);
     builder.ins().jump(done_block, &[]);
 
@@ -1814,6 +1835,7 @@ pub struct CraneliftCompiler {
     store_u64_id: FuncId,
     cop0_read_id: FuncId,
     cop0_write_id: FuncId,
+    cop1_condition_id: FuncId,
     interp_exec_id: FuncId,
     hi_read_id: FuncId,
     hi_write_id: FuncId,
@@ -1860,6 +1882,7 @@ impl Default for CraneliftCompiler {
         jit_builder.symbol("n64_jit_store_u64", n64_jit_store_u64 as *const u8);
         jit_builder.symbol("n64_jit_cop0_read", n64_jit_cop0_read as *const u8);
         jit_builder.symbol("n64_jit_cop0_write", n64_jit_cop0_write as *const u8);
+        jit_builder.symbol("n64_jit_cop1_condition", n64_jit_cop1_condition as *const u8);
         jit_builder.symbol("n64_jit_interp_exec", n64_jit_interp_exec as *const u8);
         jit_builder.symbol("n64_jit_hi_read", n64_jit_hi_read as *const u8);
         jit_builder.symbol("n64_jit_hi_write", n64_jit_hi_write as *const u8);
@@ -1916,6 +1939,9 @@ impl Default for CraneliftCompiler {
         let cop0_write_id = module
             .declare_function("n64_jit_cop0_write", Linkage::Import, &ternary_sig)
             .expect("declare n64_jit_cop0_write");
+        let cop1_condition_id = module
+            .declare_function("n64_jit_cop1_condition", Linkage::Import, &ctx_unary_sig)
+            .expect("declare n64_jit_cop1_condition");
         let interp_exec_id = module
             .declare_function("n64_jit_interp_exec", Linkage::Import, &ternary_sig)
             .expect("declare n64_jit_interp_exec");
@@ -1948,6 +1974,7 @@ impl Default for CraneliftCompiler {
             store_u64_id,
             cop0_read_id,
             cop0_write_id,
+            cop1_condition_id,
             interp_exec_id,
             hi_read_id,
             hi_write_id,
@@ -1974,6 +2001,7 @@ impl BlockCompiler for CraneliftCompiler {
         let mut decoded_count = 0u32;
         let mut interp_op_count = 0u32;
         let mut has_control_flow = false;
+        let mut ended_on_unsupported = false;
 
         while decoded_count < max_instructions {
             let opcode = match source.read_u32(phys) {
@@ -2032,6 +2060,10 @@ impl BlockCompiler for CraneliftCompiler {
                         | BranchTerminator::Bgez { .. }
                         | BranchTerminator::Bltzl { .. }
                         | BranchTerminator::Bgezl { .. }
+                        | BranchTerminator::Bc1f { .. }
+                        | BranchTerminator::Bc1t { .. }
+                        | BranchTerminator::Bc1fl { .. }
+                        | BranchTerminator::Bc1tl { .. }
                 );
                 steps.push(TraceStep::Branch {
                     phys,
@@ -2058,12 +2090,23 @@ impl BlockCompiler for CraneliftCompiler {
                     phys = phys.wrapping_add(4);
                 }
                 None => {
+                    if can_inline_interp_non_branch(opcode) {
+                        steps.push(TraceStep::Op {
+                            phys,
+                            op: Op::Interp { raw: opcode },
+                        });
+                        interp_op_count = interp_op_count.saturating_add(1);
+                        decoded_count += 1;
+                        phys = phys.wrapping_add(4);
+                        continue;
+                    }
                     if steps.is_empty() {
                         return Err(CompileError::UnsupportedOpcode {
                             phys_addr: phys,
                             opcode,
                         });
                     }
+                    ended_on_unsupported = true;
                     break;
                 }
             }
@@ -2173,6 +2216,9 @@ impl BlockCompiler for CraneliftCompiler {
             cop0_write: self
                 .module
                 .declare_func_in_func(self.cop0_write_id, builder.func),
+            cop1_condition: self
+                .module
+                .declare_func_in_func(self.cop1_condition_id, builder.func),
             interp_exec: self
                 .module
                 .declare_func_in_func(self.interp_exec_id, builder.func),
@@ -2469,6 +2515,142 @@ impl BlockCompiler for CraneliftCompiler {
                                 }
                             }
                         }
+                        BranchTerminator::Bc1f { offset }
+                        | BranchTerminator::Bc1t { offset }
+                        | BranchTerminator::Bc1fl { offset }
+                        | BranchTerminator::Bc1tl { offset } => {
+                            let call = builder.ins().call(helpers.cop1_condition, &[callbacks_ptr]);
+                            let condition = builder.inst_results(call)[0];
+                            let zero = iconst_u64(&mut builder, 0);
+                            let cond_taken = match branch {
+                                BranchTerminator::Bc1f { .. } | BranchTerminator::Bc1fl { .. } => {
+                                    builder.ins().icmp(IntCC::Equal, condition, zero)
+                                }
+                                _ => builder.ins().icmp(IntCC::NotEqual, condition, zero),
+                            };
+                            let offset_val = builder
+                                .ins()
+                                .iconst(types::I64, i64::from((offset as i32) << 2));
+                            let taken_pc = builder.ins().iadd(next_of_branch, offset_val);
+                            let target_phys = phys
+                                .wrapping_add(4)
+                                .wrapping_add(((offset as i32) << 2) as u32);
+                            let taken_block = phys_to_index
+                                .get(&target_phys)
+                                .copied()
+                                .filter(|idx| *idx > step_idx)
+                                .map(|idx| step_blocks[idx]);
+                            let is_likely = matches!(
+                                branch,
+                                BranchTerminator::Bc1fl { .. } | BranchTerminator::Bc1tl { .. }
+                            );
+
+                            if is_likely {
+                                let taken_exec_block = builder.create_block();
+                                let not_taken_retired = builder.ins().iadd_imm(retired_count, 1);
+                                match fallthrough_block {
+                                    Some(fallthrough) => {
+                                        let args = [not_taken_retired.into()];
+                                        builder.ins().brif(
+                                            cond_taken,
+                                            taken_exec_block,
+                                            &[],
+                                            fallthrough,
+                                            &args,
+                                        );
+                                    }
+                                    None => {
+                                        let args =
+                                            [fallthrough_pc.into(), not_taken_retired.into()];
+                                        builder.ins().brif(
+                                            cond_taken,
+                                            taken_exec_block,
+                                            &[],
+                                            exit_block,
+                                            &args,
+                                        );
+                                    }
+                                }
+
+                                builder.switch_to_block(taken_exec_block);
+                                emit_op(
+                                    &mut builder,
+                                    gpr_ptr,
+                                    fpr_ptr,
+                                    callbacks_ptr,
+                                    helpers,
+                                    fastmem,
+                                    flags,
+                                    next_of_branch,
+                                    delay_op,
+                                );
+                                let taken_retired = builder.ins().iadd_imm(retired_count, 2);
+                                match taken_block {
+                                    Some(target) => {
+                                        let args = [taken_retired.into()];
+                                        builder.ins().jump(target, &args);
+                                    }
+                                    None => {
+                                        let args = [taken_pc.into(), taken_retired.into()];
+                                        builder.ins().jump(exit_block, &args);
+                                    }
+                                }
+                            } else {
+                                emit_op(
+                                    &mut builder,
+                                    gpr_ptr,
+                                    fpr_ptr,
+                                    callbacks_ptr,
+                                    helpers,
+                                    fastmem,
+                                    flags,
+                                    next_of_branch,
+                                    delay_op,
+                                );
+                                let retired_after = builder.ins().iadd_imm(retired_count, 2);
+                                match (taken_block, fallthrough_block) {
+                                    (Some(taken), Some(fallthrough)) => {
+                                        let args = [retired_after.into()];
+                                        builder.ins().brif(
+                                            cond_taken,
+                                            taken,
+                                            &args,
+                                            fallthrough,
+                                            &args,
+                                        );
+                                    }
+                                    (Some(taken), None) => {
+                                        let targs = [retired_after.into()];
+                                        let fargs = [fallthrough_pc.into(), retired_after.into()];
+                                        builder
+                                            .ins()
+                                            .brif(cond_taken, taken, &targs, exit_block, &fargs);
+                                    }
+                                    (None, Some(fallthrough)) => {
+                                        let targs = [taken_pc.into(), retired_after.into()];
+                                        let fargs = [retired_after.into()];
+                                        builder.ins().brif(
+                                            cond_taken,
+                                            exit_block,
+                                            &targs,
+                                            fallthrough,
+                                            &fargs,
+                                        );
+                                    }
+                                    (None, None) => {
+                                        let targs = [taken_pc.into(), retired_after.into()];
+                                        let fargs = [fallthrough_pc.into(), retired_after.into()];
+                                        builder.ins().brif(
+                                            cond_taken,
+                                            exit_block,
+                                            &targs,
+                                            exit_block,
+                                            &fargs,
+                                        );
+                                    }
+                                }
+                            }
+                        }
                         BranchTerminator::Blez { rs, offset }
                         | BranchTerminator::Bgtz { rs, offset }
                         | BranchTerminator::Blezl { rs, offset }
@@ -2667,6 +2849,7 @@ impl BlockCompiler for CraneliftCompiler {
             instruction_count,
             interp_op_count,
             has_control_flow,
+            ended_on_unsupported,
             entry,
         })
     }
@@ -2730,6 +2913,10 @@ mod tests {
 
     unsafe extern "C" fn test_cop0_write(_user: *mut u8, _reg: u64, _value: u64) {}
 
+    unsafe extern "C" fn test_cop1_condition(_user: *mut u8) -> u64 {
+        0
+    }
+
     unsafe extern "C" fn test_interp_exec(_user: *mut u8, _raw: u64, _current_pc: u64) {}
 
     unsafe extern "C" fn test_hi_read(_user: *mut u8) -> u64 {
@@ -2757,6 +2944,7 @@ mod tests {
             store_u64: test_store_u64,
             cop0_read: test_cop0_read,
             cop0_write: test_cop0_write,
+            cop1_condition: test_cop1_condition,
             interp_exec: test_interp_exec,
             hi_read: test_hi_read,
             hi_write: test_hi_write,
@@ -2772,6 +2960,7 @@ mod tests {
     struct CallbackState {
         mem: HashMap<u64, u8>,
         cop0: [u64; 32],
+        cop1_condition: u64,
         hi: u64,
         lo: u64,
     }
@@ -2864,6 +3053,12 @@ mod tests {
         state.cop0[(reg as usize) & 0x1F] = value;
     }
 
+    unsafe extern "C" fn state_cop1_condition(user: *mut u8) -> u64 {
+        // SAFETY: callback user points to `CallbackState` for this test.
+        let state = unsafe { &mut *(user as *mut CallbackState) };
+        state.cop1_condition
+    }
+
     unsafe extern "C" fn state_interp_exec(_user: *mut u8, _raw: u64, _current_pc: u64) {
         // Test programs avoid interpreter-delegated opcodes.
     }
@@ -2905,6 +3100,7 @@ mod tests {
             store_u64: state_store_u64,
             cop0_read: state_cop0_read,
             cop0_write: state_cop0_write,
+            cop1_condition: state_cop1_condition,
             interp_exec: state_interp_exec,
             hi_read: state_hi_read,
             hi_write: state_hi_write,
@@ -3046,6 +3242,77 @@ mod tests {
         assert_eq!(gpr[10], 0);
         assert_eq!(exec.next_pc, start_pc + 16);
         assert_eq!(exec.retired_instructions, 3);
+    }
+
+    #[test]
+    fn compiled_block_executes_bc1t_with_delay_slot() {
+        let start = 0x2340u32;
+        let mut src = TestSource::with_words(&[
+            (start, 0x4501_0002),      // bc1t +2
+            (start + 4, 0x2408_0005),  // addiu t0, r0, 5 (delay slot)
+            (start + 8, 0x2408_0063),  // addiu t0, r0, 99 (skipped)
+            (start + 12, 0x2409_0007), // addiu t1, r0, 7 (target)
+        ]);
+
+        let mut compiler = CraneliftCompiler::default();
+        let block = compiler
+            .compile(
+                &CompileRequest {
+                    start_phys: start,
+                    max_instructions: 8,
+                },
+                &mut src,
+            )
+            .expect("compile");
+
+        let mut gpr = [0u64; 32];
+        let mut fpr = [0u64; 32];
+        let mut state = CallbackState::default();
+        state.cop1_condition = 1;
+        let mut callbacks = state_callbacks(&mut state);
+        let start_pc = 0xFFFF_FFFF_8000_2340u64;
+        let exec = block.execute(&mut gpr, &mut fpr, start_pc, &mut callbacks);
+
+        assert!(block.has_control_flow);
+        assert_eq!(gpr[8], 5);
+        assert_eq!(gpr[9], 7);
+        assert_eq!(exec.next_pc, start_pc + 16);
+        assert_eq!(exec.retired_instructions, 3);
+    }
+
+    #[test]
+    fn compiled_block_executes_bc1fl_not_taken_skips_delay_slot() {
+        let start = 0x2380u32;
+        let mut src = TestSource::with_words(&[
+            (start, 0x4502_0001),      // bc1fl +1 (not taken when condition=true)
+            (start + 4, 0x2408_0005),  // addiu t0, r0, 5 (delay slot, skipped)
+            (start + 8, 0x2409_0007),  // addiu t1, r0, 7
+        ]);
+
+        let mut compiler = CraneliftCompiler::default();
+        let block = compiler
+            .compile(
+                &CompileRequest {
+                    start_phys: start,
+                    max_instructions: 8,
+                },
+                &mut src,
+            )
+            .expect("compile");
+
+        let mut gpr = [0u64; 32];
+        let mut fpr = [0u64; 32];
+        let mut state = CallbackState::default();
+        state.cop1_condition = 1;
+        let mut callbacks = state_callbacks(&mut state);
+        let start_pc = 0xFFFF_FFFF_8000_2380u64;
+        let exec = block.execute(&mut gpr, &mut fpr, start_pc, &mut callbacks);
+
+        assert!(block.has_control_flow);
+        assert_eq!(gpr[8], 0);
+        assert_eq!(gpr[9], 7);
+        assert_eq!(exec.next_pc, start_pc + 12);
+        assert_eq!(exec.retired_instructions, 2);
     }
 
     #[test]

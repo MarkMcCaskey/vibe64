@@ -8,7 +8,6 @@
 /// but the completion interrupt is delayed to model real hardware
 /// timing. The N64 OS relies on having several instructions
 /// between PI_WR_LEN write and the PI completion interrupt.
-
 use super::mi::{Mi, MiInterrupt};
 
 /// PI DMA direction.
@@ -71,7 +70,11 @@ impl Pi {
             0x04 => self.cart_addr,
             0x10 => {
                 // PI_STATUS: bit 0 = DMA busy, bit 1 = I/O busy
-                if self.dma_busy_cycles > 0 { 0x01 } else { 0x00 }
+                if self.dma_busy_cycles > 0 {
+                    0x01
+                } else {
+                    0x00
+                }
             }
             0x14 => self.dom1_lat,
             0x18 => self.dom1_pwd,
@@ -100,8 +103,12 @@ impl Pi {
             0x08 => {
                 // PI_RD_LEN: RDRAM → Cart DMA (for SRAM/Flash saves)
                 self.pending_dma_len = (val & 0x00FF_FFFF) + 1;
-                log::debug!("PI RD_LEN (RDRAM→Cart): RDRAM[{:#010X}] → Cart[{:#010X}], len={:#X}",
-                    self.dram_addr, self.cart_addr, self.pending_dma_len);
+                log::debug!(
+                    "PI RD_LEN (RDRAM→Cart): RDRAM[{:#010X}] → Cart[{:#010X}], len={:#X}",
+                    self.dram_addr,
+                    self.cart_addr,
+                    self.pending_dma_len
+                );
                 PiDmaRequest::Read
             }
             0x0C => {
@@ -116,14 +123,38 @@ impl Pi {
                 }
                 PiDmaRequest::None
             }
-            0x14 => { self.dom1_lat = val & 0xFF; PiDmaRequest::None }
-            0x18 => { self.dom1_pwd = val & 0xFF; PiDmaRequest::None }
-            0x1C => { self.dom1_pgs = val & 0x0F; PiDmaRequest::None }
-            0x20 => { self.dom1_rls = val & 0x03; PiDmaRequest::None }
-            0x24 => { self.dom2_lat = val & 0xFF; PiDmaRequest::None }
-            0x28 => { self.dom2_pwd = val & 0xFF; PiDmaRequest::None }
-            0x2C => { self.dom2_pgs = val & 0x0F; PiDmaRequest::None }
-            0x30 => { self.dom2_rls = val & 0x03; PiDmaRequest::None }
+            0x14 => {
+                self.dom1_lat = val & 0xFF;
+                PiDmaRequest::None
+            }
+            0x18 => {
+                self.dom1_pwd = val & 0xFF;
+                PiDmaRequest::None
+            }
+            0x1C => {
+                self.dom1_pgs = val & 0x0F;
+                PiDmaRequest::None
+            }
+            0x20 => {
+                self.dom1_rls = val & 0x03;
+                PiDmaRequest::None
+            }
+            0x24 => {
+                self.dom2_lat = val & 0xFF;
+                PiDmaRequest::None
+            }
+            0x28 => {
+                self.dom2_pwd = val & 0xFF;
+                PiDmaRequest::None
+            }
+            0x2C => {
+                self.dom2_pgs = val & 0x0F;
+                PiDmaRequest::None
+            }
+            0x30 => {
+                self.dom2_rls = val & 0x03;
+                PiDmaRequest::None
+            }
             _ => PiDmaRequest::None,
         }
     }
@@ -137,6 +168,20 @@ impl Pi {
                 return true; // DMA complete — raise interrupt
             }
         }
+        false
+    }
+
+    /// Tick PI DMA timer by `elapsed` CPU cycles.
+    /// Returns true when completion is crossed in this interval.
+    pub fn tick_dma_batch(&mut self, elapsed: u64) -> bool {
+        if elapsed == 0 || self.dma_busy_cycles == 0 {
+            return false;
+        }
+        if elapsed >= self.dma_busy_cycles {
+            self.dma_busy_cycles = 0;
+            return true;
+        }
+        self.dma_busy_cycles -= elapsed;
         false
     }
 }

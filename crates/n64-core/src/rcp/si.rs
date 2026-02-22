@@ -60,7 +60,10 @@ impl Si {
     /// Write to SI registers. Returns a DMA request if triggered.
     pub fn write_u32(&mut self, addr: u32, val: u32) -> SiDmaRequest {
         match addr & 0x0F_FFFF {
-            0x00 => { self.dram_addr = val & 0x00FF_FFFF; SiDmaRequest::None }
+            0x00 => {
+                self.dram_addr = val & 0x00FF_FFFF;
+                SiDmaRequest::None
+            }
             0x04 => {
                 // SI_PIF_ADDR_RD64B: triggers PIF RAM → RDRAM DMA.
                 // The value written is the PIF address (always 0x1FC007C0),
@@ -89,6 +92,20 @@ impl Si {
                 return true;
             }
         }
+        false
+    }
+
+    /// Tick SI DMA timer by `elapsed` CPU cycles.
+    /// Returns true when completion is crossed in this interval.
+    pub fn tick_dma_batch(&mut self, elapsed: u64) -> bool {
+        if elapsed == 0 || self.dma_busy_cycles == 0 {
+            return false;
+        }
+        if elapsed >= self.dma_busy_cycles {
+            self.dma_busy_cycles = 0;
+            return true;
+        }
+        self.dma_busy_cycles -= elapsed;
         false
     }
 }

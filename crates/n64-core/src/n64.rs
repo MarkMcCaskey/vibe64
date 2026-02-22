@@ -503,10 +503,8 @@ impl N64 {
 
     fn tick_peripherals_and_invalidate(&mut self, elapsed: u64) {
         self.bus.vi.tick(elapsed, &mut self.bus.mi);
-        for _ in 0..elapsed {
-            self.bus.tick_pi_dma();
-            self.bus.tick_si_dma();
-        }
+        self.bus.tick_pi_dma_batch(elapsed);
+        self.bus.tick_si_dma_batch(elapsed);
         self.bus.tick_ai_dma(elapsed);
 
         for (start, len) in self.bus.take_code_invalidations() {

@@ -237,6 +237,12 @@ impl Interconnect {
         }
     }
 
+    pub fn tick_pi_dma_batch(&mut self, elapsed: u64) {
+        if self.pi.tick_dma_batch(elapsed) {
+            self.mi.set_interrupt(crate::rcp::mi::MiInterrupt::PI);
+        }
+    }
+
     pub fn tick_ai_dma(&mut self, elapsed: u64) {
         use crate::rcp::ai::AiTickResult;
         match self.ai.tick(elapsed) {
@@ -567,6 +573,13 @@ impl Interconnect {
     /// Tick SI DMA timer. Raises SI interrupt when DMA completes.
     pub fn tick_si_dma(&mut self) {
         if self.si.tick_dma() {
+            self.mi.set_interrupt(crate::rcp::mi::MiInterrupt::SI);
+            self.si.status |= 1 << 12; // Interrupt pending
+        }
+    }
+
+    pub fn tick_si_dma_batch(&mut self, elapsed: u64) {
+        if self.si.tick_dma_batch(elapsed) {
             self.mi.set_interrupt(crate::rcp::mi::MiInterrupt::SI);
             self.si.status |= 1 << 12; // Interrupt pending
         }

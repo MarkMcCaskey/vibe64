@@ -89,6 +89,33 @@ impl Cop0 {
         }
     }
 
+    /// Advance Count/Random/timer state by multiple retired instructions.
+    ///
+    /// This is equivalent to calling `increment_count`, `decrement_random`,
+    /// and `check_timer_interrupt` once per instruction.
+    pub fn advance_by_instructions(&mut self, instructions: u32) {
+        if instructions == 0 {
+            return;
+        }
+
+        let old_count = self.regs[Self::COUNT] as u32;
+        let compare = self.regs[Self::COMPARE] as u32;
+        self.regs[Self::COUNT] = self.regs[Self::COUNT].wrapping_add(u64::from(instructions));
+
+        // Timer interrupt asserts when Count matches Compare on any retired step.
+        let delta = compare.wrapping_sub(old_count);
+        if delta != 0 && delta <= instructions {
+            self.regs[Self::CAUSE] |= 1 << 15; // IP7
+        }
+
+        let wired = (self.regs[Self::WIRED] & 0x1F) as u32;
+        let mut random = (self.regs[Self::RANDOM] & 0x1F) as u32;
+        for _ in 0..instructions {
+            random = if random <= wired { 31 } else { random - 1 };
+        }
+        self.regs[Self::RANDOM] = u64::from(random);
+    }
+
     /// Decrement Random register (wraps from Wired back to 31)
     pub fn decrement_random(&mut self) {
         let wired = self.regs[Self::WIRED] & 0x1F;
