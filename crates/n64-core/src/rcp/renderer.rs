@@ -525,7 +525,10 @@ impl Renderer {
                         rdram[src_byte] & 0x0F
                     };
 
-                    let dst = tmem_offset + dy * line_bytes + (dx >> 1);
+                    let dst = Self::swizzle_tmem_addr(
+                        tmem_offset + dy * line_bytes + (dx >> 1),
+                        dy as i32,
+                    );
                     if dst < 4096 {
                         let old = self.tmem[dst];
                         self.tmem[dst] = if (dx & 1) == 0 {
@@ -560,7 +563,7 @@ impl Renderer {
                 let src_addr = (src_base + src_offset) & (rdram.len() - 1);
                 let dst_base = tmem_offset + dy * line_bytes + dx * bpp;
                 for b in 0..bpp {
-                    let dst = dst_base + b;
+                    let dst = Self::swizzle_tmem_addr(dst_base + b, dy as i32);
                     if dst < 4096 && src_addr + b < rdram.len() {
                         self.tmem[dst] = rdram[src_addr + b];
                     }
@@ -2121,4 +2124,49 @@ fn clip_lerp_near(a: &Vertex, b: &Vertex, vp_scale: &[f32; 3], vp_trans: &[f32; 
 
 fn edge_function(v0x: f32, v0y: f32, v1x: f32, v1y: f32, px: f32, py: f32) -> f32 {
     (v1x - v0x) * (py - v0y) - (v1y - v0y) * (px - v0x)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn load_tile_odd_rows_swizzle_and_fetch_consistently() {
+        let mut renderer = Renderer::new();
+        renderer.texture_image_addr = 0;
+        renderer.texture_image_width = 8;
+        renderer.texture_image_size = 1; // 8-bit source
+
+        let tile = &mut renderer.tiles[0];
+        tile.format = 4; // I8
+        tile.size = 1;
+        tile.line = 1; // 8 bytes per TMEM row
+        tile.tmem = 0;
+        tile.sl = 0;
+        tile.tl = 0;
+        tile.sh = 7 << 2;
+        tile.th = 1 << 2;
+
+        let mut rdram = vec![0u8; 64];
+        for (i, b) in rdram.iter_mut().take(16).enumerate() {
+            *b = i as u8;
+        }
+
+        // sl=0, tl=0, sh=7, th=1 (all in 10.2 fixed-point command fields)
+        let w0 = 0u32;
+        let w1 = ((7u32 << 2) << 12) | (1u32 << 2);
+        renderer.cmd_load_tile(w0, w1, &rdram);
+
+        assert_eq!(&renderer.tmem[0..8], &[0, 1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(&renderer.tmem[8..16], &[12, 13, 14, 15, 8, 9, 10, 11]);
+
+        for x in 0..8 {
+            let texel = renderer.sample_texel_point(0, x, 1);
+            let expected = (8 + x) as u8;
+            assert_eq!(texel[0], expected);
+            assert_eq!(texel[1], expected);
+            assert_eq!(texel[2], expected);
+            assert_eq!(texel[3], expected);
+        }
+    }
 }
