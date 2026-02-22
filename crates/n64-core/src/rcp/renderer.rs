@@ -1874,6 +1874,8 @@ impl Renderer {
         let z_cmp = self.othermode_l & 0x10 != 0;
         let z_upd = self.othermode_l & 0x20 != 0;
         let z_enabled = (z_cmp || z_upd) && self.z_image_addr != 0;
+        // G_MDSFT_ZMODE (bits 10..11): 0=OPA, 1=INTER, 2=XLU, 3=DECAL.
+        let z_mode = ((self.othermode_l >> 10) & 0x3) as u8;
         let z_addr = self.z_image_addr as usize;
 
         for y in min_y..max_y {
@@ -1903,10 +1905,19 @@ impl Renderer {
                     z_value = z;
                     if z_offset + 1 < rdram.len() {
                         let old_z = u16::from_be_bytes([rdram[z_offset], rdram[z_offset + 1]]);
-                        // Z compare: lower Z = closer to camera
-                        if z_cmp && z > old_z {
-                            self.z_fail_count += 1;
-                            z_pass = false;
+                        // Z compare: lower Z = closer to camera.
+                        // Use strict compare for normal modes so equal-depth late draws
+                        // don't punch through foreground; DECAL gets a small tolerance.
+                        if z_cmp {
+                            let pass = if z_mode == 3 {
+                                z <= old_z.saturating_add(8)
+                            } else {
+                                z < old_z
+                            };
+                            if !pass {
+                                self.z_fail_count += 1;
+                                z_pass = false;
+                            }
                         }
                     }
                 }
