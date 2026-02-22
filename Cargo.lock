@@ -1470,6 +1470,7 @@ dependencies = [
  "memmap2",
  "n64-dynarec",
  "rustc-hash 1.1.0",
+ "smallvec",
  "thiserror 2.0.18",
 ]
 

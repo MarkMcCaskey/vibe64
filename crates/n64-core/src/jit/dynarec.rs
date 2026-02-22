@@ -4,6 +4,7 @@ use crate::cpu::instruction::Instruction;
 use crate::cpu::Vr4300;
 use crate::jit::{ExecutionEngine, Interpreter};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use smallvec::SmallVec;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
@@ -15,6 +16,7 @@ use n64_dynarec::{
 };
 
 const TRACKING_PAGE_SHIFT: u32 = 12;
+type PendingCodeWrites = SmallVec<[(u32, u32); 8]>;
 
 fn page_of(addr: u32) -> u32 {
     addr >> TRACKING_PAGE_SHIFT
@@ -256,7 +258,7 @@ struct CallbackContext<B: Bus> {
     cpu: *mut Vr4300,
     bus: *mut B,
     recompiler: *const Recompiler,
-    pending_code_writes: *mut Vec<(u32, u32)>,
+    pending_code_writes: *mut PendingCodeWrites,
 }
 
 unsafe fn queue_store_invalidation_if_compiled<B: Bus>(
@@ -267,12 +269,17 @@ unsafe fn queue_store_invalidation_if_compiled<B: Bus>(
     if len == 0 {
         return;
     }
+    let first_page = page_of(phys);
+    let last_page = page_of(phys.saturating_add(len.saturating_sub(1)));
     // SAFETY: pointer initialized in `run_native_block` for this invocation.
     let recompiler = unsafe { &*ctx.recompiler };
     // SAFETY: pointer initialized in `run_native_block` for this invocation.
     let pending = unsafe { &mut *ctx.pending_code_writes };
-    if recompiler.has_cached_overlap(phys, len) {
-        pending.push((phys, len));
+    for page in first_page..=last_page {
+        if recompiler.has_cached_page(page) {
+            pending.push((phys, len));
+            break;
+        }
     }
 }
 
@@ -559,7 +566,7 @@ impl DynarecEngine {
         let async_queue_limit =
             Self::parse_env_u32("N64_DYNAREC_ASYNC_QUEUE_LIMIT", 256).max(1) as usize;
         let min_native_instructions = Self::parse_env_u32("N64_DYNAREC_MIN_BLOCK_INSNS", 2);
-        let native_gas_limit = Self::parse_env_u32("N64_DYNAREC_NATIVE_GAS", 8192);
+        let native_gas_limit = Self::parse_env_u32("N64_DYNAREC_NATIVE_GAS", 16384);
         let chain_limit = Self::parse_env_u32_allow_zero("N64_DYNAREC_CHAIN_LIMIT", 0);
         let native_link_fanout = Self::parse_env_u32("N64_DYNAREC_LINK_FANOUT", 8) as usize;
         let compile_budget_us_per_ms =
@@ -1591,13 +1598,13 @@ impl DynarecEngine {
         }
         let start_pc = cpu.pc;
         let fastmem = bus.dynarec_fastmem().unwrap_or_default();
-        let mut pending_code_writes: Vec<(u32, u32)> = Vec::new();
+        let mut pending_code_writes = PendingCodeWrites::new();
         let recompiler_ptr: *const Recompiler = &self.recompiler;
         let mut callback_ctx = CallbackContext {
             cpu: (cpu as *mut Vr4300),
             bus: (bus as *mut B),
             recompiler: recompiler_ptr,
-            pending_code_writes: (&mut pending_code_writes as *mut Vec<(u32, u32)>),
+            pending_code_writes: (&mut pending_code_writes as *mut PendingCodeWrites),
         };
         let mut callbacks = RuntimeCallbacks {
             user: (&mut callback_ctx as *mut CallbackContext<B>).cast::<u8>(),
@@ -1646,11 +1653,17 @@ impl DynarecEngine {
                     run_end = run_end.max(end);
                     continue;
                 }
-                self.invalidate_range(run_start, run_end.saturating_sub(run_start));
+                let run_len = run_end.saturating_sub(run_start);
+                if self.recompiler.has_cached_overlap(run_start, run_len) {
+                    self.invalidate_range(run_start, run_len);
+                }
                 run_start = start;
                 run_end = end;
             }
-            self.invalidate_range(run_start, run_end.saturating_sub(run_start));
+            let run_len = run_end.saturating_sub(run_start);
+            if self.recompiler.has_cached_overlap(run_start, run_len) {
+                self.invalidate_range(run_start, run_len);
+            }
         }
 
         // PC history ring stores only the most recent 64 entries; when native
