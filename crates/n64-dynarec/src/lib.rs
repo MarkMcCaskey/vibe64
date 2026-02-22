@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{types, AbiParam, FuncRef, InstBuilder, MemFlags, Type, Value};
 use cranelift_codegen::settings::{self, Configurable};
-use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
+use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{default_libcall_names, FuncId, Linkage, Module};
 
@@ -744,6 +744,34 @@ fn jump_target_phys(from_phys: u32, target: u32) -> u32 {
     from_phys.wrapping_add(4) & 0xF000_0000 | (target << 2)
 }
 
+fn branch_target_phys(phys: u32, branch: BranchTerminator) -> Option<u32> {
+    match branch {
+        BranchTerminator::Beq { offset, .. }
+        | BranchTerminator::Bne { offset, .. }
+        | BranchTerminator::Beql { offset, .. }
+        | BranchTerminator::Bnel { offset, .. }
+        | BranchTerminator::Blez { offset, .. }
+        | BranchTerminator::Bgtz { offset, .. }
+        | BranchTerminator::Blezl { offset, .. }
+        | BranchTerminator::Bgtzl { offset, .. }
+        | BranchTerminator::Bltz { offset, .. }
+        | BranchTerminator::Bgez { offset, .. }
+        | BranchTerminator::Bltzl { offset, .. }
+        | BranchTerminator::Bgezl { offset, .. }
+        | BranchTerminator::Bc1f { offset }
+        | BranchTerminator::Bc1t { offset }
+        | BranchTerminator::Bc1fl { offset }
+        | BranchTerminator::Bc1tl { offset } => Some(
+            phys.wrapping_add(4)
+                .wrapping_add(((offset as i32) << 2) as u32),
+        ),
+        BranchTerminator::J { target } | BranchTerminator::Jal { target } => {
+            Some(jump_target_phys(phys, target))
+        }
+        BranchTerminator::Jr { .. } | BranchTerminator::Jalr { .. } => None,
+    }
+}
+
 fn decode_supported_non_branch(raw: u32) -> Option<Op> {
     let opcode = (raw >> 26) as u8;
     let rs = ((raw >> 21) & 0x1F) as u8;
@@ -991,27 +1019,51 @@ fn iconst_u64(builder: &mut FunctionBuilder<'_>, value: u64) -> Value {
         .iconst(types::I64, i64::from_ne_bytes(value.to_ne_bytes()))
 }
 
-fn load_gpr(builder: &mut FunctionBuilder<'_>, gpr_ptr: Value, reg: u8, flags: MemFlags) -> Value {
-    if reg == 0 {
-        builder.ins().iconst(types::I64, 0)
-    } else {
-        builder
-            .ins()
-            .load(types::I64, flags, gpr_ptr, i32::from(reg) * 8)
+const GPR_COUNT: usize = 32;
+
+fn gpr_var(reg: u8) -> Variable {
+    Variable::from_u32(u32::from(reg))
+}
+
+fn load_gpr(builder: &mut FunctionBuilder<'_>, reg: u8) -> Value {
+    builder.use_var(gpr_var(reg))
+}
+
+fn store_gpr(builder: &mut FunctionBuilder<'_>, reg: u8, value: Value) {
+    if reg != 0 {
+        builder.def_var(gpr_var(reg), value);
     }
 }
 
-fn store_gpr(
-    builder: &mut FunctionBuilder<'_>,
-    gpr_ptr: Value,
-    reg: u8,
-    value: Value,
-    flags: MemFlags,
-) {
-    if reg != 0 {
-        builder
+fn init_gpr_vars(builder: &mut FunctionBuilder<'_>, gpr_ptr: Value, flags: MemFlags) {
+    for _ in 0..GPR_COUNT {
+        let _ = builder.declare_var(types::I64);
+    }
+    let zero = builder.ins().iconst(types::I64, 0);
+    builder.def_var(gpr_var(0), zero);
+    for reg in 1..GPR_COUNT {
+        let value = builder
             .ins()
-            .store(flags, value, gpr_ptr, i32::from(reg) * 8);
+            .load(types::I64, flags, gpr_ptr, (reg as i32) * 8);
+        builder.def_var(gpr_var(reg as u8), value);
+    }
+}
+
+fn spill_gpr_vars(builder: &mut FunctionBuilder<'_>, gpr_ptr: Value, flags: MemFlags) {
+    for reg in 1..GPR_COUNT {
+        let value = builder.use_var(gpr_var(reg as u8));
+        builder.ins().store(flags, value, gpr_ptr, (reg as i32) * 8);
+    }
+}
+
+fn reload_gpr_vars(builder: &mut FunctionBuilder<'_>, gpr_ptr: Value, flags: MemFlags) {
+    let zero = builder.ins().iconst(types::I64, 0);
+    builder.def_var(gpr_var(0), zero);
+    for reg in 1..GPR_COUNT {
+        let value = builder
+            .ins()
+            .load(types::I64, flags, gpr_ptr, (reg as i32) * 8);
+        builder.def_var(gpr_var(reg as u8), value);
     }
 }
 
@@ -1458,200 +1510,200 @@ fn emit_op(
 ) {
     match op {
         Op::Addi { rs, rt, imm } | Op::Addiu { rs, rt, imm } => {
-            let rs64 = load_gpr(builder, gpr_ptr, rs, flags);
+            let rs64 = load_gpr(builder, rs);
             let rs32 = builder.ins().ireduce(types::I32, rs64);
             let imm32 = builder.ins().iconst(types::I32, i64::from(imm));
             let sum32 = builder.ins().iadd(rs32, imm32);
             let sum64 = builder.ins().sextend(types::I64, sum32);
-            store_gpr(builder, gpr_ptr, rt, sum64, flags);
+            store_gpr(builder, rt, sum64);
         }
         Op::Daddiu { rs, rt, imm } => {
-            let rs64 = load_gpr(builder, gpr_ptr, rs, flags);
+            let rs64 = load_gpr(builder, rs);
             let imm64 = iconst_u64(builder, imm as i64 as u64);
             let sum64 = builder.ins().iadd(rs64, imm64);
-            store_gpr(builder, gpr_ptr, rt, sum64, flags);
+            store_gpr(builder, rt, sum64);
         }
         Op::Slti { rs, rt, imm } => {
-            let rs64 = load_gpr(builder, gpr_ptr, rs, flags);
+            let rs64 = load_gpr(builder, rs);
             let imm64 = builder.ins().iconst(types::I64, i64::from(imm));
             let cmp = builder.ins().icmp(IntCC::SignedLessThan, rs64, imm64);
             let result = builder.ins().uextend(types::I64, cmp);
-            store_gpr(builder, gpr_ptr, rt, result, flags);
+            store_gpr(builder, rt, result);
         }
         Op::Sltiu { rs, rt, imm } => {
-            let rs64 = load_gpr(builder, gpr_ptr, rs, flags);
+            let rs64 = load_gpr(builder, rs);
             let imm64 = iconst_u64(builder, imm as i64 as u64);
             let cmp = builder.ins().icmp(IntCC::UnsignedLessThan, rs64, imm64);
             let result = builder.ins().uextend(types::I64, cmp);
-            store_gpr(builder, gpr_ptr, rt, result, flags);
+            store_gpr(builder, rt, result);
         }
         Op::Andi { rs, rt, imm } => {
-            let rs64 = load_gpr(builder, gpr_ptr, rs, flags);
+            let rs64 = load_gpr(builder, rs);
             let imm64 = iconst_u64(builder, u64::from(imm));
             let result = builder.ins().band(rs64, imm64);
-            store_gpr(builder, gpr_ptr, rt, result, flags);
+            store_gpr(builder, rt, result);
         }
         Op::Ori { rs, rt, imm } => {
-            let rs64 = load_gpr(builder, gpr_ptr, rs, flags);
+            let rs64 = load_gpr(builder, rs);
             let imm64 = iconst_u64(builder, u64::from(imm));
             let result = builder.ins().bor(rs64, imm64);
-            store_gpr(builder, gpr_ptr, rt, result, flags);
+            store_gpr(builder, rt, result);
         }
         Op::Xori { rs, rt, imm } => {
-            let rs64 = load_gpr(builder, gpr_ptr, rs, flags);
+            let rs64 = load_gpr(builder, rs);
             let imm64 = iconst_u64(builder, u64::from(imm));
             let result = builder.ins().bxor(rs64, imm64);
-            store_gpr(builder, gpr_ptr, rt, result, flags);
+            store_gpr(builder, rt, result);
         }
         Op::Lui { rt, imm } => {
             let val = ((imm as i32) as i64) << 16;
             let value = builder.ins().iconst(types::I64, val);
-            store_gpr(builder, gpr_ptr, rt, value, flags);
+            store_gpr(builder, rt, value);
         }
         Op::Addu { rs, rt, rd } => {
-            let lhs = load_gpr(builder, gpr_ptr, rs, flags);
-            let rhs = load_gpr(builder, gpr_ptr, rt, flags);
+            let lhs = load_gpr(builder, rs);
+            let rhs = load_gpr(builder, rt);
             let lhs32 = builder.ins().ireduce(types::I32, lhs);
             let rhs32 = builder.ins().ireduce(types::I32, rhs);
             let sum32 = builder.ins().iadd(lhs32, rhs32);
             let result = builder.ins().sextend(types::I64, sum32);
-            store_gpr(builder, gpr_ptr, rd, result, flags);
+            store_gpr(builder, rd, result);
         }
         Op::Subu { rs, rt, rd } => {
-            let lhs = load_gpr(builder, gpr_ptr, rs, flags);
-            let rhs = load_gpr(builder, gpr_ptr, rt, flags);
+            let lhs = load_gpr(builder, rs);
+            let rhs = load_gpr(builder, rt);
             let lhs32 = builder.ins().ireduce(types::I32, lhs);
             let rhs32 = builder.ins().ireduce(types::I32, rhs);
             let diff32 = builder.ins().isub(lhs32, rhs32);
             let result = builder.ins().sextend(types::I64, diff32);
-            store_gpr(builder, gpr_ptr, rd, result, flags);
+            store_gpr(builder, rd, result);
         }
         Op::And { rs, rt, rd } => {
-            let lhs = load_gpr(builder, gpr_ptr, rs, flags);
-            let rhs = load_gpr(builder, gpr_ptr, rt, flags);
+            let lhs = load_gpr(builder, rs);
+            let rhs = load_gpr(builder, rt);
             let result = builder.ins().band(lhs, rhs);
-            store_gpr(builder, gpr_ptr, rd, result, flags);
+            store_gpr(builder, rd, result);
         }
         Op::Or { rs, rt, rd } => {
-            let lhs = load_gpr(builder, gpr_ptr, rs, flags);
-            let rhs = load_gpr(builder, gpr_ptr, rt, flags);
+            let lhs = load_gpr(builder, rs);
+            let rhs = load_gpr(builder, rt);
             let result = builder.ins().bor(lhs, rhs);
-            store_gpr(builder, gpr_ptr, rd, result, flags);
+            store_gpr(builder, rd, result);
         }
         Op::Xor { rs, rt, rd } => {
-            let lhs = load_gpr(builder, gpr_ptr, rs, flags);
-            let rhs = load_gpr(builder, gpr_ptr, rt, flags);
+            let lhs = load_gpr(builder, rs);
+            let rhs = load_gpr(builder, rt);
             let result = builder.ins().bxor(lhs, rhs);
-            store_gpr(builder, gpr_ptr, rd, result, flags);
+            store_gpr(builder, rd, result);
         }
         Op::Nor { rs, rt, rd } => {
-            let lhs = load_gpr(builder, gpr_ptr, rs, flags);
-            let rhs = load_gpr(builder, gpr_ptr, rt, flags);
+            let lhs = load_gpr(builder, rs);
+            let rhs = load_gpr(builder, rt);
             let or_val = builder.ins().bor(lhs, rhs);
             let result = builder.ins().bnot(or_val);
-            store_gpr(builder, gpr_ptr, rd, result, flags);
+            store_gpr(builder, rd, result);
         }
         Op::Slt { rs, rt, rd } => {
-            let lhs = load_gpr(builder, gpr_ptr, rs, flags);
-            let rhs = load_gpr(builder, gpr_ptr, rt, flags);
+            let lhs = load_gpr(builder, rs);
+            let rhs = load_gpr(builder, rt);
             let cmp = builder.ins().icmp(IntCC::SignedLessThan, lhs, rhs);
             let result = builder.ins().uextend(types::I64, cmp);
-            store_gpr(builder, gpr_ptr, rd, result, flags);
+            store_gpr(builder, rd, result);
         }
         Op::Sltu { rs, rt, rd } => {
-            let lhs = load_gpr(builder, gpr_ptr, rs, flags);
-            let rhs = load_gpr(builder, gpr_ptr, rt, flags);
+            let lhs = load_gpr(builder, rs);
+            let rhs = load_gpr(builder, rt);
             let cmp = builder.ins().icmp(IntCC::UnsignedLessThan, lhs, rhs);
             let result = builder.ins().uextend(types::I64, cmp);
-            store_gpr(builder, gpr_ptr, rd, result, flags);
+            store_gpr(builder, rd, result);
         }
         Op::Daddu { rs, rt, rd } => {
-            let lhs = load_gpr(builder, gpr_ptr, rs, flags);
-            let rhs = load_gpr(builder, gpr_ptr, rt, flags);
+            let lhs = load_gpr(builder, rs);
+            let rhs = load_gpr(builder, rt);
             let result = builder.ins().iadd(lhs, rhs);
-            store_gpr(builder, gpr_ptr, rd, result, flags);
+            store_gpr(builder, rd, result);
         }
         Op::Dsubu { rs, rt, rd } => {
-            let lhs = load_gpr(builder, gpr_ptr, rs, flags);
-            let rhs = load_gpr(builder, gpr_ptr, rt, flags);
+            let lhs = load_gpr(builder, rs);
+            let rhs = load_gpr(builder, rt);
             let result = builder.ins().isub(lhs, rhs);
-            store_gpr(builder, gpr_ptr, rd, result, flags);
+            store_gpr(builder, rd, result);
         }
         Op::Sll { rt, rd, sa } => {
-            let rt64 = load_gpr(builder, gpr_ptr, rt, flags);
+            let rt64 = load_gpr(builder, rt);
             let rt32 = builder.ins().ireduce(types::I32, rt64);
             let sh = builder.ins().iconst(types::I32, i64::from(sa));
             let result32 = builder.ins().ishl(rt32, sh);
             let result64 = builder.ins().sextend(types::I64, result32);
-            store_gpr(builder, gpr_ptr, rd, result64, flags);
+            store_gpr(builder, rd, result64);
         }
         Op::Srl { rt, rd, sa } => {
-            let rt64 = load_gpr(builder, gpr_ptr, rt, flags);
+            let rt64 = load_gpr(builder, rt);
             let rt32 = builder.ins().ireduce(types::I32, rt64);
             let sh = builder.ins().iconst(types::I32, i64::from(sa));
             let result32 = builder.ins().ushr(rt32, sh);
             let result64 = builder.ins().sextend(types::I64, result32);
-            store_gpr(builder, gpr_ptr, rd, result64, flags);
+            store_gpr(builder, rd, result64);
         }
         Op::Sra { rt, rd, sa } => {
-            let rt64 = load_gpr(builder, gpr_ptr, rt, flags);
+            let rt64 = load_gpr(builder, rt);
             let sh = builder.ins().iconst(types::I64, i64::from(sa));
             let shifted64 = builder.ins().ushr(rt64, sh);
             let result32 = builder.ins().ireduce(types::I32, shifted64);
             let result64 = builder.ins().sextend(types::I64, result32);
-            store_gpr(builder, gpr_ptr, rd, result64, flags);
+            store_gpr(builder, rd, result64);
         }
         Op::Sllv { rs, rt, rd } => {
-            let rs = load_gpr(builder, gpr_ptr, rs, flags);
+            let rs = load_gpr(builder, rs);
             let sh_mask = iconst_u64(builder, 0x1F);
             let sh_masked = builder.ins().band(rs, sh_mask);
             let sh = builder.ins().ireduce(types::I32, sh_masked);
-            let rt64 = load_gpr(builder, gpr_ptr, rt, flags);
+            let rt64 = load_gpr(builder, rt);
             let rt32 = builder.ins().ireduce(types::I32, rt64);
             let result32 = builder.ins().ishl(rt32, sh);
             let result64 = builder.ins().sextend(types::I64, result32);
-            store_gpr(builder, gpr_ptr, rd, result64, flags);
+            store_gpr(builder, rd, result64);
         }
         Op::Srlv { rs, rt, rd } => {
-            let rs = load_gpr(builder, gpr_ptr, rs, flags);
+            let rs = load_gpr(builder, rs);
             let sh_mask = iconst_u64(builder, 0x1F);
             let sh_masked = builder.ins().band(rs, sh_mask);
             let sh = builder.ins().ireduce(types::I32, sh_masked);
-            let rt64 = load_gpr(builder, gpr_ptr, rt, flags);
+            let rt64 = load_gpr(builder, rt);
             let rt32 = builder.ins().ireduce(types::I32, rt64);
             let result32 = builder.ins().ushr(rt32, sh);
             let result64 = builder.ins().sextend(types::I64, result32);
-            store_gpr(builder, gpr_ptr, rd, result64, flags);
+            store_gpr(builder, rd, result64);
         }
         Op::Srav { rs, rt, rd } => {
-            let rs = load_gpr(builder, gpr_ptr, rs, flags);
+            let rs = load_gpr(builder, rs);
             let sh_mask = iconst_u64(builder, 0x1F);
             let sh = builder.ins().band(rs, sh_mask);
-            let rt64 = load_gpr(builder, gpr_ptr, rt, flags);
+            let rt64 = load_gpr(builder, rt);
             let shifted64 = builder.ins().ushr(rt64, sh);
             let result32 = builder.ins().ireduce(types::I32, shifted64);
             let result64 = builder.ins().sextend(types::I64, result32);
-            store_gpr(builder, gpr_ptr, rd, result64, flags);
+            store_gpr(builder, rd, result64);
         }
         Op::Mfhi { rd } => {
             let value = read_hi(builder, callbacks_ptr, helpers, runtime_ptrs);
-            store_gpr(builder, gpr_ptr, rd, value, flags);
+            store_gpr(builder, rd, value);
         }
         Op::Mthi { rs } => {
-            let value = load_gpr(builder, gpr_ptr, rs, flags);
+            let value = load_gpr(builder, rs);
             write_hi(builder, callbacks_ptr, helpers, runtime_ptrs, value);
         }
         Op::Mflo { rd } => {
             let value = read_lo(builder, callbacks_ptr, helpers, runtime_ptrs);
-            store_gpr(builder, gpr_ptr, rd, value, flags);
+            store_gpr(builder, rd, value);
         }
         Op::Mtlo { rs } => {
-            let value = load_gpr(builder, gpr_ptr, rs, flags);
+            let value = load_gpr(builder, rs);
             write_lo(builder, callbacks_ptr, helpers, runtime_ptrs, value);
         }
         Op::Mult { rs, rt } => {
-            let lhs = load_gpr(builder, gpr_ptr, rs, flags);
-            let rhs = load_gpr(builder, gpr_ptr, rt, flags);
+            let lhs = load_gpr(builder, rs);
+            let rhs = load_gpr(builder, rt);
             let lhs32 = builder.ins().ireduce(types::I32, lhs);
             let rhs32 = builder.ins().ireduce(types::I32, rhs);
             let lhs64 = builder.ins().sextend(types::I64, lhs32);
@@ -1667,8 +1719,8 @@ fn emit_op(
             write_hi(builder, callbacks_ptr, helpers, runtime_ptrs, hi64);
         }
         Op::Multu { rs, rt } => {
-            let lhs = load_gpr(builder, gpr_ptr, rs, flags);
-            let rhs = load_gpr(builder, gpr_ptr, rt, flags);
+            let lhs = load_gpr(builder, rs);
+            let rhs = load_gpr(builder, rt);
             let lhs32 = builder.ins().ireduce(types::I32, lhs);
             let rhs32 = builder.ins().ireduce(types::I32, rhs);
             let lhs64 = builder.ins().uextend(types::I64, lhs32);
@@ -1684,8 +1736,8 @@ fn emit_op(
             write_hi(builder, callbacks_ptr, helpers, runtime_ptrs, hi64);
         }
         Op::Div { rs, rt } => {
-            let lhs = load_gpr(builder, gpr_ptr, rs, flags);
-            let rhs = load_gpr(builder, gpr_ptr, rt, flags);
+            let lhs = load_gpr(builder, rs);
+            let rhs = load_gpr(builder, rt);
             let lhs32 = builder.ins().ireduce(types::I32, lhs);
             let rhs32 = builder.ins().ireduce(types::I32, rhs);
             let zero = builder.ins().iconst(types::I32, 0);
@@ -1710,8 +1762,8 @@ fn emit_op(
             write_hi(builder, callbacks_ptr, helpers, runtime_ptrs, hi);
         }
         Op::Divu { rs, rt } => {
-            let lhs = load_gpr(builder, gpr_ptr, rs, flags);
-            let rhs = load_gpr(builder, gpr_ptr, rt, flags);
+            let lhs = load_gpr(builder, rs);
+            let rhs = load_gpr(builder, rt);
             let lhs32 = builder.ins().ireduce(types::I32, lhs);
             let rhs32 = builder.ins().ireduce(types::I32, rhs);
             let zero = builder.ins().iconst(types::I32, 0);
@@ -1730,24 +1782,24 @@ fn emit_op(
             write_hi(builder, callbacks_ptr, helpers, runtime_ptrs, hi);
         }
         Op::Dmult { rs, rt } => {
-            let lhs = load_gpr(builder, gpr_ptr, rs, flags);
-            let rhs = load_gpr(builder, gpr_ptr, rt, flags);
+            let lhs = load_gpr(builder, rs);
+            let rhs = load_gpr(builder, rt);
             let lo = builder.ins().imul(lhs, rhs);
             let hi = builder.ins().smulhi(lhs, rhs);
             write_lo(builder, callbacks_ptr, helpers, runtime_ptrs, lo);
             write_hi(builder, callbacks_ptr, helpers, runtime_ptrs, hi);
         }
         Op::Dmultu { rs, rt } => {
-            let lhs = load_gpr(builder, gpr_ptr, rs, flags);
-            let rhs = load_gpr(builder, gpr_ptr, rt, flags);
+            let lhs = load_gpr(builder, rs);
+            let rhs = load_gpr(builder, rt);
             let lo = builder.ins().imul(lhs, rhs);
             let hi = builder.ins().umulhi(lhs, rhs);
             write_lo(builder, callbacks_ptr, helpers, runtime_ptrs, lo);
             write_hi(builder, callbacks_ptr, helpers, runtime_ptrs, hi);
         }
         Op::Ddiv { rs, rt } => {
-            let lhs = load_gpr(builder, gpr_ptr, rs, flags);
-            let rhs = load_gpr(builder, gpr_ptr, rt, flags);
+            let lhs = load_gpr(builder, rs);
+            let rhs = load_gpr(builder, rt);
             let zero = iconst_u64(builder, 0);
             let is_zero = builder.ins().icmp(IntCC::Equal, rhs, zero);
             let min_i64 = builder.ins().iconst(types::I64, i64::MIN);
@@ -1768,8 +1820,8 @@ fn emit_op(
             write_hi(builder, callbacks_ptr, helpers, runtime_ptrs, hi);
         }
         Op::Ddivu { rs, rt } => {
-            let lhs = load_gpr(builder, gpr_ptr, rs, flags);
-            let rhs = load_gpr(builder, gpr_ptr, rt, flags);
+            let lhs = load_gpr(builder, rs);
+            let rhs = load_gpr(builder, rt);
             let zero = iconst_u64(builder, 0);
             let is_zero = builder.ins().icmp(IntCC::Equal, rhs, zero);
             let one = iconst_u64(builder, 1);
@@ -1784,70 +1836,70 @@ fn emit_op(
             write_hi(builder, callbacks_ptr, helpers, runtime_ptrs, hi);
         }
         Op::Lb { base, rt, imm } => {
-            let base_addr = load_gpr(builder, gpr_ptr, base, flags);
+            let base_addr = load_gpr(builder, base);
             let vaddr = builder.ins().iadd_imm(base_addr, i64::from(imm));
             let loaded =
                 emit_load_via_fastmem(builder, callbacks_ptr, helpers.load_u8, fastmem, vaddr, 1);
             let loaded8 = builder.ins().ireduce(types::I8, loaded);
             let loaded64 = builder.ins().sextend(types::I64, loaded8);
-            store_gpr(builder, gpr_ptr, rt, loaded64, flags);
+            store_gpr(builder, rt, loaded64);
         }
         Op::Lh { base, rt, imm } => {
-            let base_addr = load_gpr(builder, gpr_ptr, base, flags);
+            let base_addr = load_gpr(builder, base);
             let vaddr = builder.ins().iadd_imm(base_addr, i64::from(imm));
             let loaded =
                 emit_load_via_fastmem(builder, callbacks_ptr, helpers.load_u16, fastmem, vaddr, 2);
             let loaded16 = builder.ins().ireduce(types::I16, loaded);
             let loaded64 = builder.ins().sextend(types::I64, loaded16);
-            store_gpr(builder, gpr_ptr, rt, loaded64, flags);
+            store_gpr(builder, rt, loaded64);
         }
         Op::Lhu { base, rt, imm } => {
-            let base_addr = load_gpr(builder, gpr_ptr, base, flags);
+            let base_addr = load_gpr(builder, base);
             let vaddr = builder.ins().iadd_imm(base_addr, i64::from(imm));
             let loaded =
                 emit_load_via_fastmem(builder, callbacks_ptr, helpers.load_u16, fastmem, vaddr, 2);
             let loaded16 = builder.ins().ireduce(types::I16, loaded);
             let loaded64 = builder.ins().uextend(types::I64, loaded16);
-            store_gpr(builder, gpr_ptr, rt, loaded64, flags);
+            store_gpr(builder, rt, loaded64);
         }
         Op::Lw { base, rt, imm } => {
-            let base_addr = load_gpr(builder, gpr_ptr, base, flags);
+            let base_addr = load_gpr(builder, base);
             let vaddr = builder.ins().iadd_imm(base_addr, i64::from(imm));
             let loaded =
                 emit_load_via_fastmem(builder, callbacks_ptr, helpers.load_u32, fastmem, vaddr, 4);
             let loaded32 = builder.ins().ireduce(types::I32, loaded);
             let loaded64 = builder.ins().sextend(types::I64, loaded32);
-            store_gpr(builder, gpr_ptr, rt, loaded64, flags);
+            store_gpr(builder, rt, loaded64);
         }
         Op::Lwu { base, rt, imm } => {
-            let base_addr = load_gpr(builder, gpr_ptr, base, flags);
+            let base_addr = load_gpr(builder, base);
             let vaddr = builder.ins().iadd_imm(base_addr, i64::from(imm));
             let loaded =
                 emit_load_via_fastmem(builder, callbacks_ptr, helpers.load_u32, fastmem, vaddr, 4);
             let loaded32 = builder.ins().ireduce(types::I32, loaded);
             let loaded64 = builder.ins().uextend(types::I64, loaded32);
-            store_gpr(builder, gpr_ptr, rt, loaded64, flags);
+            store_gpr(builder, rt, loaded64);
         }
         Op::Ld { base, rt, imm } => {
-            let base_addr = load_gpr(builder, gpr_ptr, base, flags);
+            let base_addr = load_gpr(builder, base);
             let vaddr = builder.ins().iadd_imm(base_addr, i64::from(imm));
             let loaded64 =
                 emit_load_via_fastmem(builder, callbacks_ptr, helpers.load_u64, fastmem, vaddr, 8);
-            store_gpr(builder, gpr_ptr, rt, loaded64, flags);
+            store_gpr(builder, rt, loaded64);
         }
         Op::Lbu { base, rt, imm } => {
-            let base_addr = load_gpr(builder, gpr_ptr, base, flags);
+            let base_addr = load_gpr(builder, base);
             let vaddr = builder.ins().iadd_imm(base_addr, i64::from(imm));
             let loaded =
                 emit_load_via_fastmem(builder, callbacks_ptr, helpers.load_u8, fastmem, vaddr, 1);
             let loaded8 = builder.ins().ireduce(types::I8, loaded);
             let loaded64 = builder.ins().uextend(types::I64, loaded8);
-            store_gpr(builder, gpr_ptr, rt, loaded64, flags);
+            store_gpr(builder, rt, loaded64);
         }
         Op::Sw { base, rt, imm } => {
-            let base_addr = load_gpr(builder, gpr_ptr, base, flags);
+            let base_addr = load_gpr(builder, base);
             let vaddr = builder.ins().iadd_imm(base_addr, i64::from(imm));
-            let value = load_gpr(builder, gpr_ptr, rt, flags);
+            let value = load_gpr(builder, rt);
             let value32 = builder.ins().ireduce(types::I32, value);
             let value64 = builder.ins().uextend(types::I64, value32);
             emit_store_via_fastmem(
@@ -1861,9 +1913,9 @@ fn emit_op(
             );
         }
         Op::Sb { base, rt, imm } => {
-            let base_addr = load_gpr(builder, gpr_ptr, base, flags);
+            let base_addr = load_gpr(builder, base);
             let vaddr = builder.ins().iadd_imm(base_addr, i64::from(imm));
-            let value = load_gpr(builder, gpr_ptr, rt, flags);
+            let value = load_gpr(builder, rt);
             let value8 = builder.ins().ireduce(types::I8, value);
             let value64 = builder.ins().uextend(types::I64, value8);
             emit_store_via_fastmem(
@@ -1877,9 +1929,9 @@ fn emit_op(
             );
         }
         Op::Sh { base, rt, imm } => {
-            let base_addr = load_gpr(builder, gpr_ptr, base, flags);
+            let base_addr = load_gpr(builder, base);
             let vaddr = builder.ins().iadd_imm(base_addr, i64::from(imm));
-            let value = load_gpr(builder, gpr_ptr, rt, flags);
+            let value = load_gpr(builder, rt);
             let value16 = builder.ins().ireduce(types::I16, value);
             let value64 = builder.ins().uextend(types::I64, value16);
             emit_store_via_fastmem(
@@ -1893,9 +1945,9 @@ fn emit_op(
             );
         }
         Op::Sd { base, rt, imm } => {
-            let base_addr = load_gpr(builder, gpr_ptr, base, flags);
+            let base_addr = load_gpr(builder, base);
             let vaddr = builder.ins().iadd_imm(base_addr, i64::from(imm));
-            let value = load_gpr(builder, gpr_ptr, rt, flags);
+            let value = load_gpr(builder, rt);
             emit_store_via_fastmem(
                 builder,
                 callbacks_ptr,
@@ -1907,7 +1959,7 @@ fn emit_op(
             );
         }
         Op::Lwc1 { base, ft, imm } => {
-            let base_addr = load_gpr(builder, gpr_ptr, base, flags);
+            let base_addr = load_gpr(builder, base);
             let vaddr = builder.ins().iadd_imm(base_addr, i64::from(imm));
             let loaded =
                 emit_load_via_fastmem(builder, callbacks_ptr, helpers.load_u32, fastmem, vaddr, 4);
@@ -1915,7 +1967,7 @@ fn emit_op(
             store_fpr_word(builder, fpr_ptr, ft, bits32, flags);
         }
         Op::Swc1 { base, ft, imm } => {
-            let base_addr = load_gpr(builder, gpr_ptr, base, flags);
+            let base_addr = load_gpr(builder, base);
             let vaddr = builder.ins().iadd_imm(base_addr, i64::from(imm));
             let bits32 = load_fpr_word(builder, fpr_ptr, ft, flags);
             let value64 = builder.ins().uextend(types::I64, bits32);
@@ -1930,14 +1982,14 @@ fn emit_op(
             );
         }
         Op::Ldc1 { base, ft, imm } => {
-            let base_addr = load_gpr(builder, gpr_ptr, base, flags);
+            let base_addr = load_gpr(builder, base);
             let vaddr = builder.ins().iadd_imm(base_addr, i64::from(imm));
             let loaded =
                 emit_load_via_fastmem(builder, callbacks_ptr, helpers.load_u64, fastmem, vaddr, 8);
             store_fpr_double_bits(builder, fpr_ptr, ft, loaded, flags);
         }
         Op::Sdc1 { base, ft, imm } => {
-            let base_addr = load_gpr(builder, gpr_ptr, base, flags);
+            let base_addr = load_gpr(builder, base);
             let vaddr = builder.ins().iadd_imm(base_addr, i64::from(imm));
             let value = load_fpr_double_bits(builder, fpr_ptr, ft, flags);
             emit_store_via_fastmem(
@@ -1953,10 +2005,10 @@ fn emit_op(
         Op::Mfc1 { rt, fs } => {
             let bits32 = load_fpr_word(builder, fpr_ptr, fs, flags);
             let value64 = builder.ins().sextend(types::I64, bits32);
-            store_gpr(builder, gpr_ptr, rt, value64, flags);
+            store_gpr(builder, rt, value64);
         }
         Op::Mtc1 { rt, fs } => {
-            let value64 = load_gpr(builder, gpr_ptr, rt, flags);
+            let value64 = load_gpr(builder, rt);
             let bits32 = builder.ins().ireduce(types::I32, value64);
             store_fpr_word(builder, fpr_ptr, fs, bits32, flags);
         }
@@ -2038,26 +2090,28 @@ fn emit_op(
             let value = builder.inst_results(call)[0];
             let value32 = builder.ins().ireduce(types::I32, value);
             let value64 = builder.ins().sextend(types::I64, value32);
-            store_gpr(builder, gpr_ptr, rt, value64, flags);
+            store_gpr(builder, rt, value64);
         }
         Op::Dmfc0 { rt, rd } => {
             let reg = iconst_u64(builder, u64::from(rd));
             let call = builder.ins().call(helpers.cop0_read, &[callbacks_ptr, reg]);
             let value = builder.inst_results(call)[0];
-            store_gpr(builder, gpr_ptr, rt, value, flags);
+            store_gpr(builder, rt, value);
         }
         Op::Mtc0 { rt, rd } | Op::Dmtc0 { rt, rd } => {
             let reg = iconst_u64(builder, u64::from(rd));
-            let value = load_gpr(builder, gpr_ptr, rt, flags);
+            let value = load_gpr(builder, rt);
             builder
                 .ins()
                 .call(helpers.cop0_write, &[callbacks_ptr, reg, value]);
         }
         Op::Interp { raw } => {
             let raw = iconst_u64(builder, u64::from(raw));
+            spill_gpr_vars(builder, gpr_ptr, flags);
             builder
                 .ins()
                 .call(helpers.interp_exec, &[callbacks_ptr, raw, current_pc]);
+            reload_gpr_vars(builder, gpr_ptr, flags);
         }
         Op::Sync => {
             // SYNC is a no-op for this emulator core.
@@ -2575,6 +2629,7 @@ impl BlockCompiler for CraneliftCompiler {
         let mut flags = MemFlags::new();
         flags.set_notrap();
         flags.set_aligned();
+        init_gpr_vars(&mut builder, gpr_ptr, flags);
 
         let mut phys_to_index = HashMap::with_capacity(steps.len());
         for (idx, step) in steps.iter().copied().enumerate() {
@@ -2585,40 +2640,54 @@ impl BlockCompiler for CraneliftCompiler {
             let TraceStep::Branch { phys, branch, .. } = step else {
                 return false;
             };
-            let target_phys = match branch {
-                BranchTerminator::Beq { offset, .. }
-                | BranchTerminator::Bne { offset, .. }
-                | BranchTerminator::Beql { offset, .. }
-                | BranchTerminator::Bnel { offset, .. }
-                | BranchTerminator::Blez { offset, .. }
-                | BranchTerminator::Bgtz { offset, .. }
-                | BranchTerminator::Blezl { offset, .. }
-                | BranchTerminator::Bgtzl { offset, .. }
-                | BranchTerminator::Bltz { offset, .. }
-                | BranchTerminator::Bgez { offset, .. }
-                | BranchTerminator::Bltzl { offset, .. }
-                | BranchTerminator::Bgezl { offset, .. }
-                | BranchTerminator::Bc1f { offset }
-                | BranchTerminator::Bc1t { offset }
-                | BranchTerminator::Bc1fl { offset }
-                | BranchTerminator::Bc1tl { offset } => phys
-                    .wrapping_add(4)
-                    .wrapping_add(((offset as i32) << 2) as u32),
-                BranchTerminator::J { target } | BranchTerminator::Jal { target } => {
-                    jump_target_phys(phys, target)
-                }
-                BranchTerminator::Jr { .. } | BranchTerminator::Jalr { .. } => return false,
+            let Some(target_phys) = branch_target_phys(phys, branch) else {
+                return false;
             };
-            match phys_to_index.get(&target_phys).copied() {
-                Some(target_idx) => target_idx <= step_idx,
-                None => false,
-            }
+            phys_to_index
+                .get(&target_phys)
+                .copied()
+                .map(|target_idx| target_idx <= step_idx)
+                .unwrap_or(false)
         });
+
+        let mut block_starts = vec![0usize];
+        for (step_idx, step) in steps.iter().copied().enumerate() {
+            let TraceStep::Branch {
+                phys,
+                branch,
+                continue_fallthrough,
+                ..
+            } = step
+            else {
+                continue;
+            };
+            if continue_fallthrough && step_idx + 1 < steps.len() {
+                block_starts.push(step_idx + 1);
+            }
+            if let Some(target_phys) = branch_target_phys(phys, branch) {
+                if let Some(target_idx) = phys_to_index.get(&target_phys).copied() {
+                    block_starts.push(target_idx);
+                }
+            }
+        }
+        block_starts.sort_unstable();
+        block_starts.dedup();
+
+        let mut block_for_step = vec![0usize; steps.len()];
+        for (block_idx, &start_idx) in block_starts.iter().enumerate() {
+            let end_idx = block_starts
+                .get(block_idx + 1)
+                .copied()
+                .unwrap_or(steps.len());
+            for step_idx in start_idx..end_idx {
+                block_for_step[step_idx] = block_idx;
+            }
+        }
 
         let exit_block = builder.create_block();
         builder.append_block_param(exit_block, types::I64);
         builder.append_block_param(exit_block, types::I32);
-        let step_blocks: Vec<_> = steps
+        let step_blocks: Vec<_> = block_starts
             .iter()
             .map(|_| {
                 let b = builder.create_block();
@@ -2641,10 +2710,18 @@ impl BlockCompiler for CraneliftCompiler {
         let args = [zero_retired.into()];
         builder.ins().jump(step_blocks[0], &args);
 
+        let mut active_block = None;
+        let mut active_block_idx = 0usize;
+        let mut retired_count = zero_retired;
         for (step_idx, step) in steps.iter().copied().enumerate() {
-            let step_block = step_blocks[step_idx];
-            builder.switch_to_block(step_block);
-            let retired_count = builder.block_params(step_block)[0];
+            let block_idx = block_for_step[step_idx];
+            let step_block = step_blocks[block_idx];
+            if active_block != Some(step_block) {
+                builder.switch_to_block(step_block);
+                retired_count = builder.block_params(step_block)[0];
+                active_block = Some(step_block);
+                active_block_idx = block_idx;
+            }
             let step_phys = step.phys();
             let step_delta = i64::from(step_phys.wrapping_sub(request.start_phys));
             let current_pc = builder.ins().iadd_imm(start_pc, step_delta);
@@ -2680,14 +2757,25 @@ impl BlockCompiler for CraneliftCompiler {
                         current_pc,
                         op,
                     );
-                    let retired_after = builder.ins().iadd_imm(retired_count, 1);
-                    if let Some(next_block) = step_blocks.get(step_idx + 1).copied() {
-                        let args = [retired_after.into()];
-                        builder.ins().jump(next_block, &args);
+                    retired_count = builder.ins().iadd_imm(retired_count, 1);
+                    let next_block_idx = if step_idx + 1 < steps.len() {
+                        Some(block_for_step[step_idx + 1])
                     } else {
-                        let ret_pc = builder.ins().iadd_imm(current_pc, 4);
-                        let args = [ret_pc.into(), retired_after.into()];
-                        builder.ins().jump(exit_block, &args);
+                        None
+                    };
+                    match next_block_idx {
+                        Some(next_idx) if next_idx == active_block_idx => {}
+                        Some(next_idx) => {
+                            let args = [retired_count.into()];
+                            builder.ins().jump(step_blocks[next_idx], &args);
+                            active_block = None;
+                        }
+                        None => {
+                            let ret_pc = builder.ins().iadd_imm(current_pc, 4);
+                            let args = [ret_pc.into(), retired_count.into()];
+                            builder.ins().jump(exit_block, &args);
+                            active_block = None;
+                        }
                     }
                 }
                 TraceStep::Branch {
@@ -2698,8 +2786,8 @@ impl BlockCompiler for CraneliftCompiler {
                 } => {
                     let next_of_branch = builder.ins().iadd_imm(current_pc, 4);
                     let fallthrough_pc = builder.ins().iadd_imm(current_pc, 8);
-                    let fallthrough_block = if continue_fallthrough {
-                        step_blocks.get(step_idx + 1).copied()
+                    let fallthrough_block = if continue_fallthrough && step_idx + 1 < steps.len() {
+                        Some(step_blocks[block_for_step[step_idx + 1]])
                     } else {
                         None
                     };
@@ -2710,7 +2798,7 @@ impl BlockCompiler for CraneliftCompiler {
                             let target_block = phys_to_index
                                 .get(&target_phys)
                                 .copied()
-                                .map(|idx| step_blocks[idx]);
+                                .map(|idx| step_blocks[block_for_step[idx]]);
                             emit_op(
                                 &mut builder,
                                 gpr_ptr,
@@ -2741,9 +2829,9 @@ impl BlockCompiler for CraneliftCompiler {
                             let target_block = phys_to_index
                                 .get(&target_phys)
                                 .copied()
-                                .map(|idx| step_blocks[idx]);
+                                .map(|idx| step_blocks[block_for_step[idx]]);
                             let link = builder.ins().iadd_imm(current_pc, 8);
-                            store_gpr(&mut builder, gpr_ptr, 31, link, flags);
+                            store_gpr(&mut builder, 31, link);
                             emit_op(
                                 &mut builder,
                                 gpr_ptr,
@@ -2782,14 +2870,14 @@ impl BlockCompiler for CraneliftCompiler {
                                 next_of_branch,
                                 delay_op,
                             );
-                            let target_pc = load_gpr(&mut builder, gpr_ptr, rs, flags);
+                            let target_pc = load_gpr(&mut builder, rs);
                             let retired_after = builder.ins().iadd_imm(retired_count, 2);
                             let args = [target_pc.into(), retired_after.into()];
                             builder.ins().jump(exit_block, &args);
                         }
                         BranchTerminator::Jalr { rs, rd } => {
                             let link = builder.ins().iadd_imm(current_pc, 8);
-                            store_gpr(&mut builder, gpr_ptr, rd, link, flags);
+                            store_gpr(&mut builder, rd, link);
                             emit_op(
                                 &mut builder,
                                 gpr_ptr,
@@ -2802,7 +2890,7 @@ impl BlockCompiler for CraneliftCompiler {
                                 next_of_branch,
                                 delay_op,
                             );
-                            let target_pc = load_gpr(&mut builder, gpr_ptr, rs, flags);
+                            let target_pc = load_gpr(&mut builder, rs);
                             let retired_after = builder.ins().iadd_imm(retired_count, 2);
                             let args = [target_pc.into(), retired_after.into()];
                             builder.ins().jump(exit_block, &args);
@@ -2811,8 +2899,8 @@ impl BlockCompiler for CraneliftCompiler {
                         | BranchTerminator::Bne { rs, rt, offset }
                         | BranchTerminator::Beql { rs, rt, offset }
                         | BranchTerminator::Bnel { rs, rt, offset } => {
-                            let lhs = load_gpr(&mut builder, gpr_ptr, rs, flags);
-                            let rhs = load_gpr(&mut builder, gpr_ptr, rt, flags);
+                            let lhs = load_gpr(&mut builder, rs);
+                            let rhs = load_gpr(&mut builder, rt);
                             let cond_taken = match branch {
                                 BranchTerminator::Beq { .. } | BranchTerminator::Beql { .. } => {
                                     builder.ins().icmp(IntCC::Equal, lhs, rhs)
@@ -2829,7 +2917,7 @@ impl BlockCompiler for CraneliftCompiler {
                             let taken_block = phys_to_index
                                 .get(&target_phys)
                                 .copied()
-                                .map(|idx| step_blocks[idx]);
+                                .map(|idx| step_blocks[block_for_step[idx]]);
                             let is_likely = matches!(
                                 branch,
                                 BranchTerminator::Beql { .. } | BranchTerminator::Bnel { .. }
@@ -2966,7 +3054,7 @@ impl BlockCompiler for CraneliftCompiler {
                             let taken_block = phys_to_index
                                 .get(&target_phys)
                                 .copied()
-                                .map(|idx| step_blocks[idx]);
+                                .map(|idx| step_blocks[block_for_step[idx]]);
                             let is_likely = matches!(
                                 branch,
                                 BranchTerminator::Bc1fl { .. } | BranchTerminator::Bc1tl { .. }
@@ -3084,7 +3172,7 @@ impl BlockCompiler for CraneliftCompiler {
                         | BranchTerminator::Bgez { rs, offset }
                         | BranchTerminator::Bltzl { rs, offset }
                         | BranchTerminator::Bgezl { rs, offset } => {
-                            let lhs = load_gpr(&mut builder, gpr_ptr, rs, flags);
+                            let lhs = load_gpr(&mut builder, rs);
                             let zero = iconst_u64(&mut builder, 0);
                             let cond_taken = match branch {
                                 BranchTerminator::Blez { .. } | BranchTerminator::Blezl { .. } => {
@@ -3110,7 +3198,7 @@ impl BlockCompiler for CraneliftCompiler {
                             let taken_block = phys_to_index
                                 .get(&target_phys)
                                 .copied()
-                                .map(|idx| step_blocks[idx]);
+                                .map(|idx| step_blocks[block_for_step[idx]]);
                             let is_likely = matches!(
                                 branch,
                                 BranchTerminator::Blezl { .. }
@@ -3224,6 +3312,7 @@ impl BlockCompiler for CraneliftCompiler {
                             }
                         }
                     }
+                    active_block = None;
                 }
             }
         }
@@ -3233,6 +3322,7 @@ impl BlockCompiler for CraneliftCompiler {
         let exit_params = builder.block_params(exit_block);
         let ret_pc = exit_params[0];
         let retired_count = exit_params[1];
+        spill_gpr_vars(&mut builder, gpr_ptr, flags);
 
         builder
             .ins()
