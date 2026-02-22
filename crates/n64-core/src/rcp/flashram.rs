@@ -10,7 +10,7 @@
 /// Data transfer happens via PI DMA when cart_addr is in the 0x0800_0000 range.
 
 const FLASH_SIZE: usize = 0x20000; // 128 KB
-const PAGE_SIZE: usize = 128;      // 128 bytes per page
+const PAGE_SIZE: usize = 128; // 128 bytes per page
 const SECTOR_SIZE: usize = 128 * PAGE_SIZE; // 16 KB per sector
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -95,7 +95,11 @@ impl FlashRam {
                         if offset < FLASH_SIZE {
                             self.data[offset..end].fill(0xFF);
                             self.dirty = true;
-                            log::debug!("FlashRAM: erased sector {} (offset {:#X})", self.erase_sector, offset);
+                            log::debug!(
+                                "FlashRAM: erased sector {} (offset {:#X})",
+                                self.erase_sector,
+                                offset
+                            );
                         }
                         self.status |= 0x08; // Erase success
                     }

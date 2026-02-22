@@ -8,22 +8,22 @@
 /// Tile descriptor — one of 8 texture tile configurations.
 #[derive(Clone, Copy, Default)]
 pub struct TileDescriptor {
-    pub format: u8,    // 0=RGBA, 1=YUV, 2=CI, 3=IA, 4=I
-    pub size: u8,      // 0=4bit, 1=8bit, 2=16bit, 3=32bit
-    pub line: u16,     // TMEM line stride (in 64-bit words)
-    pub tmem: u16,     // TMEM offset (in 64-bit words)
-    pub palette: u8,   // Palette index (for CI4)
-    pub cm_s: u8,      // Clamp/Mirror/Wrap for S
-    pub mask_s: u8,    // S mask (power of 2)
-    pub shift_s: u8,   // S shift
-    pub cm_t: u8,      // Clamp/Mirror/Wrap for T
-    pub mask_t: u8,    // T mask (power of 2)
-    pub shift_t: u8,   // T shift
+    pub format: u8,  // 0=RGBA, 1=YUV, 2=CI, 3=IA, 4=I
+    pub size: u8,    // 0=4bit, 1=8bit, 2=16bit, 3=32bit
+    pub line: u16,   // TMEM line stride (in 64-bit words)
+    pub tmem: u16,   // TMEM offset (in 64-bit words)
+    pub palette: u8, // Palette index (for CI4)
+    pub cm_s: u8,    // Clamp/Mirror/Wrap for S
+    pub mask_s: u8,  // S mask (power of 2)
+    pub shift_s: u8, // S shift
+    pub cm_t: u8,    // Clamp/Mirror/Wrap for T
+    pub mask_t: u8,  // T mask (power of 2)
+    pub shift_t: u8, // T shift
     // Tile size (set by G_SETTILESIZE)
-    pub sl: u16,       // S low (10.2 fixed-point)
-    pub tl: u16,       // T low (10.2 fixed-point)
-    pub sh: u16,       // S high (10.2 fixed-point)
-    pub th: u16,       // T high (10.2 fixed-point)
+    pub sl: u16, // S low (10.2 fixed-point)
+    pub tl: u16, // T low (10.2 fixed-point)
+    pub sh: u16, // S high (10.2 fixed-point)
+    pub th: u16, // T high (10.2 fixed-point)
 }
 
 /// Transformed vertex with both clip-space and screen-space coordinates.
@@ -33,7 +33,7 @@ pub struct Vertex {
     pub x: f32,
     pub y: f32,
     pub z: f32,
-    pub w: f32,       // 1/clip_w
+    pub w: f32, // 1/clip_w
     // Clip space (before perspective divide, for near-plane clipping)
     pub clip_x: f32,
     pub clip_y: f32,
@@ -79,10 +79,10 @@ pub struct Renderer {
     pub othermode_l: u32,
 
     // ─── Colors ───
-    pub env_color: [u8; 4],    // RGBA
-    pub prim_color: [u8; 4],   // RGBA
-    pub blend_color: [u8; 4],  // RGBA
-    pub fog_color: [u8; 4],    // RGBA
+    pub env_color: [u8; 4],   // RGBA
+    pub prim_color: [u8; 4],  // RGBA
+    pub blend_color: [u8; 4], // RGBA
+    pub fog_color: [u8; 4],   // RGBA
     pub prim_lod_frac: u8,
     pub prim_min_level: u8,
 
@@ -102,9 +102,9 @@ pub struct Renderer {
 
     // ─── Lighting ───
     pub num_dir_lights: u8,
-    pub light_colors: [[u8; 3]; 8],   // 0..num_dir_lights = directional, num_dir_lights = ambient
+    pub light_colors: [[u8; 3]; 8], // 0..num_dir_lights = directional, num_dir_lights = ambient
     pub light_dirs: [[i8; 3]; 8],
-    pub lookat: [[f32; 3]; 2],        // lookat_x [0] and lookat_y [1] for texgen
+    pub lookat: [[f32; 3]; 2], // lookat_x [0] and lookat_y [1] for texgen
 
     // ─── Texture memory (4 KB, mirroring real TMEM) ───
     pub tmem: [u8; 4096],
@@ -156,8 +156,7 @@ pub struct Renderer {
     pub best_frame_snapshot: Vec<u8>,
     pub best_frame_nonblack: u32,
     /// Track all unique color image addresses used by GFX tasks
-    pub ci_history: Vec<(u32, u32, u32, u32, u32)>,  // (ci_addr, tris, fb_nonblack, task_writes, task_nb_writes)
-
+    pub ci_history: Vec<(u32, u32, u32, u32, u32)>, // (ci_addr, tris, fb_nonblack, task_writes, task_nb_writes)
 }
 
 impl Renderer {
@@ -255,8 +254,12 @@ impl Renderer {
         self.color_image_size = ((w0 >> 19) & 0x3) as u8;
         self.color_image_width = (w0 & 0xFFF) + 1;
         self.color_image_addr = self.resolve_segment(w1);
-        log::trace!("SetColorImage: addr={:#X} width={} size={}",
-            self.color_image_addr, self.color_image_width, self.color_image_size);
+        log::trace!(
+            "SetColorImage: addr={:#X} width={} size={}",
+            self.color_image_addr,
+            self.color_image_width,
+            self.color_image_size
+        );
     }
 
     /// G_SETZIMG: Set the depth buffer destination.
@@ -432,7 +435,9 @@ impl Renderer {
             } else {
                 (tl_i * src_pitch_texels + sl_i) * src_bpp
             };
-        let copy_len = byte_count.min(4096 - tmem_offset).min(rdram.len().saturating_sub(src));
+        let copy_len = byte_count
+            .min(4096 - tmem_offset)
+            .min(rdram.len().saturating_sub(src));
 
         if dxt == 0 {
             // No interleaving — simple copy
@@ -662,8 +667,13 @@ impl Renderer {
     /// w0: [E4][lrx:12][lry:12]  w1: [tile:3][00][ulx:12][uly:12]
     /// extra0: [s:16][t:16]       extra1: [dsdx:16][dtdy:16]
     pub fn cmd_texture_rect(
-        &mut self, w0: u32, w1: u32, extra0: u32, extra1: u32,
-        rdram: &mut [u8], flip: bool,
+        &mut self,
+        w0: u32,
+        w1: u32,
+        extra0: u32,
+        extra1: u32,
+        rdram: &mut [u8],
+        flip: bool,
     ) {
         let lrx = ((w0 >> 12) & 0xFFF) as i32;
         let lry = (w0 & 0xFFF) as i32;
@@ -822,7 +832,8 @@ impl Renderer {
                     let val = self.tmem[byte_offset];
                     match tile.format {
                         2 => self.lookup_tlut(val as usize), // CI8
-                        3 => { // IA8: I[7:4], A[3:0]
+                        3 => {
+                            // IA8: I[7:4], A[3:0]
                             let hi = (val >> 4) & 0xF;
                             let i = (hi << 4) | hi; // expand 4-bit to 8-bit: 0xF → 0xFF
                             let lo = val & 0xF;
@@ -845,7 +856,8 @@ impl Renderer {
                     let val = ((hi as u16) << 8) | lo as u16;
                     match tile.format {
                         0 => unpack_rgba5551(val), // RGBA16
-                        3 => { // IA16: I[15:8], A[7:0]
+                        3 => {
+                            // IA16: I[15:8], A[7:0]
                             let i = hi;
                             [i, i, i, lo]
                         }
@@ -876,7 +888,11 @@ impl Renderer {
 
     fn swizzle_tmem_addr(addr: usize, ti: i32) -> usize {
         // TMEM swaps 32-bit halves on odd T rows.
-        if (ti & 1) != 0 { addr ^ 0x4 } else { addr }
+        if (ti & 1) != 0 {
+            addr ^ 0x4
+        } else {
+            addr
+        }
     }
 
     fn apply_tile_shift_fixed(coord: i32, shift: u8) -> i32 {
@@ -905,7 +921,11 @@ impl Renderer {
             coord.clamp(0, size - 1)
         } else if mirror {
             let c = coord & (size * 2 - 1);
-            if c >= size { size * 2 - 1 - c } else { c }
+            if c >= size {
+                size * 2 - 1 - c
+            } else {
+                c
+            }
         } else {
             coord & (size - 1)
         }
@@ -941,10 +961,13 @@ impl Renderer {
         let cycle = self.cycle_type();
 
         // Copy mode: pass texel through directly
-        if cycle == 2 { return texel0; }
+        if cycle == 2 {
+            return texel0;
+        }
         // Fill mode: shouldn't reach here (handled by fill_rect)
-        if cycle == 3 { return texel0; }
-
+        if cycle == 3 {
+            return texel0;
+        }
 
         // Extract cycle 0 selectors from combine_hi / combine_lo.
         // combine_hi[23:0]: a0[23:20] c0[19:15] Aa0[14:12] Ac0[11:9] a1[8:5] c1[4:0]
@@ -953,36 +976,32 @@ impl Renderer {
         //   Ab0[14:12] Ad0[11:9] d1[8:6] Ab1[5:3] Ad1[2:0]
         let a0_rgb = ((self.combine_hi >> 20) & 0xF) as u8;
         let c0_rgb = ((self.combine_hi >> 15) & 0x1F) as u8;
-        let a0_a   = ((self.combine_hi >> 12) & 0x7) as u8;
-        let c0_a   = ((self.combine_hi >> 9) & 0x7) as u8;
+        let a0_a = ((self.combine_hi >> 12) & 0x7) as u8;
+        let c0_a = ((self.combine_hi >> 9) & 0x7) as u8;
         let b0_rgb = ((self.combine_lo >> 28) & 0xF) as u8;
         let d0_rgb = ((self.combine_lo >> 15) & 0x7) as u8;
-        let b0_a   = ((self.combine_lo >> 12) & 0x7) as u8;
-        let d0_a   = ((self.combine_lo >> 9) & 0x7) as u8;
+        let b0_a = ((self.combine_lo >> 12) & 0x7) as u8;
+        let d0_a = ((self.combine_lo >> 9) & 0x7) as u8;
 
         // Cycle 0: COMBINED input is zero (no prior cycle output)
         let combined = [0u8; 4];
         let result = self.cc_evaluate(
-            a0_rgb, b0_rgb, c0_rgb, d0_rgb,
-            a0_a, b0_a, c0_a, d0_a,
-            &combined, &texel0, &shade,
+            a0_rgb, b0_rgb, c0_rgb, d0_rgb, a0_a, b0_a, c0_a, d0_a, &combined, &texel0, &shade,
         );
 
         // 2-cycle mode: run again with cycle 1 selectors, feeding cycle 0 result as COMBINED
         if cycle == 1 {
             let a1_rgb = ((self.combine_hi >> 5) & 0xF) as u8;
             let c1_rgb = (self.combine_hi & 0x1F) as u8;
-            let a1_a   = ((self.combine_lo >> 21) & 0x7) as u8;
-            let c1_a   = ((self.combine_lo >> 18) & 0x7) as u8;
+            let a1_a = ((self.combine_lo >> 21) & 0x7) as u8;
+            let c1_a = ((self.combine_lo >> 18) & 0x7) as u8;
             let b1_rgb = ((self.combine_lo >> 24) & 0xF) as u8;
             let d1_rgb = ((self.combine_lo >> 6) & 0x7) as u8;
-            let b1_a   = ((self.combine_lo >> 3) & 0x7) as u8;
-            let d1_a   = (self.combine_lo & 0x7) as u8;
+            let b1_a = ((self.combine_lo >> 3) & 0x7) as u8;
+            let d1_a = (self.combine_lo & 0x7) as u8;
 
             let cycle1_result = self.cc_evaluate(
-                a1_rgb, b1_rgb, c1_rgb, d1_rgb,
-                a1_a, b1_a, c1_a, d1_a,
-                &result, &texel0, &shade,
+                a1_rgb, b1_rgb, c1_rgb, d1_rgb, a1_a, b1_a, c1_a, d1_a, &result, &texel0, &shade,
             );
 
             return cycle1_result;
@@ -994,9 +1013,17 @@ impl Renderer {
     /// Apply (A - B) * C + D for RGB and Alpha using the given selectors.
     fn cc_evaluate(
         &self,
-        a_rgb_sel: u8, b_rgb_sel: u8, c_rgb_sel: u8, d_rgb_sel: u8,
-        a_a_sel: u8, b_a_sel: u8, c_a_sel: u8, d_a_sel: u8,
-        combined: &[u8; 4], texel0: &[u8; 4], shade: &[u8; 4],
+        a_rgb_sel: u8,
+        b_rgb_sel: u8,
+        c_rgb_sel: u8,
+        d_rgb_sel: u8,
+        a_a_sel: u8,
+        b_a_sel: u8,
+        c_a_sel: u8,
+        d_a_sel: u8,
+        combined: &[u8; 4],
+        texel0: &[u8; 4],
+        shade: &[u8; 4],
     ) -> [u8; 4] {
         let a_rgb = self.cc_rgb_a(a_rgb_sel, combined, texel0, shade);
         let b_rgb = self.cc_rgb_b(b_rgb_sel, combined, texel0, shade);
@@ -1010,8 +1037,7 @@ impl Renderer {
 
         let mut result = [0u8; 4];
         for i in 0..3 {
-            let v = ((a_rgb[i] as i32 - b_rgb[i] as i32) * c_rgb[i] as i32) / 256
-                + d_rgb[i] as i32;
+            let v = ((a_rgb[i] as i32 - b_rgb[i] as i32) * c_rgb[i] as i32) / 256 + d_rgb[i] as i32;
             result[i] = v.clamp(0, 255) as u8;
         }
         let v = ((a_a as i32 - b_a as i32) * c_a as i32) / 256 + d_a as i32;
@@ -1049,20 +1075,20 @@ impl Renderer {
     /// RGB input C (5-bit, 32 options): includes alpha-as-RGB variants and LOD fraction.
     fn cc_rgb_c(&self, sel: u8, combined: &[u8; 4], texel0: &[u8; 4], shade: &[u8; 4]) -> [u8; 3] {
         match sel {
-            0  => [combined[0], combined[1], combined[2]],
-            1  => [texel0[0], texel0[1], texel0[2]],
-            2  => [texel0[0], texel0[1], texel0[2]], // TEXEL1
-            3  => [self.prim_color[0], self.prim_color[1], self.prim_color[2]],
-            4  => [shade[0], shade[1], shade[2]],
-            5  => [self.env_color[0], self.env_color[1], self.env_color[2]],
-            7  => [combined[3], combined[3], combined[3]],     // COMBINED_ALPHA
-            8  => [texel0[3], texel0[3], texel0[3]],           // TEXEL0_ALPHA
-            9  => [texel0[3], texel0[3], texel0[3]],           // TEXEL1_ALPHA
-            10 => [self.prim_color[3]; 3],                     // PRIM_ALPHA
-            11 => [shade[3]; 3],                               // SHADE_ALPHA
-            12 => [self.env_color[3]; 3],                      // ENV_ALPHA
-            14 => [self.prim_lod_frac; 3],                     // PRIM_LOD_FRAC
-            _  => [0, 0, 0], // KEY_SCALE, LOD_FRAC, K5, 0
+            0 => [combined[0], combined[1], combined[2]],
+            1 => [texel0[0], texel0[1], texel0[2]],
+            2 => [texel0[0], texel0[1], texel0[2]], // TEXEL1
+            3 => [self.prim_color[0], self.prim_color[1], self.prim_color[2]],
+            4 => [shade[0], shade[1], shade[2]],
+            5 => [self.env_color[0], self.env_color[1], self.env_color[2]],
+            7 => [combined[3], combined[3], combined[3]], // COMBINED_ALPHA
+            8 => [texel0[3], texel0[3], texel0[3]],       // TEXEL0_ALPHA
+            9 => [texel0[3], texel0[3], texel0[3]],       // TEXEL1_ALPHA
+            10 => [self.prim_color[3]; 3],                // PRIM_ALPHA
+            11 => [shade[3]; 3],                          // SHADE_ALPHA
+            12 => [self.env_color[3]; 3],                 // ENV_ALPHA
+            14 => [self.prim_lod_frac; 3],                // PRIM_LOD_FRAC
+            _ => [0, 0, 0],                               // KEY_SCALE, LOD_FRAC, K5, 0
         }
     }
 
@@ -1122,10 +1148,14 @@ impl Renderer {
 
         for i in 0..num {
             let idx = start + i;
-            if idx >= 32 { break; }
+            if idx >= 32 {
+                break;
+            }
 
             let off = addr + i * 16; // 16 bytes per vertex
-            if off + 15 >= rdram.len() { break; }
+            if off + 15 >= rdram.len() {
+                break;
+            }
 
             let x = read_i16(rdram, off) as f32;
             let y = read_i16(rdram, off + 2) as f32;
@@ -1142,9 +1172,15 @@ impl Renderer {
                 let nz = rdram[(off + 14) & (rdram.len() - 1)] as i8 as f32;
 
                 // Transform normal by modelview upper-3x3 (n * M, row-vector convention)
-                let wnx = nx * self.modelview[0][0] + ny * self.modelview[1][0] + nz * self.modelview[2][0];
-                let wny = nx * self.modelview[0][1] + ny * self.modelview[1][1] + nz * self.modelview[2][1];
-                let wnz = nx * self.modelview[0][2] + ny * self.modelview[1][2] + nz * self.modelview[2][2];
+                let wnx = nx * self.modelview[0][0]
+                    + ny * self.modelview[1][0]
+                    + nz * self.modelview[2][0];
+                let wny = nx * self.modelview[0][1]
+                    + ny * self.modelview[1][1]
+                    + nz * self.modelview[2][1];
+                let wnz = nx * self.modelview[0][2]
+                    + ny * self.modelview[1][2]
+                    + nz * self.modelview[2][2];
                 let len = (wnx * wnx + wny * wny + wnz * wnz).sqrt();
                 let (wnx, wny, wnz) = if len > 0.001 {
                     (wnx / len, wny / len, wnz / len)
@@ -1154,7 +1190,11 @@ impl Renderer {
 
                 // Ambient light is at index num_dir_lights
                 let n = self.num_dir_lights as usize;
-                let amb = if n < 8 { self.light_colors[n] } else { [64, 64, 64] };
+                let amb = if n < 8 {
+                    self.light_colors[n]
+                } else {
+                    [64, 64, 64]
+                };
 
                 let mut ra = amb[0] as f32;
                 let mut ga = amb[1] as f32;
@@ -1175,23 +1215,35 @@ impl Renderer {
                 // onto lookat vectors (set by gSPLookAt). The dot product gives
                 // how much the normal aligns with each viewing axis.
                 let s = if self.geometry_mode & 0x40000 != 0 {
-                    let dot_x = wnx * self.lookat[0][0] + wny * self.lookat[0][1] + wnz * self.lookat[0][2];
+                    let dot_x =
+                        wnx * self.lookat[0][0] + wny * self.lookat[0][1] + wnz * self.lookat[0][2];
                     if self.geometry_mode & 0x80000 != 0 {
                         (-dot_x).clamp(-1.0, 1.0).acos() / std::f32::consts::PI * 32768.0
                     } else {
                         dot_x * 16384.0 + 16384.0
                     }
-                } else { s };
+                } else {
+                    s
+                };
                 let t = if self.geometry_mode & 0x40000 != 0 {
-                    let dot_y = wnx * self.lookat[1][0] + wny * self.lookat[1][1] + wnz * self.lookat[1][2];
+                    let dot_y =
+                        wnx * self.lookat[1][0] + wny * self.lookat[1][1] + wnz * self.lookat[1][2];
                     if self.geometry_mode & 0x80000 != 0 {
                         (-dot_y).clamp(-1.0, 1.0).acos() / std::f32::consts::PI * 32768.0
                     } else {
                         dot_y * 16384.0 + 16384.0
                     }
-                } else { t };
+                } else {
+                    t
+                };
 
-                (ra.clamp(0.0, 255.0) as u8, ga.clamp(0.0, 255.0) as u8, ba.clamp(0.0, 255.0) as u8, s, t)
+                (
+                    ra.clamp(0.0, 255.0) as u8,
+                    ga.clamp(0.0, 255.0) as u8,
+                    ba.clamp(0.0, 255.0) as u8,
+                    s,
+                    t,
+                )
             } else {
                 // No lighting — read raw vertex colors
                 let r = rdram[(off + 12) & (rdram.len() - 1)];
@@ -1207,8 +1259,8 @@ impl Renderer {
             // and replace vertex alpha with it. The blender then uses shade alpha
             // to lerp between pixel color and fog_color.
             let a = if self.geometry_mode & 0x10000 != 0 && cw.abs() > 0.0001 {
-                let fog = (cw * self.fog_multiplier as f32 + self.fog_offset as f32)
-                    .clamp(0.0, 255.0);
+                let fog =
+                    (cw * self.fog_multiplier as f32 + self.fog_offset as f32).clamp(0.0, 255.0);
                 fog as u8
             } else {
                 a
@@ -1224,15 +1276,34 @@ impl Renderer {
                     y: -cy * inv_w * self.viewport_scale[1] + self.viewport_trans[1],
                     z,
                     w: inv_w,
-                    clip_x: cx, clip_y: cy, clip_z: cz, clip_w: cw,
-                    s, t, r, g, b, a,
+                    clip_x: cx,
+                    clip_y: cy,
+                    clip_z: cz,
+                    clip_w: cw,
+                    s,
+                    t,
+                    r,
+                    g,
+                    b,
+                    a,
                 };
             } else {
                 // Vertex behind camera — store clip coords for near-plane clipping
                 self.vertex_buffer[idx] = Vertex {
-                    x: 0.0, y: 0.0, z: 0.0, w: 0.0,
-                    clip_x: cx, clip_y: cy, clip_z: cz, clip_w: cw,
-                    s, t, r, g, b, a,
+                    x: 0.0,
+                    y: 0.0,
+                    z: 0.0,
+                    w: 0.0,
+                    clip_x: cx,
+                    clip_y: cy,
+                    clip_z: cz,
+                    clip_w: cw,
+                    s,
+                    t,
+                    r,
+                    g,
+                    b,
+                    a,
                 };
             }
         }
@@ -1278,8 +1349,14 @@ impl Renderer {
 
         let mat = load_fixed_point_matrix(rdram, addr);
 
-        log::trace!("G_MTX: params={:#04X} push={} load={} proj={} addr={:#X}",
-            params, push, load, projection, addr);
+        log::trace!(
+            "G_MTX: params={:#04X} push={} load={} proj={} addr={:#X}",
+            params,
+            push,
+            load,
+            projection,
+            addr
+        );
 
         if projection {
             if load {
@@ -1293,7 +1370,11 @@ impl Renderer {
                 self.matrix_stack.push(self.modelview);
             }
             // RSP microcode prepends: stack = new * old
-            self.modelview = if load { mat } else { mat4_mul(&mat, &self.modelview) };
+            self.modelview = if load {
+                mat
+            } else {
+                mat4_mul(&mat, &self.modelview)
+            };
         }
 
         // N64 uses v * MVP, so MVP = MV * P
@@ -1317,7 +1398,9 @@ impl Renderer {
     pub fn cmd_modify_vtx(&mut self, w0: u32, w1: u32) {
         let where_field = (w0 >> 16) & 0xFF;
         let vtx_idx = ((w0 & 0xFFFF) / 2) as usize; // byte offset into vertex buffer / 2
-        if vtx_idx >= 32 { return; }
+        if vtx_idx >= 32 {
+            return;
+        }
 
         match where_field {
             0x10 => {
@@ -1333,8 +1416,12 @@ impl Renderer {
                 self.vertex_buffer[vtx_idx].a = w1 as u8;
             }
             _ => {
-                log::trace!("G_MODIFYVTX: unhandled where={:#X} vtx={} val={:#X}",
-                    where_field, vtx_idx, w1);
+                log::trace!(
+                    "G_MODIFYVTX: unhandled where={:#X} vtx={} val={:#X}",
+                    where_field,
+                    vtx_idx,
+                    w1
+                );
             }
         }
     }
@@ -1350,7 +1437,8 @@ impl Renderer {
         self.texture_scale_s = (w1 >> 16) as u16;
         self.texture_scale_t = (w1 & 0xFFFF) as u16;
         self.texture_tile = ((w0 >> 8) & 0x7) as u8;
-        self.texture_on = (w0 & 0xFF) != 0 || self.texture_scale_s != 0 || self.texture_scale_t != 0;
+        self.texture_on =
+            (w0 & 0xFF) != 0 || self.texture_scale_s != 0 || self.texture_scale_t != 0;
     }
 
     /// G_MOVEMEM/G_MV_VIEWPORT: Load viewport parameters from RDRAM.
@@ -1367,10 +1455,14 @@ impl Renderer {
     /// Light data is 16 bytes: col[3], pad, colc[3], pad, dir[3], pad, pad*4.
     pub fn cmd_set_light(&mut self, dmem_offset: usize, addr: u32, rdram: &[u8]) {
         let slot = dmem_offset / 24;
-        if slot > 9 { return; }
+        if slot > 9 {
+            return;
+        }
 
         let a = self.resolve_segment(addr) as usize;
-        if a + 11 >= rdram.len() { return; }
+        if a + 11 >= rdram.len() {
+            return;
+        }
 
         if slot < 2 {
             // Lookat vectors: slot 0 = lookat_x, slot 1 = lookat_y
@@ -1381,13 +1473,11 @@ impl Renderer {
             self.lookat[slot] = [dx, dy, dz];
         } else {
             let idx = slot - 2;
-            if idx >= 8 { return; }
+            if idx >= 8 {
+                return;
+            }
             self.light_colors[idx] = [rdram[a], rdram[a + 1], rdram[a + 2]];
-            self.light_dirs[idx] = [
-                rdram[a + 8] as i8,
-                rdram[a + 9] as i8,
-                rdram[a + 10] as i8,
-            ];
+            self.light_dirs[idx] = [rdram[a + 8] as i8, rdram[a + 9] as i8, rdram[a + 10] as i8];
         }
     }
 
@@ -1409,7 +1499,12 @@ impl Renderer {
             3 => {
                 let offset = addr + ((y * width + x) as usize) * 4;
                 if offset + 3 < rdram.len() {
-                    [rdram[offset], rdram[offset + 1], rdram[offset + 2], rdram[offset + 3]]
+                    [
+                        rdram[offset],
+                        rdram[offset + 1],
+                        rdram[offset + 2],
+                        rdram[offset + 3],
+                    ]
                 } else {
                     [0, 0, 0, 0]
                 }
@@ -1451,7 +1546,13 @@ impl Renderer {
         // CVG_X_ALPHA (bit 12): coverage *= CC alpha (for alpha cutout).
         let alpha_cvg_sel = self.othermode_l & (1 << 13) != 0;
         let a: u16 = match a_sel {
-            0 => if alpha_cvg_sel { 255 } else { pixel[3] as u16 },
+            0 => {
+                if alpha_cvg_sel {
+                    255
+                } else {
+                    pixel[3] as u16
+                }
+            }
             1 => self.fog_color[3] as u16,
             2 => shade_alpha as u16,
             _ => 0,
@@ -1488,7 +1589,14 @@ impl Renderer {
     /// Write a pixel to the framebuffer with alpha compare and blending.
     /// `shade_alpha` is the raw interpolated vertex alpha (for blender A_SEL=2).
     /// Returns true when the color buffer is updated.
-    fn write_pixel(&mut self, rdram: &mut [u8], x: i32, y: i32, color: [u8; 4], shade_alpha: u8) -> bool {
+    fn write_pixel(
+        &mut self,
+        rdram: &mut [u8],
+        x: i32,
+        y: i32,
+        color: [u8; 4],
+        shade_alpha: u8,
+    ) -> bool {
         // Fully transparent texels should not emit color/depth.
         if color[3] == 0 {
             return false;
@@ -1528,8 +1636,15 @@ impl Renderer {
         match self.color_image_size {
             2 => {
                 let offset = addr + ((y * width + x) as usize) * 2;
-                if offset + 1 >= rdram.len() { return false; }
-                let pixel = pack_rgba5551(final_color[0], final_color[1], final_color[2], final_color[3]);
+                if offset + 1 >= rdram.len() {
+                    return false;
+                }
+                let pixel = pack_rgba5551(
+                    final_color[0],
+                    final_color[1],
+                    final_color[2],
+                    final_color[3],
+                );
                 let bytes = pixel.to_be_bytes();
                 rdram[offset] = bytes[0];
                 rdram[offset + 1] = bytes[1];
@@ -1537,7 +1652,9 @@ impl Renderer {
             }
             3 => {
                 let offset = addr + ((y * width + x) as usize) * 4;
-                if offset + 3 >= rdram.len() { return false; }
+                if offset + 3 >= rdram.len() {
+                    return false;
+                }
                 rdram[offset] = final_color[0];
                 rdram[offset + 1] = final_color[1];
                 rdram[offset + 2] = final_color[2];
@@ -1593,12 +1710,22 @@ impl Renderer {
                         count += 1;
                         if !next_in {
                             // Edge exits: emit intersection
-                            output[count] = clip_lerp_near(&curr, &next, &self.viewport_scale, &self.viewport_trans);
+                            output[count] = clip_lerp_near(
+                                &curr,
+                                &next,
+                                &self.viewport_scale,
+                                &self.viewport_trans,
+                            );
                             count += 1;
                         }
                     } else if next_in {
                         // Edge enters: emit intersection
-                        output[count] = clip_lerp_near(&curr, &next, &self.viewport_scale, &self.viewport_trans);
+                        output[count] = clip_lerp_near(
+                            &curr,
+                            &next,
+                            &self.viewport_scale,
+                            &self.viewport_trans,
+                        );
                         count += 1;
                     }
                 }
@@ -1624,10 +1751,10 @@ impl Renderer {
         let gb_max_y = 720.0f32;
 
         // Trivial rejection: if all 3 vertices are outside the same edge, skip
-        if (v0.x < gb_min_x && v1.x < gb_min_x && v2.x < gb_min_x) ||
-           (v0.x > gb_max_x && v1.x > gb_max_x && v2.x > gb_max_x) ||
-           (v0.y < gb_min_y && v1.y < gb_min_y && v2.y < gb_min_y) ||
-           (v0.y > gb_max_y && v1.y > gb_max_y && v2.y > gb_max_y)
+        if (v0.x < gb_min_x && v1.x < gb_min_x && v2.x < gb_min_x)
+            || (v0.x > gb_max_x && v1.x > gb_max_x && v2.x > gb_max_x)
+            || (v0.y < gb_min_y && v1.y < gb_min_y && v2.y < gb_min_y)
+            || (v0.y > gb_max_y && v1.y > gb_max_y && v2.y > gb_max_y)
         {
             return;
         }
@@ -1635,18 +1762,28 @@ impl Renderer {
         // If any vertex is outside the guard band, check if the triangle
         // could still contribute pixels. If vertices are wildly off-screen,
         // skip to avoid precision issues in the edge function.
-        let any_outside = v0.x < gb_min_x || v0.x > gb_max_x ||
-                          v0.y < gb_min_y || v0.y > gb_max_y ||
-                          v1.x < gb_min_x || v1.x > gb_max_x ||
-                          v1.y < gb_min_y || v1.y > gb_max_y ||
-                          v2.x < gb_min_x || v2.x > gb_max_x ||
-                          v2.y < gb_min_y || v2.y > gb_max_y;
+        let any_outside = v0.x < gb_min_x
+            || v0.x > gb_max_x
+            || v0.y < gb_min_y
+            || v0.y > gb_max_y
+            || v1.x < gb_min_x
+            || v1.x > gb_max_x
+            || v1.y < gb_min_y
+            || v1.y > gb_max_y
+            || v2.x < gb_min_x
+            || v2.x > gb_max_x
+            || v2.y < gb_min_y
+            || v2.y > gb_max_y;
 
         if any_outside {
             // Check for NaN/Inf which would break the rasterizer
-            if !v0.x.is_finite() || !v0.y.is_finite() ||
-               !v1.x.is_finite() || !v1.y.is_finite() ||
-               !v2.x.is_finite() || !v2.y.is_finite() {
+            if !v0.x.is_finite()
+                || !v0.y.is_finite()
+                || !v1.x.is_finite()
+                || !v1.y.is_finite()
+                || !v2.x.is_finite()
+                || !v2.y.is_finite()
+            {
                 return;
             }
         }
@@ -1660,9 +1797,24 @@ impl Renderer {
         // Record edges for wireframe overlay
         if self.debug_wireframe && self.wire_edges.len() < 500_000 {
             use crate::debug::WireEdge;
-            self.wire_edges.push(WireEdge { x0: v0.x, y0: v0.y, x1: v1.x, y1: v1.y });
-            self.wire_edges.push(WireEdge { x0: v1.x, y0: v1.y, x1: v2.x, y1: v2.y });
-            self.wire_edges.push(WireEdge { x0: v2.x, y0: v2.y, x1: v0.x, y1: v0.y });
+            self.wire_edges.push(WireEdge {
+                x0: v0.x,
+                y0: v0.y,
+                x1: v1.x,
+                y1: v1.y,
+            });
+            self.wire_edges.push(WireEdge {
+                x0: v1.x,
+                y0: v1.y,
+                x1: v2.x,
+                y1: v2.y,
+            });
+            self.wire_edges.push(WireEdge {
+                x0: v2.x,
+                y0: v2.y,
+                x1: v0.x,
+                y1: v0.y,
+            });
         }
 
         // Bounding box clipped to scissor
@@ -1676,11 +1828,15 @@ impl Renderer {
         let max_x = v0.x.max(v1.x).max(v2.x).min(scr_lrx).ceil() as i32;
         let max_y = v0.y.max(v1.y).max(v2.y).min(scr_lry).ceil() as i32;
 
-        if min_x >= max_x || min_y >= max_y { return; }
+        if min_x >= max_x || min_y >= max_y {
+            return;
+        }
 
         // Triangle area via edge function — also detects degenerate triangles
         let area = edge_function(v0.x, v0.y, v1.x, v1.y, v2.x, v2.y);
-        if area.abs() < 0.001 { return; }
+        if area.abs() < 0.001 {
+            return;
+        }
 
         // Face culling: check geometry_mode flags
         // G_CULL_FRONT = 0x0200, G_CULL_BACK = 0x0400
@@ -1693,8 +1849,14 @@ impl Renderer {
         let cull_back = self.geometry_mode & 0x0400 != 0;
         if cull_front != cull_back {
             // Only one cull mode active — apply it
-            if cull_back && area > 0.0 { self.cull_count += 1; return; }
-            if cull_front && area < 0.0 { self.cull_count += 1; return; }
+            if cull_back && area > 0.0 {
+                self.cull_count += 1;
+                return;
+            }
+            if cull_front && area < 0.0 {
+                self.cull_count += 1;
+                return;
+            }
         }
 
         let inv_area = 1.0 / area;
@@ -1721,7 +1883,9 @@ impl Renderer {
                 let w2 = 1.0 - w0 - w1;
 
                 // Inside test: all barycentric coords must be non-negative
-                if w0 < 0.0 || w1 < 0.0 || w2 < 0.0 { continue; }
+                if w0 < 0.0 || w1 < 0.0 || w2 < 0.0 {
+                    continue;
+                }
 
                 // Z-buffer depth test
                 let mut z_pass = true;
@@ -1732,9 +1896,8 @@ impl Renderer {
                     // of post-divide Z causes camera-angle dependent overlap errors.
                     let inv_w = w0 * v0.w + w1 * v1.w + w2 * v2.w;
                     let zf = if inv_w.abs() > 1e-10 {
-                        let z_over_w = w0 * v0.clip_z * v0.w
-                            + w1 * v1.clip_z * v1.w
-                            + w2 * v2.clip_z * v2.w;
+                        let z_over_w =
+                            w0 * v0.clip_z * v0.w + w1 * v1.clip_z * v1.w + w2 * v2.clip_z * v2.w;
                         let z_ndc = z_over_w / inv_w;
                         z_ndc * self.viewport_scale[2] + self.viewport_trans[2]
                     } else {
@@ -1753,17 +1916,19 @@ impl Renderer {
                         }
                     }
                 }
-                if !z_pass { continue; }
+                if !z_pass {
+                    continue;
+                }
 
                 // Interpolate vertex color
-                let r = (w0 * v0.r as f32 + w1 * v1.r as f32 + w2 * v2.r as f32)
-                    .clamp(0.0, 255.0) as u8;
-                let g = (w0 * v0.g as f32 + w1 * v1.g as f32 + w2 * v2.g as f32)
-                    .clamp(0.0, 255.0) as u8;
-                let b = (w0 * v0.b as f32 + w1 * v1.b as f32 + w2 * v2.b as f32)
-                    .clamp(0.0, 255.0) as u8;
-                let a = (w0 * v0.a as f32 + w1 * v1.a as f32 + w2 * v2.a as f32)
-                    .clamp(0.0, 255.0) as u8;
+                let r = (w0 * v0.r as f32 + w1 * v1.r as f32 + w2 * v2.r as f32).clamp(0.0, 255.0)
+                    as u8;
+                let g = (w0 * v0.g as f32 + w1 * v1.g as f32 + w2 * v2.g as f32).clamp(0.0, 255.0)
+                    as u8;
+                let b = (w0 * v0.b as f32 + w1 * v1.b as f32 + w2 * v2.b as f32).clamp(0.0, 255.0)
+                    as u8;
+                let a = (w0 * v0.a as f32 + w1 * v1.a as f32 + w2 * v2.a as f32).clamp(0.0, 255.0)
+                    as u8;
 
                 // Sample texture if enabled, otherwise texel0 = zero
                 let texel0 = if textured {
@@ -1776,8 +1941,10 @@ impl Renderer {
                         let t_over_w = w0 * v0.t * v0.w + w1 * v1.t * v1.w + w2 * v2.t * v2.w;
                         (s_over_w / inv_w, t_over_w / inv_w)
                     } else {
-                        (w0 * v0.s + w1 * v1.s + w2 * v2.s,
-                         w0 * v0.t + w1 * v1.t + w2 * v2.t)
+                        (
+                            w0 * v0.s + w1 * v1.s + w2 * v2.s,
+                            w0 * v0.t + w1 * v1.t + w2 * v2.t,
+                        )
                     };
                     let scaled_s = (tex_s * self.texture_scale_s as f32 / 65536.0) as i32;
                     let scaled_t = (tex_t * self.texture_scale_t as f32 / 65536.0) as i32;
@@ -1850,10 +2017,10 @@ fn mat4_mul(a: &[[f32; 4]; 4], b: &[[f32; 4]; 4]) -> [[f32; 4]; 4] {
 /// Compute v * M (row-vector × matrix), matching N64 RSP convention.
 fn mat4_mul_vec(m: &[[f32; 4]; 4], v: [f32; 4]) -> [f32; 4] {
     [
-        v[0]*m[0][0] + v[1]*m[1][0] + v[2]*m[2][0] + v[3]*m[3][0],
-        v[0]*m[0][1] + v[1]*m[1][1] + v[2]*m[2][1] + v[3]*m[3][1],
-        v[0]*m[0][2] + v[1]*m[1][2] + v[2]*m[2][2] + v[3]*m[3][2],
-        v[0]*m[0][3] + v[1]*m[1][3] + v[2]*m[2][3] + v[3]*m[3][3],
+        v[0] * m[0][0] + v[1] * m[1][0] + v[2] * m[2][0] + v[3] * m[3][0],
+        v[0] * m[0][1] + v[1] * m[1][1] + v[2] * m[2][1] + v[3] * m[3][1],
+        v[0] * m[0][2] + v[1] * m[1][2] + v[2] * m[2][2] + v[3] * m[3][2],
+        v[0] * m[0][3] + v[1] * m[1][3] + v[2] * m[2][3] + v[3] * m[3][3],
     ]
 }
 
@@ -1930,8 +2097,16 @@ fn clip_lerp_near(a: &Vertex, b: &Vertex, vp_scale: &[f32; 3], vp_trans: &[f32; 
         y: -cy * inv_w * vp_scale[1] + vp_trans[1],
         z: (cz * inv_w * vp_scale[2] + vp_trans[2]).clamp(0.0, 0xFFFF as f32),
         w: inv_w,
-        clip_x: cx, clip_y: cy, clip_z: cz, clip_w: cw,
-        s, t: tc, r, g, b: bl, a: al,
+        clip_x: cx,
+        clip_y: cy,
+        clip_z: cz,
+        clip_w: cw,
+        s,
+        t: tc,
+        r,
+        g,
+        b: bl,
+        a: al,
     }
 }
 

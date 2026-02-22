@@ -3,7 +3,6 @@
 /// Draws text, wireframe, depth buffer, and diagnostic info onto the
 /// pixels RGBA8888 buffer AFTER the normal framebuffer blit, so it
 /// never corrupts emulation state.
-
 use n64_core::bus::map::Interconnect;
 use n64_core::debug::DebugState;
 use winit::keyboard::KeyCode;
@@ -230,12 +229,16 @@ fn set_pixel(buf: &mut [u8], x: usize, y: usize, r: u8, g: u8, b: u8) {
 }
 
 fn draw_char(buf: &mut [u8], x: usize, y: usize, ch: u8, r: u8, g: u8, b: u8) {
-    if ch < FONT_FIRST || ch > 126 { return; }
+    if ch < FONT_FIRST || ch > 126 {
+        return;
+    }
     let idx = (ch - FONT_FIRST) as usize;
     let glyph = &FONT[idx * 8..(idx + 1) * 8];
     for row in 0..FONT_CHAR_H {
         let py = y + row;
-        if py >= HEIGHT { break; }
+        if py >= HEIGHT {
+            break;
+        }
         let bits = glyph[row];
         for col in 0..8usize {
             if bits & (0x80 >> col) != 0 {
@@ -260,10 +263,14 @@ fn draw_text(buf: &mut [u8], x: usize, y: usize, text: &str, r: u8, g: u8, b: u8
 fn draw_rect_bg(buf: &mut [u8], x: usize, y: usize, w: usize, h: usize) {
     for dy in 0..h {
         let py = y + dy;
-        if py >= HEIGHT { break; }
+        if py >= HEIGHT {
+            break;
+        }
         for dx in 0..w {
             let px = x + dx;
-            if px >= WIDTH { break; }
+            if px >= WIDTH {
+                break;
+            }
             let off = (py * WIDTH + px) * 4;
             // Darken to ~25% brightness
             buf[off] = buf[off] >> 2;
@@ -287,10 +294,18 @@ fn draw_line(buf: &mut [u8], x0: i32, y0: i32, x1: i32, y1: i32, r: u8, g: u8, b
         if x >= 0 && x < WIDTH as i32 && y >= 0 && y < HEIGHT as i32 {
             set_pixel(buf, x as usize, y as usize, r, g, b);
         }
-        if x == x1 && y == y1 { break; }
+        if x == x1 && y == y1 {
+            break;
+        }
         let e2 = 2 * err;
-        if e2 >= dy { err += dy; x += sx; }
-        if e2 <= dx { err += dx; y += sy; }
+        if e2 >= dy {
+            err += dy;
+            x += sx;
+        }
+        if e2 <= dx {
+            err += dx;
+            y += sy;
+        }
     }
 }
 
@@ -303,21 +318,35 @@ fn draw_stats_hud(buf: &mut [u8], debug: &DebugState, bus: &Interconnect) {
     let stats = &debug.prev_stats;
     let fps = {
         let avg = debug.fps_samples.iter().sum::<f64>() / 60.0;
-        if avg > 0.001 { 1000.0 / avg } else { 0.0 }
+        if avg > 0.001 {
+            1000.0 / avg
+        } else {
+            0.0
+        }
     };
 
     let lines: [String; 8] = [
         format!("FPS: {:.1}", fps),
         format!("Tris: {}", stats.tri_count),
         format!("Vtx:  {}", stats.vtx_count),
-        format!("Fill: {}  Tex: {}", stats.fill_rect_count, stats.tex_rect_count),
+        format!(
+            "Fill: {}  Tex: {}",
+            stats.fill_rect_count, stats.tex_rect_count
+        ),
         format!("DL cmds: {}", stats.dl_cmd_count),
-        format!("RSP: gfx={} aud={}", stats.rsp_gfx_tasks, stats.rsp_audio_tasks),
+        format!(
+            "RSP: gfx={} aud={}",
+            stats.rsp_gfx_tasks, stats.rsp_audio_tasks
+        ),
         format!("VI: {}x{} origin={:#X}", bus.vi.width, 240, bus.vi.origin),
         format!("Frame: {}", debug.frame_count),
     ];
 
-    let max_w = lines.iter().map(|l| l.len() * FONT_CHAR_W + 8).max().unwrap_or(100);
+    let max_w = lines
+        .iter()
+        .map(|l| l.len() * FONT_CHAR_W + 8)
+        .max()
+        .unwrap_or(100);
     draw_rect_bg(buf, 2, 2, max_w, lines.len() * 9 + 4);
 
     for (i, line) in lines.iter().enumerate() {
@@ -334,15 +363,25 @@ fn draw_wireframe(buf: &mut [u8], debug: &DebugState) {
     let mut y_max = f32::MIN;
 
     for edge in &debug.wire_edges {
-        let on_screen = edge.x0 >= 0.0 && edge.x0 < WIDTH as f32
-            && edge.y0 >= 0.0 && edge.y0 < HEIGHT as f32;
-        if on_screen { visible += 1; }
+        let on_screen =
+            edge.x0 >= 0.0 && edge.x0 < WIDTH as f32 && edge.y0 >= 0.0 && edge.y0 < HEIGHT as f32;
+        if on_screen {
+            visible += 1;
+        }
         x_min = x_min.min(edge.x0).min(edge.x1);
         x_max = x_max.max(edge.x0).max(edge.x1);
         y_min = y_min.min(edge.y0).min(edge.y1);
         y_max = y_max.max(edge.y0).max(edge.y1);
-        draw_line(buf, edge.x0 as i32, edge.y0 as i32,
-                  edge.x1 as i32, edge.y1 as i32, 0x00, 0xFF, 0x00);
+        draw_line(
+            buf,
+            edge.x0 as i32,
+            edge.y0 as i32,
+            edge.x1 as i32,
+            edge.y1 as i32,
+            0x00,
+            0xFF,
+            0x00,
+        );
     }
 
     // Show edge stats with coordinate ranges
@@ -356,7 +395,11 @@ fn draw_wireframe(buf: &mut [u8], debug: &DebugState) {
     } else {
         vec!["Wire: 0 edges".to_string()]
     };
-    let max_w = lines.iter().map(|l| l.len() * FONT_CHAR_W + 8).max().unwrap_or(100);
+    let max_w = lines
+        .iter()
+        .map(|l| l.len() * FONT_CHAR_W + 8)
+        .max()
+        .unwrap_or(100);
     draw_rect_bg(buf, WIDTH - max_w - 2, 2, max_w, lines.len() * 9 + 4);
     for (i, line) in lines.iter().enumerate() {
         draw_text(buf, WIDTH - max_w, 4 + i * 9, line, 0x00, 0xFF, 0x00);
@@ -371,7 +414,15 @@ fn draw_depth_viz(buf: &mut [u8], bus: &Interconnect) {
 
     if z_addr == 0 || z_addr + width * HEIGHT * 2 >= rdram.len() {
         draw_rect_bg(buf, 2, 2, 180, 14);
-        draw_text(buf, 4, 4, &format!("Z: addr={:#X} (invalid)", z_addr), 0xFF, 0x40, 0x40);
+        draw_text(
+            buf,
+            4,
+            4,
+            &format!("Z: addr={:#X} (invalid)", z_addr),
+            0xFF,
+            0x40,
+            0x40,
+        );
         return;
     }
 
@@ -384,12 +435,22 @@ fn draw_depth_viz(buf: &mut [u8], bus: &Interconnect) {
     for y in 0..HEIGHT {
         for x in 0..width {
             let offset = z_addr + (y * width + x) * 2;
-            if offset + 1 >= rdram.len() { continue; }
+            if offset + 1 >= rdram.len() {
+                continue;
+            }
             let z = u16::from_be_bytes([rdram[offset], rdram[offset + 1]]);
-            if z != 0 { z_nonzero += 1; }
-            if z != 0xFFFF { z_non_ffff += 1; }
-            if z < z_min { z_min = z; }
-            if z > z_max { z_max = z; }
+            if z != 0 {
+                z_nonzero += 1;
+            }
+            if z != 0xFFFF {
+                z_non_ffff += 1;
+            }
+            if z < z_min {
+                z_min = z;
+            }
+            if z > z_max {
+                z_max = z;
+            }
             // Map Z to grayscale: 0=white (near), 0xFFFF=black (far)
             let gray = (255u16).saturating_sub(z >> 7).min(255) as u8;
             set_pixel(buf, x, y, gray, gray, gray);
@@ -402,7 +463,11 @@ fn draw_depth_viz(buf: &mut [u8], bus: &Interconnect) {
         format!("min={:#06X} max={:#06X}", z_min, z_max),
         format!("non0={} nonFF={}", z_nonzero, z_non_ffff),
     ];
-    let max_w = lines.iter().map(|l| l.len() * FONT_CHAR_W + 8).max().unwrap_or(100);
+    let max_w = lines
+        .iter()
+        .map(|l| l.len() * FONT_CHAR_W + 8)
+        .max()
+        .unwrap_or(100);
     draw_rect_bg(buf, 2, 2, max_w, lines.len() * 9 + 4);
     for (i, line) in lines.iter().enumerate() {
         draw_text(buf, 4, 4 + i * 9, line, 0xFF, 0xFF, 0x00);
@@ -416,23 +481,50 @@ fn draw_texture_info(buf: &mut [u8], bus: &Interconnect) {
 
     for i in 0..8 {
         let t = &r.tiles[i];
-        if t.line == 0 && t.tmem == 0 { continue; }
+        if t.line == 0 && t.tmem == 0 {
+            continue;
+        }
         let fmt = match t.format {
-            0 => "RGBA", 1 => "YUV", 2 => "CI", 3 => "IA", 4 => "I", _ => "?"
+            0 => "RGBA",
+            1 => "YUV",
+            2 => "CI",
+            3 => "IA",
+            4 => "I",
+            _ => "?",
         };
-        let bpp = match t.size { 0 => "4b", 1 => "8b", 2 => "16b", 3 => "32b", _ => "?" };
-        lines.push(format!("T{}: {} {} tmem={} pal={} {}x{}",
-            i, fmt, bpp, t.tmem, t.palette,
+        let bpp = match t.size {
+            0 => "4b",
+            1 => "8b",
+            2 => "16b",
+            3 => "32b",
+            _ => "?",
+        };
+        lines.push(format!(
+            "T{}: {} {} tmem={} pal={} {}x{}",
+            i,
+            fmt,
+            bpp,
+            t.tmem,
+            t.palette,
             (t.sh >> 2).wrapping_sub(t.sl >> 2) + 1,
-            (t.th >> 2).wrapping_sub(t.tl >> 2) + 1));
+            (t.th >> 2).wrapping_sub(t.tl >> 2) + 1
+        ));
     }
 
-    let max_w = lines.iter().map(|l| l.len() * FONT_CHAR_W + 8).max().unwrap_or(100);
+    let max_w = lines
+        .iter()
+        .map(|l| l.len() * FONT_CHAR_W + 8)
+        .max()
+        .unwrap_or(100);
     let y_start = HEIGHT - lines.len() * 9 - 6;
     draw_rect_bg(buf, 2, y_start, max_w, lines.len() * 9 + 4);
 
     for (i, line) in lines.iter().enumerate() {
-        let color = if i == 0 { (0xFF, 0xFF, 0xFF) } else { (0x80, 0xFF, 0x80) };
+        let color = if i == 0 {
+            (0xFF, 0xFF, 0xFF)
+        } else {
+            (0x80, 0xFF, 0x80)
+        };
         draw_text(buf, 4, y_start + 2 + i * 9, line, color.0, color.1, color.2);
     }
 }
@@ -442,50 +534,87 @@ fn draw_geometry_inspector(buf: &mut [u8], bus: &Interconnect) {
     let r = &bus.renderer;
     let mut lines: Vec<String> = vec!["=== Geometry ===".to_string()];
 
-    lines.push(format!("VP scl:({:.0},{:.0},{:.0})", r.viewport_scale[0], r.viewport_scale[1], r.viewport_scale[2]));
-    lines.push(format!("VP trn:({:.0},{:.0},{:.0})", r.viewport_trans[0], r.viewport_trans[1], r.viewport_trans[2]));
+    lines.push(format!(
+        "VP scl:({:.0},{:.0},{:.0})",
+        r.viewport_scale[0], r.viewport_scale[1], r.viewport_scale[2]
+    ));
+    lines.push(format!(
+        "VP trn:({:.0},{:.0},{:.0})",
+        r.viewport_trans[0], r.viewport_trans[1], r.viewport_trans[2]
+    ));
     lines.push(format!("Geo: {:#010X}", r.geometry_mode));
 
     // Decode key geometry mode flags
     let mut flags = Vec::new();
-    if r.geometry_mode & 0x0001 != 0 { flags.push("ZBUF"); }
-    if r.geometry_mode & 0x0200 != 0 { flags.push("CULL_F"); }
-    if r.geometry_mode & 0x0400 != 0 { flags.push("CULL_B"); }
-    if r.geometry_mode & 0x10000 != 0 { flags.push("FOG"); }
-    if r.geometry_mode & 0x20000 != 0 { flags.push("LIGHT"); }
+    if r.geometry_mode & 0x0001 != 0 {
+        flags.push("ZBUF");
+    }
+    if r.geometry_mode & 0x0200 != 0 {
+        flags.push("CULL_F");
+    }
+    if r.geometry_mode & 0x0400 != 0 {
+        flags.push("CULL_B");
+    }
+    if r.geometry_mode & 0x10000 != 0 {
+        flags.push("FOG");
+    }
+    if r.geometry_mode & 0x20000 != 0 {
+        flags.push("LIGHT");
+    }
     if !flags.is_empty() {
         lines.push(format!("  {}", flags.join(" ")));
     }
 
     lines.push(format!("OtherH:{:#010X}", r.othermode_h));
     lines.push(format!("OtherL:{:#010X}", r.othermode_l));
-    lines.push(format!("Scissor:({},{})..({},{})",
-        r.scissor_ulx >> 2, r.scissor_uly >> 2, r.scissor_lrx >> 2, r.scissor_lry >> 2));
-    lines.push(format!("CImg:{:#X} {}px Z:{:#X}",
-        r.color_image_addr, r.color_image_width, r.z_image_addr));
+    lines.push(format!(
+        "Scissor:({},{})..({},{})",
+        r.scissor_ulx >> 2,
+        r.scissor_uly >> 2,
+        r.scissor_lrx >> 2,
+        r.scissor_lry >> 2
+    ));
+    lines.push(format!(
+        "CImg:{:#X} {}px Z:{:#X}",
+        r.color_image_addr, r.color_image_width, r.z_image_addr
+    ));
 
     // MVP row 0
-    lines.push(format!("MVP[0]: {:.2} {:.2} {:.2} {:.2}",
-        r.mvp[0][0], r.mvp[0][1], r.mvp[0][2], r.mvp[0][3]));
+    lines.push(format!(
+        "MVP[0]: {:.2} {:.2} {:.2} {:.2}",
+        r.mvp[0][0], r.mvp[0][1], r.mvp[0][2], r.mvp[0][3]
+    ));
 
     // Show first few active vertices
     let mut shown = 0;
     for i in 0..32 {
-        if shown >= 3 { break; }
+        if shown >= 3 {
+            break;
+        }
         let v = &r.vertex_buffer[i];
         if v.w.abs() > 0.001 {
-            lines.push(format!("V{:2}:({:.0},{:.0},{:.0}) #{:02X}{:02X}{:02X}",
-                i, v.x, v.y, v.z, v.r, v.g, v.b));
+            lines.push(format!(
+                "V{:2}:({:.0},{:.0},{:.0}) #{:02X}{:02X}{:02X}",
+                i, v.x, v.y, v.z, v.r, v.g, v.b
+            ));
             shown += 1;
         }
     }
 
-    let max_w = lines.iter().map(|l| l.len() * FONT_CHAR_W + 8).max().unwrap_or(200);
+    let max_w = lines
+        .iter()
+        .map(|l| l.len() * FONT_CHAR_W + 8)
+        .max()
+        .unwrap_or(200);
     let y_start = 100;
     draw_rect_bg(buf, 2, y_start, max_w, lines.len() * 9 + 4);
 
     for (i, line) in lines.iter().enumerate() {
-        let color = if i == 0 { (0xFF, 0xFF, 0xFF) } else { (0x80, 0xFF, 0x80) };
+        let color = if i == 0 {
+            (0xFF, 0xFF, 0xFF)
+        } else {
+            (0x80, 0xFF, 0x80)
+        };
         draw_text(buf, 4, y_start + 2 + i * 9, line, color.0, color.1, color.2);
     }
 }
@@ -521,22 +650,43 @@ fn draw_os_monitor(buf: &mut [u8], debug: &DebugState, bus: &Interconnect) {
         .filter(|&i| mi.intr & (1 << i) != 0)
         .map(|i| names[i as usize])
         .collect();
-    let active_str = if active.is_empty() { "none".to_string() } else { active.join(" ") };
+    let active_str = if active.is_empty() {
+        "none".to_string()
+    } else {
+        active.join(" ")
+    };
     lines.push(format!("MI: {} mask={:06b}", active_str, mi.intr_mask));
 
-    lines.push(format!("RSP: {} tasks  st={:#06X}", rsp.start_count, rsp.status));
-    lines.push(format!("VI: {}/{} origin={:#X}", vi.v_current, vi.v_sync, vi.origin));
+    lines.push(format!(
+        "RSP: {} tasks  st={:#06X}",
+        rsp.start_count, rsp.status
+    ));
+    lines.push(format!(
+        "VI: {}/{} origin={:#X}",
+        vi.v_current, vi.v_sync, vi.origin
+    ));
 
     // Thread list
     lines.push("--- Threads ---".to_string());
     for t in &debug.cached_threads {
         let s = match t.state {
-            1 => "STOP", 2 => "RUN ", 4 => "CURR", 8 => "WAIT", _ => "??? "
+            1 => "STOP",
+            2 => "RUN ",
+            4 => "CURR",
+            8 => "WAIT",
+            _ => "??? ",
         };
-        lines.push(format!("T{}:p{:3} {} {:#010X}", t.id, t.priority, s, t.saved_pc));
+        lines.push(format!(
+            "T{}:p{:3} {} {:#010X}",
+            t.id, t.priority, s, t.saved_pc
+        ));
     }
 
-    let max_w = lines.iter().map(|l| l.len() * FONT_CHAR_W + 8).max().unwrap_or(200);
+    let max_w = lines
+        .iter()
+        .map(|l| l.len() * FONT_CHAR_W + 8)
+        .max()
+        .unwrap_or(200);
     draw_rect_bg(buf, 2, 0, max_w, lines.len() * 9 + 4);
 
     for (i, line) in lines.iter().enumerate() {
@@ -554,37 +704,55 @@ pub fn scan_os_threads(bus: &Interconnect) -> Vec<n64_core::debug::ThreadInfo> {
     let rdram = bus.rdram.data();
     let read_u32 = |off: usize| -> u32 {
         if off + 3 < rdram.len() {
-            u32::from_be_bytes([rdram[off], rdram[off+1], rdram[off+2], rdram[off+3]])
-        } else { 0 }
+            u32::from_be_bytes([rdram[off], rdram[off + 1], rdram[off + 2], rdram[off + 3]])
+        } else {
+            0
+        }
     };
 
     let mut best_chain: Vec<n64_core::debug::ThreadInfo> = Vec::new();
 
     for scan_addr in (0x300000..0x400000).step_by(4) {
         let ptr = read_u32(scan_addr);
-        if ptr < 0x8000_0000 || ptr >= 0x8080_0000 { continue; }
+        if ptr < 0x8000_0000 || ptr >= 0x8080_0000 {
+            continue;
+        }
         let phys = (ptr & 0x7FFFFF) as usize;
-        if phys + 0x11C >= rdram.len() { continue; }
+        if phys + 0x11C >= rdram.len() {
+            continue;
+        }
 
         let pri = read_u32(phys + 4);
         let state = u16::from_be_bytes([rdram[phys + 0x10], rdram[phys + 0x11]]);
-        if pri > 255 || !(state == 1 || state == 2 || state == 4 || state == 8) { continue; }
+        if pri > 255 || !(state == 1 || state == 2 || state == 4 || state == 8) {
+            continue;
+        }
 
         let mut chain = Vec::new();
         let mut cur = ptr;
         for _ in 0..20 {
             let p = (cur & 0x7FFFFF) as usize;
-            if p + 0x11C >= rdram.len() { break; }
+            if p + 0x11C >= rdram.len() {
+                break;
+            }
             let pri = read_u32(p + 4);
             let state = u16::from_be_bytes([rdram[p + 0x10], rdram[p + 0x11]]);
             let id = read_u32(p + 0x14);
             let saved_pc = read_u32(p + 0x11C);
-            if pri > 255 { break; }
+            if pri > 255 {
+                break;
+            }
             chain.push(n64_core::debug::ThreadInfo {
-                vaddr: cur, priority: pri, state, id, saved_pc,
+                vaddr: cur,
+                priority: pri,
+                state,
+                id,
+                saved_pc,
             });
             let next = read_u32(p + 0x0C);
-            if next == 0 || next < 0x8000_0000 || next >= 0x8080_0000 || next == cur { break; }
+            if next == 0 || next < 0x8000_0000 || next >= 0x8080_0000 || next == cur {
+                break;
+            }
             cur = next;
         }
         if chain.len() > best_chain.len() {
@@ -612,10 +780,16 @@ pub fn draw_status_message(buf: &mut [u8], text: &str) {
 /// Main entry: draw all active debug overlays onto the pixel buffer.
 pub fn draw_overlays(buf: &mut [u8], debug: &mut DebugState, bus: &Interconnect) {
     let flags = &debug.flags;
-    let any_active = flags.show_stats || flags.show_wireframe || flags.show_depth
-        || flags.show_textures || flags.show_geometry || flags.show_dl_log
+    let any_active = flags.show_stats
+        || flags.show_wireframe
+        || flags.show_depth
+        || flags.show_textures
+        || flags.show_geometry
+        || flags.show_dl_log
         || flags.show_os_monitor;
-    if !any_active { return; }
+    if !any_active {
+        return;
+    }
 
     // Rate-limited OS thread scan
     if flags.show_os_monitor {
@@ -628,13 +802,27 @@ pub fn draw_overlays(buf: &mut [u8], debug: &mut DebugState, bus: &Interconnect)
     }
 
     // Draw order: depth replaces FB, then wireframe, then panels on top
-    if flags.show_depth { draw_depth_viz(buf, bus); }
-    if flags.show_wireframe { draw_wireframe(buf, debug); }
-    if flags.show_os_monitor { draw_os_monitor(buf, debug, bus); }
-    if flags.show_geometry { draw_geometry_inspector(buf, bus); }
-    if flags.show_textures { draw_texture_info(buf, bus); }
-    if flags.show_dl_log { draw_dl_log(buf, debug); }
-    if flags.show_stats { draw_stats_hud(buf, debug, bus); }
+    if flags.show_depth {
+        draw_depth_viz(buf, bus);
+    }
+    if flags.show_wireframe {
+        draw_wireframe(buf, debug);
+    }
+    if flags.show_os_monitor {
+        draw_os_monitor(buf, debug, bus);
+    }
+    if flags.show_geometry {
+        draw_geometry_inspector(buf, bus);
+    }
+    if flags.show_textures {
+        draw_texture_info(buf, bus);
+    }
+    if flags.show_dl_log {
+        draw_dl_log(buf, debug);
+    }
+    if flags.show_stats {
+        draw_stats_hud(buf, debug, bus);
+    }
 }
 
 /// Handle an F-key press to toggle debug modes.

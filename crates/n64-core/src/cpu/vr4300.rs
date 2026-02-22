@@ -118,7 +118,12 @@ impl Vr4300 {
     pub fn unimpl(&mut self, key: String, pc: u64, raw: u32) {
         let count = self.unimpl_opcodes.entry(key.clone()).or_insert(0);
         if *count == 0 {
-            log::error!("UNIMPLEMENTED {} at PC={:#018X} (raw={:#010X})", key, pc, raw);
+            log::error!(
+                "UNIMPLEMENTED {} at PC={:#018X} (raw={:#010X})",
+                key,
+                pc,
+                raw
+            );
         }
         *count += 1;
         self.reserved_instr = true;
@@ -189,8 +194,14 @@ impl Vr4300 {
             // Track TLB misses for debugging
             self.tlb_miss_count += 1;
             if self.tlb_miss_count <= 5 {
-                log::warn!("TLB {:?} #{} at PC={:#010X} bad_vaddr={:#018X} step={}",
-                    code, self.tlb_miss_count, current_pc as u32, bad_vaddr, self.step_count);
+                log::warn!(
+                    "TLB {:?} #{} at PC={:#010X} bad_vaddr={:#018X} step={}",
+                    code,
+                    self.tlb_miss_count,
+                    current_pc as u32,
+                    bad_vaddr,
+                    self.step_count
+                );
             }
             let epc = if was_delay_slot {
                 current_pc.wrapping_sub(4) // branch instruction
@@ -225,7 +236,11 @@ impl Vr4300 {
             }
             self.cop0.regs[Cop0::STATUS] |= 0x02; // Set EXL
             let bev = (self.cop0.regs[Cop0::STATUS] >> 22) & 1;
-            let vector = if bev != 0 { 0xFFFF_FFFF_BFC0_0200u64 } else { 0xFFFF_FFFF_8000_0180u64 };
+            let vector = if bev != 0 {
+                0xFFFF_FFFF_BFC0_0200u64
+            } else {
+                0xFFFF_FFFF_8000_0180u64
+            };
             self.pc = vector;
             self.next_pc = vector.wrapping_add(4);
             self.gpr[0] = 0;
@@ -309,7 +324,8 @@ impl Vr4300 {
     /// Translate a virtual address with fallback for debug/diagnostic use.
     /// On TLB miss, returns addr & 0x1FFFFFFF instead of None.
     pub fn translate_address(&self, vaddr: u64) -> u32 {
-        self.try_translate(vaddr).unwrap_or_else(|| vaddr as u32 & 0x1FFF_FFFF)
+        self.try_translate(vaddr)
+            .unwrap_or_else(|| vaddr as u32 & 0x1FFF_FFFF)
     }
 
     /// Take a TLB exception (Refill or Invalid).
@@ -349,9 +365,17 @@ impl Vr4300 {
         // Vector: TLB Refill (0x80000000) when EXL was clear, else general (0x80000180)
         let bev = (self.cop0.regs[Cop0::STATUS] >> 22) & 1;
         let vector = if exl_was_set {
-            if bev != 0 { 0xFFFF_FFFF_BFC0_0380u64 } else { 0xFFFF_FFFF_8000_0180u64 }
+            if bev != 0 {
+                0xFFFF_FFFF_BFC0_0380u64
+            } else {
+                0xFFFF_FFFF_8000_0180u64
+            }
         } else {
-            if bev != 0 { 0xFFFF_FFFF_BFC0_0000u64 } else { 0xFFFF_FFFF_8000_0000u64 }
+            if bev != 0 {
+                0xFFFF_FFFF_BFC0_0000u64
+            } else {
+                0xFFFF_FFFF_8000_0000u64
+            }
         };
 
         self.pc = vector;

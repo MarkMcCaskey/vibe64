@@ -14,15 +14,16 @@ use ratatui::{
 use n64_core::cpu::cop0::Cop0;
 
 const REG_NAMES: [&str; 32] = [
-    "zero", "at", "v0", "v1", "a0", "a1", "a2", "a3",
-    "t0",   "t1", "t2", "t3", "t4", "t5", "t6", "t7",
-    "s0",   "s1", "s2", "s3", "s4", "s5", "s6", "s7",
-    "t8",   "t9", "k0", "k1", "gp", "sp", "fp", "ra",
+    "zero", "at", "v0", "v1", "a0", "a1", "a2", "a3", "t0", "t1", "t2", "t3", "t4", "t5", "t6",
+    "t7", "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7", "t8", "t9", "k0", "k1", "gp", "sp", "fp",
+    "ra",
 ];
 
 pub fn run(mut n64: n64_core::N64) {
     enable_raw_mode().expect("enable raw mode");
-    stdout().execute(EnterAlternateScreen).expect("enter alt screen");
+    stdout()
+        .execute(EnterAlternateScreen)
+        .expect("enter alt screen");
 
     let backend = CrosstermBackend::new(stdout());
     let mut terminal = Terminal::new(backend).expect("create terminal");
@@ -63,7 +64,9 @@ pub fn run(mut n64: n64_core::N64) {
     }
 
     disable_raw_mode().expect("disable raw mode");
-    stdout().execute(LeaveAlternateScreen).expect("leave alt screen");
+    stdout()
+        .execute(LeaveAlternateScreen)
+        .expect("leave alt screen");
 }
 
 fn draw_ui(f: &mut Frame, n64: &n64_core::N64, paused: bool, frame_count: u64) {
@@ -115,10 +118,7 @@ fn draw_ui(f: &mut Frame, n64: &n64_core::N64, paused: bool, frame_count: u64) {
 fn format_cpu_registers(n64: &n64_core::N64) -> String {
     let cpu = &n64.cpu;
     let mut s = format!(" PC  {:#018X}\n", cpu.pc);
-    s += &format!(
-        " HI  {:#018X}  LO  {:#018X}\n",
-        cpu.hi, cpu.lo
-    );
+    s += &format!(" HI  {:#018X}  LO  {:#018X}\n", cpu.hi, cpu.lo);
     s += &format!(
         " Delay slot: {}  LL bit: {}\n\n",
         cpu.in_delay_slot, cpu.ll_bit
@@ -167,13 +167,27 @@ fn format_system_status(n64: &n64_core::N64) -> String {
     // Cause: exception code
     let exc_code = (cause >> 2) & 0x1F;
     let exc_name = match exc_code {
-        0 => "Int", 1 => "TLB Mod", 2 => "TLB Load", 3 => "TLB Store",
-        4 => "AddrLoad", 5 => "AddrStore", 8 => "Syscall", 9 => "Break",
-        10 => "Reserved", 12 => "Overflow", 13 => "Trap", 15 => "FPE",
+        0 => "Int",
+        1 => "TLB Mod",
+        2 => "TLB Load",
+        3 => "TLB Store",
+        4 => "AddrLoad",
+        5 => "AddrStore",
+        8 => "Syscall",
+        9 => "Break",
+        10 => "Reserved",
+        12 => "Overflow",
+        13 => "Trap",
+        15 => "FPE",
         _ => "Other",
     };
     let bd = cause & (1 << 31) != 0;
-    s += &format!(" ExcCode: {} ({}){}\n", exc_code, exc_name, if bd { " [BD]" } else { "" });
+    s += &format!(
+        " ExcCode: {} ({}){}\n",
+        exc_code,
+        exc_name,
+        if bd { " [BD]" } else { "" }
+    );
     s += &format!(" EPC:     {:#018X}\n\n", cop0.regs[Cop0::EPC]);
 
     // Interrupt Pending (Cause) vs Interrupt Mask (Status)
@@ -194,8 +208,16 @@ fn format_system_status(n64: &n64_core::N64) -> String {
             masked.push(MI_NAMES[i as usize]);
         }
     }
-    let active_str = if active.is_empty() { "none".into() } else { active.join(" ") };
-    let masked_str = if masked.is_empty() { "none".into() } else { masked.join(" ") };
+    let active_str = if active.is_empty() {
+        "none".into()
+    } else {
+        active.join(" ")
+    };
+    let masked_str = if masked.is_empty() {
+        "none".into()
+    } else {
+        masked.join(" ")
+    };
     s += &format!(" MI active: {}\n", active_str);
     s += &format!(" MI mask:   {}\n\n", masked_str);
 

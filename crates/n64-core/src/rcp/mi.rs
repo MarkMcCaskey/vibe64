@@ -69,18 +69,30 @@ impl Mi {
         // Init length (bits 6:0)
         self.mode = (self.mode & !0x7F) | (val & 0x7F);
 
-        if val & (1 << 7) != 0 { self.mode &= !(1 << 7); }  // Clear init mode
-        if val & (1 << 8) != 0 { self.mode |= 1 << 7; }      // Set init mode
-        if val & (1 << 9) != 0 { self.mode &= !(1 << 8); }   // Clear ebus test
-        if val & (1 << 10) != 0 { self.mode |= 1 << 8; }     // Set ebus test
+        if val & (1 << 7) != 0 {
+            self.mode &= !(1 << 7);
+        } // Clear init mode
+        if val & (1 << 8) != 0 {
+            self.mode |= 1 << 7;
+        } // Set init mode
+        if val & (1 << 9) != 0 {
+            self.mode &= !(1 << 8);
+        } // Clear ebus test
+        if val & (1 << 10) != 0 {
+            self.mode |= 1 << 8;
+        } // Set ebus test
 
         // Bit 11: Clear DP interrupt
         if val & (1 << 11) != 0 {
             self.clear_interrupt(MiInterrupt::DP);
         }
 
-        if val & (1 << 12) != 0 { self.mode &= !(1 << 9); }  // Clear RDRAM reg
-        if val & (1 << 13) != 0 { self.mode |= 1 << 9; }     // Set RDRAM reg
+        if val & (1 << 12) != 0 {
+            self.mode &= !(1 << 9);
+        } // Clear RDRAM reg
+        if val & (1 << 13) != 0 {
+            self.mode |= 1 << 9;
+        } // Set RDRAM reg
     }
 
     pub fn set_interrupt(&mut self, irq: MiInterrupt) {

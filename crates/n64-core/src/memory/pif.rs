@@ -12,24 +12,23 @@
 ///   0x01 = process joybus commands
 ///   0x02 = CIC challenge-response (CIC-6105 only)
 ///   0x08 = terminate boot process
-
 use crate::cart::cic::CicVariant;
 
 /// N64 controller button bit flags (big-endian button word).
 pub mod buttons {
-    pub const A: u16       = 0x8000;
-    pub const B: u16       = 0x4000;
-    pub const Z: u16       = 0x2000;
-    pub const START: u16   = 0x1000;
-    pub const D_UP: u16    = 0x0800;
-    pub const D_DOWN: u16  = 0x0400;
-    pub const D_LEFT: u16  = 0x0200;
+    pub const A: u16 = 0x8000;
+    pub const B: u16 = 0x4000;
+    pub const Z: u16 = 0x2000;
+    pub const START: u16 = 0x1000;
+    pub const D_UP: u16 = 0x0800;
+    pub const D_DOWN: u16 = 0x0400;
+    pub const D_LEFT: u16 = 0x0200;
     pub const D_RIGHT: u16 = 0x0100;
-    pub const L: u16       = 0x0020;
-    pub const R: u16       = 0x0010;
-    pub const C_UP: u16    = 0x0008;
-    pub const C_DOWN: u16  = 0x0004;
-    pub const C_LEFT: u16  = 0x0002;
+    pub const L: u16 = 0x0020;
+    pub const R: u16 = 0x0010;
+    pub const C_UP: u16 = 0x0008;
+    pub const C_DOWN: u16 = 0x0004;
+    pub const C_LEFT: u16 = 0x0002;
     pub const C_RIGHT: u16 = 0x0001;
 }
 
@@ -45,8 +44,8 @@ pub struct ControllerState {
 #[derive(Clone, Copy, PartialEq)]
 pub enum EepromType {
     None,
-    Eeprom4K,   // 512 bytes (64 blocks × 8 bytes)
-    Eeprom16K,  // 2048 bytes (256 blocks × 8 bytes)
+    Eeprom4K,  // 512 bytes (64 blocks × 8 bytes)
+    Eeprom16K, // 2048 bytes (256 blocks × 8 bytes)
 }
 
 pub struct Pif {
@@ -163,23 +162,48 @@ impl Pif {
             let tx_len = self.ram[i];
 
             // Special markers
-            if tx_len == 0xFE { break; }          // End of commands
-            if tx_len == 0x00 { i += 1; channel += 1; continue; } // Channel present, skip
-            if tx_len == 0xFD { i += 1; channel += 1; continue; } // Channel skip
-            if tx_len == 0xFF { i += 1; continue; }               // NOP pad byte (no channel advance)
-            // Bit 7 set (but not 0xFF/0xFE/0xFD) = channel already processed
-            if tx_len & 0x80 != 0 { i += 1; channel += 1; continue; }
+            if tx_len == 0xFE {
+                break;
+            } // End of commands
+            if tx_len == 0x00 {
+                i += 1;
+                channel += 1;
+                continue;
+            } // Channel present, skip
+            if tx_len == 0xFD {
+                i += 1;
+                channel += 1;
+                continue;
+            } // Channel skip
+            if tx_len == 0xFF {
+                i += 1;
+                continue;
+            } // NOP pad byte (no channel advance)
+              // Bit 7 set (but not 0xFF/0xFE/0xFD) = channel already processed
+            if tx_len & 0x80 != 0 {
+                i += 1;
+                channel += 1;
+                continue;
+            }
 
             let tx = (tx_len & 0x3F) as usize;
-            if i + 1 >= 63 { break; }
+            if i + 1 >= 63 {
+                break;
+            }
             let rx_len = self.ram[i + 1];
             let rx = (rx_len & 0x3F) as usize;
 
             let cmd_start = i + 2;
             let rx_start = cmd_start + tx;
 
-            if rx_start + rx > 63 { break; }
-            if tx == 0 { i = rx_start + rx; channel += 1; continue; }
+            if rx_start + rx > 63 {
+                break;
+            }
+            if tx == 0 {
+                i = rx_start + rx;
+                channel += 1;
+                continue;
+            }
 
             let cmd = self.ram[cmd_start];
 
@@ -310,12 +334,10 @@ impl Pif {
     /// Algorithm from: https://github.com/pj64team/Project64-1.6-Plus/blob/main/n64_cic_nus_6105.c
     fn cic_6105_challenge(&mut self) {
         const LUT0: [u8; 16] = [
-            0x4, 0x7, 0xA, 0x7, 0xE, 0x5, 0xE, 0x1,
-            0xC, 0xF, 0x8, 0xF, 0x6, 0x3, 0x6, 0x9,
+            0x4, 0x7, 0xA, 0x7, 0xE, 0x5, 0xE, 0x1, 0xC, 0xF, 0x8, 0xF, 0x6, 0x3, 0x6, 0x9,
         ];
         const LUT1: [u8; 16] = [
-            0x4, 0x1, 0xA, 0x7, 0xE, 0x5, 0xE, 0x1,
-            0xC, 0x9, 0x8, 0x5, 0x6, 0x3, 0xC, 0x9,
+            0x4, 0x1, 0xA, 0x7, 0xE, 0x5, 0xE, 0x1, 0xC, 0x9, 0x8, 0x5, 0x6, 0x3, 0xC, 0x9,
         ];
 
         // Extract 30 nibbles from PIF RAM bytes 0x30-0x3E
@@ -335,7 +357,11 @@ impl Pif {
             response[i] = (key.wrapping_add(5u8.wrapping_mul(challenge[i]))) & 0x0F;
             key = lut[response[i] as usize];
             let sgn = (response[i] >> 3) & 1;
-            let mag = if sgn == 1 { (!response[i]) & 0x7 } else { response[i] & 0x7 };
+            let mag = if sgn == 1 {
+                (!response[i]) & 0x7
+            } else {
+                response[i] & 0x7
+            };
             let mut mod_val = if mag % 3 == 1 { sgn } else { 1 - sgn };
             if use_lut1 && (response[i] == 0x1 || response[i] == 0x9) {
                 mod_val = 1;

@@ -22,74 +22,76 @@ pub fn detect_ucode(game_code: &[u8; 4]) -> UcodeType {
     let code = std::str::from_utf8(game_code).unwrap_or("");
     // F3D games (original microcode)
     const F3D_GAMES: &[&str] = &[
-        "NSME", "NSMJ", "NSMP",  // Super Mario 64
-        "NMKE", "NMKJ", "NMKP",  // Mario Kart 64
-        "NSSE", "NSSJ", "NSSP",  // Star Fox 64
-        "NWRE", "NWRJ", "NWRP",  // Wave Race 64
-        "NPWE", "NPWJ", "NPWP",  // Pilotwings 64
+        "NSME", "NSMJ", "NSMP", // Super Mario 64
+        "NMKE", "NMKJ", "NMKP", // Mario Kart 64
+        "NSSE", "NSSJ", "NSSP", // Star Fox 64
+        "NWRE", "NWRJ", "NWRP", // Wave Race 64
+        "NPWE", "NPWJ", "NPWP", // Pilotwings 64
     ];
     for &c in F3D_GAMES {
-        if code == c { return UcodeType::F3d; }
+        if code == c {
+            return UcodeType::F3d;
+        }
     }
     UcodeType::F3dex2
 }
 
 // ─── RDP commands (passed through by F3DEX2 to the RDP) ───
 
-pub const G_SETCIMG: u8      = 0xFF; // Set Color Image (framebuffer)
-pub const G_SETZIMG: u8      = 0xFE; // Set Z Image (depth buffer)
-pub const G_SETTIMG: u8      = 0xFD; // Set Texture Image source
-pub const G_SETCOMBINE: u8   = 0xFC; // Set Color Combiner mode
-pub const G_SETENVCOLOR: u8  = 0xFB; // Set Environment Color
+pub const G_SETCIMG: u8 = 0xFF; // Set Color Image (framebuffer)
+pub const G_SETZIMG: u8 = 0xFE; // Set Z Image (depth buffer)
+pub const G_SETTIMG: u8 = 0xFD; // Set Texture Image source
+pub const G_SETCOMBINE: u8 = 0xFC; // Set Color Combiner mode
+pub const G_SETENVCOLOR: u8 = 0xFB; // Set Environment Color
 pub const G_SETPRIMCOLOR: u8 = 0xFA; // Set Primitive Color
 pub const G_SETBLENDCOLOR: u8 = 0xF9; // Set Blend Color
-pub const G_SETFOGCOLOR: u8  = 0xF8; // Set Fog Color
+pub const G_SETFOGCOLOR: u8 = 0xF8; // Set Fog Color
 pub const G_SETFILLCOLOR: u8 = 0xF7; // Set Fill Color
-pub const G_FILLRECT: u8     = 0xF6; // Fill Rectangle
-pub const G_SETTILE: u8      = 0xF5; // Set Tile Descriptor
-pub const G_LOADTILE: u8     = 0xF4; // Load Tile from DRAM → TMEM
-pub const G_LOADBLOCK: u8    = 0xF3; // Load Block from DRAM → TMEM
-pub const G_SETTILESIZE: u8  = 0xF2; // Set Tile Size
-pub const G_LOADTLUT: u8     = 0xF0; // Load Texture Lookup Table
-pub const G_SETSCISSOR: u8   = 0xED; // Set Scissor Rectangle
-pub const G_SETCONVERT: u8   = 0xEC; // Set Color Convert coefficients
-pub const G_SETKEYR: u8      = 0xEB; // Set Chroma Key Red
-pub const G_SETKEYGB: u8     = 0xEA; // Set Chroma Key Green/Blue
-pub const G_RDPFULLSYNC: u8  = 0xE9; // Full Sync (wait for RDP idle)
-pub const G_RDPTILESYNC: u8  = 0xE8; // Tile Sync
-pub const G_RDPPIPESYNC: u8  = 0xE7; // Pipe Sync
-pub const G_RDPLOADSYNC: u8  = 0xE6; // Load Sync
-pub const G_TEXRECT: u8      = 0xE4; // Texture Rectangle
-pub const G_TEXRECTFLIP: u8  = 0xE5; // Texture Rectangle (S/T flipped)
+pub const G_FILLRECT: u8 = 0xF6; // Fill Rectangle
+pub const G_SETTILE: u8 = 0xF5; // Set Tile Descriptor
+pub const G_LOADTILE: u8 = 0xF4; // Load Tile from DRAM → TMEM
+pub const G_LOADBLOCK: u8 = 0xF3; // Load Block from DRAM → TMEM
+pub const G_SETTILESIZE: u8 = 0xF2; // Set Tile Size
+pub const G_LOADTLUT: u8 = 0xF0; // Load Texture Lookup Table
+pub const G_SETSCISSOR: u8 = 0xED; // Set Scissor Rectangle
+pub const G_SETCONVERT: u8 = 0xEC; // Set Color Convert coefficients
+pub const G_SETKEYR: u8 = 0xEB; // Set Chroma Key Red
+pub const G_SETKEYGB: u8 = 0xEA; // Set Chroma Key Green/Blue
+pub const G_RDPFULLSYNC: u8 = 0xE9; // Full Sync (wait for RDP idle)
+pub const G_RDPTILESYNC: u8 = 0xE8; // Tile Sync
+pub const G_RDPPIPESYNC: u8 = 0xE7; // Pipe Sync
+pub const G_RDPLOADSYNC: u8 = 0xE6; // Load Sync
+pub const G_TEXRECT: u8 = 0xE4; // Texture Rectangle
+pub const G_TEXRECTFLIP: u8 = 0xE5; // Texture Rectangle (S/T flipped)
 pub const G_SETOTHERMODE_H: u8 = 0xE3; // Set Other Modes (high half)
 pub const G_SETOTHERMODE_L: u8 = 0xE2; // Set Other Modes (low half)
 pub const G_RDPSETOTHERMODE: u8 = 0xEF; // Set Both Other Mode halves at once
 
 // ─── RSP geometry commands (F3DEX2-specific opcodes) ───
 
-pub const G_NOOP: u8         = 0x00; // No Operation
-pub const G_VTX: u8          = 0x01; // Load Vertices
-pub const G_MODIFYVTX: u8    = 0x02; // Modify Vertex
-pub const G_TRI1: u8         = 0x05; // Draw 1 Triangle
-pub const G_TRI2: u8         = 0x06; // Draw 2 Triangles
-pub const G_QUAD: u8         = 0x07; // Draw Quadrilateral
-pub const G_POPMTX: u8       = 0xD8; // Pop Matrix Stack
+pub const G_NOOP: u8 = 0x00; // No Operation
+pub const G_VTX: u8 = 0x01; // Load Vertices
+pub const G_MODIFYVTX: u8 = 0x02; // Modify Vertex
+pub const G_TRI1: u8 = 0x05; // Draw 1 Triangle
+pub const G_TRI2: u8 = 0x06; // Draw 2 Triangles
+pub const G_QUAD: u8 = 0x07; // Draw Quadrilateral
+pub const G_POPMTX: u8 = 0xD8; // Pop Matrix Stack
 pub const G_GEOMETRYMODE: u8 = 0xD9; // Set/Clear Geometry Mode flags
-pub const G_MTX: u8          = 0xDA; // Load Matrix
-pub const G_MOVEWORD: u8     = 0xDB; // Move Word to RSP DMEM
-pub const G_MOVEMEM: u8      = 0xDC; // Move Memory block
-pub const G_TEXTURE: u8      = 0xD7; // Set Texture parameters
-pub const G_DL: u8           = 0xDE; // Branch/Call Display List
-pub const G_ENDDL: u8        = 0xDF; // End Display List
+pub const G_MTX: u8 = 0xDA; // Load Matrix
+pub const G_MOVEWORD: u8 = 0xDB; // Move Word to RSP DMEM
+pub const G_MOVEMEM: u8 = 0xDC; // Move Memory block
+pub const G_TEXTURE: u8 = 0xD7; // Set Texture parameters
+pub const G_DL: u8 = 0xDE; // Branch/Call Display List
+pub const G_ENDDL: u8 = 0xDF; // End Display List
 pub const G_SETGEOMETRYMODE: u8 = 0xD9; // alias
-pub const G_SPECIAL_1: u8    = 0xD5; // Special (branch on Z)
-pub const G_RDPHALF_1: u8    = 0xE1; // RDP half word 1 (used by texture rect)
-pub const G_RDPHALF_2: u8    = 0xF1; // RDP half word 2 (used by texture rect)
+pub const G_SPECIAL_1: u8 = 0xD5; // Special (branch on Z)
+pub const G_RDPHALF_1: u8 = 0xE1; // RDP half word 1 (used by texture rect)
+pub const G_RDPHALF_2: u8 = 0xF1; // RDP half word 2 (used by texture rect)
 
 // ─── Cycle type constants (from othermode_H bits 52-53) ───
 
-pub const CYCLE_1: u8    = 0;
-pub const CYCLE_2: u8    = 1;
+pub const CYCLE_1: u8 = 0;
+pub const CYCLE_2: u8 = 1;
 pub const CYCLE_COPY: u8 = 2;
 pub const CYCLE_FILL: u8 = 3;
 
@@ -102,11 +104,11 @@ pub const M_AUDTASK: u32 = 2;
 // osSpTaskLoad DMAs the 64-byte OSTask header to the last 64 bytes
 // of DMEM (0xFC0..0xFFF). The RSP microcode reads it from there.
 
-pub const TASK_TYPE: u32       = 0xFC0;
-pub const TASK_FLAGS: u32      = 0xFC4;
+pub const TASK_TYPE: u32 = 0xFC0;
+pub const TASK_FLAGS: u32 = 0xFC4;
 pub const TASK_UCODE_BOOT: u32 = 0xFC8;
 pub const TASK_UCODE_SIZE_BOOT: u32 = 0xFCC;
-pub const TASK_UCODE: u32     = 0xFD0;
+pub const TASK_UCODE: u32 = 0xFD0;
 pub const TASK_UCODE_SIZE: u32 = 0xFD4;
 pub const TASK_UCODE_DATA: u32 = 0xFD8;
 pub const TASK_UCODE_DATA_SIZE: u32 = 0xFDC;
@@ -114,8 +116,8 @@ pub const TASK_DRAM_STACK: u32 = 0xFE0;
 pub const TASK_DRAM_STACK_SIZE: u32 = 0xFE4;
 pub const TASK_OUTPUT_BUFF: u32 = 0xFE8;
 pub const TASK_OUTPUT_BUFF_SIZE: u32 = 0xFEC;
-pub const TASK_DATA_PTR: u32   = 0xFF0;
-pub const TASK_DATA_SIZE: u32  = 0xFF4;
+pub const TASK_DATA_PTR: u32 = 0xFF0;
+pub const TASK_DATA_SIZE: u32 = 0xFF4;
 pub const TASK_YIELD_DATA_PTR: u32 = 0xFF8;
 pub const TASK_YIELD_DATA_SIZE: u32 = 0xFFC;
 
@@ -256,27 +258,28 @@ pub fn process_display_list(renderer: &mut Renderer, rdram: &mut [u8], addr: u32
                 let index = (w0 >> 16) & 0xFF;
                 let offset = w0 & 0xFFFF;
                 match index {
-                    0x02 => { // G_MW_NUMLIGHT
+                    0x02 => {
+                        // G_MW_NUMLIGHT
                         renderer.num_dir_lights = (w1 / 24) as u8;
                     }
-                    0x06 => { // G_MW_SEGMENT
+                    0x06 => {
+                        // G_MW_SEGMENT
                         let seg = (offset / 4) as usize;
                         if seg < 16 {
                             renderer.segment_table[seg] = w1 & 0x00FF_FFFF;
                         }
                     }
-                    0x08 => { // G_MW_FOG
+                    0x08 => {
+                        // G_MW_FOG
                         renderer.cmd_set_fog(w1);
                     }
-                    0x0A => { // G_MW_LIGHTCOL: set light color via moveword
+                    0x0A => {
+                        // G_MW_LIGHTCOL: set light color via moveword
                         let light_idx = (offset as usize) / 24;
                         let sub = (offset as usize) % 24;
                         if light_idx < 8 && (sub == 0 || sub == 4) {
-                            renderer.light_colors[light_idx] = [
-                                (w1 >> 24) as u8,
-                                (w1 >> 16) as u8,
-                                (w1 >> 8) as u8,
-                            ];
+                            renderer.light_colors[light_idx] =
+                                [(w1 >> 24) as u8, (w1 >> 16) as u8, (w1 >> 8) as u8];
                         }
                     }
                     0x0E => {} // G_MW_PERSPNORM: perspective normalization (ignored)
@@ -285,8 +288,7 @@ pub fn process_display_list(renderer: &mut Renderer, rdram: &mut [u8], addr: u32
             }
             G_QUAD => renderer.cmd_tri2(w0, w1, rdram),
             G_MODIFYVTX => renderer.cmd_modify_vtx(w0, w1),
-            G_SETCONVERT | G_SETKEYR | G_SETKEYGB
-            | G_SPECIAL_1 => {}
+            G_SETCONVERT | G_SETKEYR | G_SETKEYGB | G_SPECIAL_1 => {}
 
             G_RDPHALF_1 | G_RDPHALF_2 => {
                 // These store half-words for the next texture rect command.
@@ -296,7 +298,11 @@ pub fn process_display_list(renderer: &mut Renderer, rdram: &mut [u8], addr: u32
             }
 
             _ => {
-                log::trace!("Unknown GBI command {:#04X} at DL addr {:#010X}", cmd, pc.wrapping_sub(8));
+                log::trace!(
+                    "Unknown GBI command {:#04X} at DL addr {:#010X}",
+                    cmd,
+                    pc.wrapping_sub(8)
+                );
             }
         }
     }
@@ -313,9 +319,15 @@ pub fn process_display_list(renderer: &mut Renderer, rdram: &mut [u8], addr: u32
 /// All other bits (ZBUFFER, SHADE, LIGHTING, FOG, etc.) are identical.
 fn translate_f3d_geom(bits: u32) -> u32 {
     let mut out = bits & !(0x1000 | 0x2000 | 0x0200); // clear F3D-specific bits
-    if bits & 0x1000 != 0 { out |= 0x0200; }      // cull front
-    if bits & 0x2000 != 0 { out |= 0x0400; }      // cull back
-    if bits & 0x0200 != 0 { out |= 0x0020_0000; }  // smooth shading
+    if bits & 0x1000 != 0 {
+        out |= 0x0200;
+    } // cull front
+    if bits & 0x2000 != 0 {
+        out |= 0x0400;
+    } // cull back
+    if bits & 0x0200 != 0 {
+        out |= 0x0020_0000;
+    } // smooth shading
     out
 }
 
@@ -324,20 +336,20 @@ fn translate_f3d_geom(bits: u32) -> u32 {
 pub fn process_display_list_f3d(renderer: &mut Renderer, rdram: &mut [u8], addr: u32) {
     log::debug!("ENTERING process_display_list_f3d addr={:#010X}", addr);
     // F3D opcode constants (differ from F3DEX2)
-    const F3D_MTX: u8           = 0x01;
-    const F3D_MOVEMEM: u8       = 0x03;
-    const F3D_VTX: u8           = 0x04;
-    const F3D_DL: u8            = 0x06;
-    const F3D_RDPHALF_1: u8     = 0xB4;
+    const F3D_MTX: u8 = 0x01;
+    const F3D_MOVEMEM: u8 = 0x03;
+    const F3D_VTX: u8 = 0x04;
+    const F3D_DL: u8 = 0x06;
+    const F3D_RDPHALF_1: u8 = 0xB4;
     const F3D_CLEARGEOMETRYMODE: u8 = 0xB6;
-    const F3D_SETGEOMETRYMODE: u8   = 0xB7;
-    const F3D_ENDDL: u8         = 0xB8;
+    const F3D_SETGEOMETRYMODE: u8 = 0xB7;
+    const F3D_ENDDL: u8 = 0xB8;
     const F3D_SETOTHERMODE_L: u8 = 0xB9;
     const F3D_SETOTHERMODE_H: u8 = 0xBA;
-    const F3D_TEXTURE: u8       = 0xBB;
-    const F3D_MOVEWORD: u8      = 0xBC;
-    const F3D_POPMTX: u8        = 0xBD;
-    const F3D_TRI1: u8          = 0xBF;
+    const F3D_TEXTURE: u8 = 0xBB;
+    const F3D_MOVEWORD: u8 = 0xBC;
+    const F3D_POPMTX: u8 = 0xBD;
+    const F3D_TRI1: u8 = 0xBF;
 
     // F3D geometry mode bits differ from F3DEX2 — see translate_f3d_geom().
 
@@ -347,7 +359,11 @@ pub fn process_display_list_f3d(renderer: &mut Renderer, rdram: &mut [u8], addr:
 
     loop {
         if cmd_count >= MAX_COMMANDS {
-            log::warn!("F3D display list exceeded {} commands, stopping at pc={:#010X}", MAX_COMMANDS, pc);
+            log::warn!(
+                "F3D display list exceeded {} commands, stopping at pc={:#010X}",
+                MAX_COMMANDS,
+                pc
+            );
             break;
         }
         cmd_count += 1;
@@ -421,9 +437,9 @@ pub fn process_display_list_f3d(renderer: &mut Renderer, rdram: &mut [u8], addr:
                 let f3d_params = (w0 >> 16) & 0xFF;
                 // Translate F3D params to F3DEX2 format:
                 // F3DEX2: bit0=push(inv), bit1=load, bit2=projection
-                let push_inv = (f3d_params >> 2) & 1;  // F3D bit2 → F3DEX2 bit0
-                let load = (f3d_params >> 1) & 1;       // same position
-                let proj = f3d_params & 1;               // F3D bit0 → F3DEX2 bit2
+                let push_inv = (f3d_params >> 2) & 1; // F3D bit2 → F3DEX2 bit0
+                let load = (f3d_params >> 1) & 1; // same position
+                let proj = f3d_params & 1; // F3D bit0 → F3DEX2 bit2
                 let compat_params = push_inv | (load << 1) | (proj << 2);
                 let compat_w0 = compat_params;
                 renderer.cmd_load_matrix(compat_w0, w1, rdram);
@@ -454,14 +470,16 @@ pub fn process_display_list_f3d(renderer: &mut Renderer, rdram: &mut [u8], addr:
                 let index = w0 & 0xFF;
                 let offset = (w0 >> 8) & 0xFFFF;
                 match index {
-                    0x06 => { // G_MW_SEGMENT
+                    0x06 => {
+                        // G_MW_SEGMENT
                         let seg = (offset / 4) as usize;
                         if seg < 16 {
                             renderer.segment_table[seg] = w1 & 0x00FF_FFFF;
                         }
                     }
                     0x08 => renderer.cmd_set_fog(w1),
-                    0x02 => { // G_MW_NUMLIGHT — F3D formula: ((val - 0x80000000) / 32) - 1
+                    0x02 => {
+                        // G_MW_NUMLIGHT — F3D formula: ((val - 0x80000000) / 32) - 1
                         let val = w1.wrapping_sub(0x80000000);
                         renderer.num_dir_lights = (val / 32).saturating_sub(1) as u8;
                     }
@@ -529,14 +547,24 @@ pub fn process_display_list_f3d(renderer: &mut Renderer, rdram: &mut [u8], addr:
             G_SETCONVERT | G_SETKEYR | G_SETKEYGB => {}
 
             _ => {
-                log::debug!("Unknown F3D command {:#04X} at DL[{:#010X}] w0={:#010X} w1={:#010X}",
-                    cmd, pc.wrapping_sub(8), w0, w1);
+                log::debug!(
+                    "Unknown F3D command {:#04X} at DL[{:#010X}] w0={:#010X} w1={:#010X}",
+                    cmd,
+                    pc.wrapping_sub(8),
+                    w0,
+                    w1
+                );
             }
         }
     }
 
-    log::debug!("F3D DL done: {} cmds, {} tris, {} DL branches at addr={:#010X}",
-        cmd_count, renderer.tri_count, stack.len(), addr);
+    log::debug!(
+        "F3D DL done: {} cmds, {} tris, {} DL branches at addr={:#010X}",
+        cmd_count,
+        renderer.tri_count,
+        stack.len(),
+        addr
+    );
 }
 
 /// Look up a human-readable name for an F3DEX2 GBI opcode.
@@ -639,6 +667,8 @@ pub fn opcode_name_f3d(cmd: u8) -> &'static str {
 /// Read a big-endian u32 from RDRAM.
 fn read_u32(rdram: &[u8], addr: u32) -> u32 {
     let off = (addr as usize) & (rdram.len() - 1);
-    if off + 3 >= rdram.len() { return 0; }
-    u32::from_be_bytes([rdram[off], rdram[off+1], rdram[off+2], rdram[off+3]])
+    if off + 3 >= rdram.len() {
+        return 0;
+    }
+    u32::from_be_bytes([rdram[off], rdram[off + 1], rdram[off + 2], rdram[off + 3]])
 }

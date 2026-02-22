@@ -18,16 +18,36 @@ impl Instruction {
         Self(raw)
     }
 
-    pub fn opcode(self) -> u32 { (self.0 >> 26) & 0x3F }
-    pub fn rs(self) -> usize { ((self.0 >> 21) & 0x1F) as usize }
-    pub fn rt(self) -> usize { ((self.0 >> 16) & 0x1F) as usize }
-    pub fn rd(self) -> usize { ((self.0 >> 11) & 0x1F) as usize }
-    pub fn sa(self) -> usize { ((self.0 >> 6) & 0x1F) as usize }
-    pub fn funct(self) -> u32 { self.0 & 0x3F }
-    pub fn imm(self) -> u16 { self.0 as u16 }
-    pub fn imm_sign_ext(self) -> u64 { self.imm() as i16 as i64 as u64 }
-    pub fn target(self) -> u32 { self.0 & 0x03FF_FFFF }
-    pub fn raw(self) -> u32 { self.0 }
+    pub fn opcode(self) -> u32 {
+        (self.0 >> 26) & 0x3F
+    }
+    pub fn rs(self) -> usize {
+        ((self.0 >> 21) & 0x1F) as usize
+    }
+    pub fn rt(self) -> usize {
+        ((self.0 >> 16) & 0x1F) as usize
+    }
+    pub fn rd(self) -> usize {
+        ((self.0 >> 11) & 0x1F) as usize
+    }
+    pub fn sa(self) -> usize {
+        ((self.0 >> 6) & 0x1F) as usize
+    }
+    pub fn funct(self) -> u32 {
+        self.0 & 0x3F
+    }
+    pub fn imm(self) -> u16 {
+        self.0 as u16
+    }
+    pub fn imm_sign_ext(self) -> u64 {
+        self.imm() as i16 as i64 as u64
+    }
+    pub fn target(self) -> u32 {
+        self.0 & 0x03FF_FFFF
+    }
+    pub fn raw(self) -> u32 {
+        self.0
+    }
 }
 
 impl std::fmt::Display for Instruction {

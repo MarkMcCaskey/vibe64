@@ -72,7 +72,7 @@ impl Cop1 {
     /// Write a double-precision float to FPR[n] (FR=0 mode: even/odd pair).
     pub fn write_f64(&mut self, n: usize, val: f64) {
         let bits = val.to_bits();
-        self.fpr[n] = bits & 0xFFFF_FFFF;             // low 32 bits → even register
+        self.fpr[n] = bits & 0xFFFF_FFFF; // low 32 bits → even register
         self.fpr[n | 1] = (bits >> 32) & 0xFFFF_FFFF; // high 32 bits → odd register
     }
 }

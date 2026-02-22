@@ -70,9 +70,10 @@ pub fn detect_format(magic: [u8; 4]) -> Result<RomFormat, RomError> {
         [0x80, 0x37, 0x12, 0x40] => Ok(RomFormat::BigEndian),
         [0x37, 0x80, 0x40, 0x12] => Ok(RomFormat::ByteSwapped),
         [0x40, 0x12, 0x37, 0x80] => Ok(RomFormat::LittleEndian),
-        _ => Err(RomError::UnknownFormat(magic[0], magic[1], magic[2], magic[3])),
+        _ => Err(RomError::UnknownFormat(
+            magic[0], magic[1], magic[2], magic[3],
+        )),
     }
-
 }
 
 pub fn normalize(data: &mut Vec<u8>, format: RomFormat) {
@@ -90,7 +91,6 @@ pub fn normalize(data: &mut Vec<u8>, format: RomFormat) {
             }
         }
     }
-
 }
 
 pub fn parse_header(data: &[u8], format: RomFormat) -> Result<RomHeader, RomError> {
@@ -101,7 +101,10 @@ pub fn parse_header(data: &[u8], format: RomFormat) -> Result<RomHeader, RomErro
     let crc1 = u32::from_be_bytes(data[0x10..0x14].try_into().unwrap());
     let crc2 = u32::from_be_bytes(data[0x14..0x18].try_into().unwrap());
     let name_bytes = &data[0x20..0x34];
-    let name = String::from_utf8_lossy(name_bytes).trim_end_matches('\0').trim().to_string();
+    let name = String::from_utf8_lossy(name_bytes)
+        .trim_end_matches('\0')
+        .trim()
+        .to_string();
     let game_code: [u8; 4] = data[0x3B..0x3F].try_into().unwrap();
     let version = data[0x3F];
 

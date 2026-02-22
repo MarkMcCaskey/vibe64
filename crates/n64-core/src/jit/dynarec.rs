@@ -2055,7 +2055,10 @@ mod tests {
         engine.native_gas_limit = u32::MAX;
 
         let retired = engine.execute(&mut cpu, &mut bus);
-        assert!(retired > 5, "expected native run to exceed event-capped retire");
+        assert!(
+            retired > 5,
+            "expected native run to exceed event-capped retire"
+        );
         assert!(cpu.gpr[8] > 5);
         assert_eq!(engine.runtime.native_blocks_executed, 1);
     }

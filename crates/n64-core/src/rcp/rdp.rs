@@ -41,13 +41,25 @@ impl Rdp {
             0x04 => self.end = val & 0x00FF_FFF8,
             0x0C => {
                 // DPC_STATUS write: set/clear pairs
-                if val & 0x01 != 0 { self.status &= !0x01; } // Clear XBUS
-                if val & 0x02 != 0 { self.status |= 0x01; }  // Set XBUS
-                if val & 0x04 != 0 { self.status &= !0x02; } // Clear FREEZE
-                if val & 0x08 != 0 { self.status |= 0x02; }  // Set FREEZE
-                if val & 0x10 != 0 { self.status &= !0x04; } // Clear FLUSH
-                if val & 0x20 != 0 { self.status |= 0x04; }  // Set FLUSH
-                // Bits 6-9 clear counters on hardware; no-op in HLE.
+                if val & 0x01 != 0 {
+                    self.status &= !0x01;
+                } // Clear XBUS
+                if val & 0x02 != 0 {
+                    self.status |= 0x01;
+                } // Set XBUS
+                if val & 0x04 != 0 {
+                    self.status &= !0x02;
+                } // Clear FREEZE
+                if val & 0x08 != 0 {
+                    self.status |= 0x02;
+                } // Set FREEZE
+                if val & 0x10 != 0 {
+                    self.status &= !0x04;
+                } // Clear FLUSH
+                if val & 0x20 != 0 {
+                    self.status |= 0x04;
+                } // Set FLUSH
+                  // Bits 6-9 clear counters on hardware; no-op in HLE.
             }
             _ => {}
         }

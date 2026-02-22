@@ -72,12 +72,16 @@ impl Tlb {
             if (vaddr & !mask) != (entry.entry_hi & !mask) {
                 continue; // VPN mismatch
             }
-            let global_bit= (entry.entry_lo0 & entry.entry_lo1 & 0x1) == 1;
+            let global_bit = (entry.entry_lo0 & entry.entry_lo1 & 0x1) == 1;
             if !global_bit && (entry.entry_hi as u8 & 0xFF) != asid {
                 continue; // ASID mismatch
             }
             let odd = (vaddr & ((mask + 1) >> 1)) != 0;
-            let entry_lo = if odd { entry.entry_lo1 } else { entry.entry_lo0 };
+            let entry_lo = if odd {
+                entry.entry_lo1
+            } else {
+                entry.entry_lo0
+            };
             if (entry_lo & 0x2) == 0 {
                 return None; // Not valid
             }

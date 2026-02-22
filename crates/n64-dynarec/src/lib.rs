@@ -2821,9 +2821,10 @@ impl BlockCompiler for CraneliftCompiler {
             .iconst(types::I32, i64::from(compile_limit_value));
         let zero = builder.ins().iconst(types::I32, 0);
         let runtime_is_zero = builder.ins().icmp(IntCC::Equal, runtime_retire_limit, zero);
-        let runtime_limit = builder
-            .ins()
-            .select(runtime_is_zero, compile_limit, runtime_retire_limit);
+        let runtime_limit =
+            builder
+                .ins()
+                .select(runtime_is_zero, compile_limit, runtime_retire_limit);
         let retire_limit = builder.ins().umin(runtime_limit, compile_limit);
 
         let zero_retired = builder.ins().iconst(types::I32, 0);

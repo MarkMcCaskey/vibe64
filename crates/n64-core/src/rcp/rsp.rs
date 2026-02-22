@@ -114,7 +114,10 @@ impl Rsp {
             0x4_0000 => self.dma_mem_addr,
             0x4_0004 => self.dma_dram_addr,
             0x4_0008 | 0x4_000C => 0, // SP_RD_LEN / SP_WR_LEN (write-only, reads return 0)
-            0x4_0010 => { self.status_read_count.set(self.status_read_count.get() + 1); self.status },
+            0x4_0010 => {
+                self.status_read_count.set(self.status_read_count.get() + 1);
+                self.status
+            }
             0x4_0014 => self.dma_full,
             0x4_0018 => self.dma_busy,
             0x4_001C => {
@@ -132,8 +135,14 @@ impl Rsp {
     /// Write to RSP registers. Returns action for the bus to perform.
     pub fn write_reg_u32(&mut self, addr: u32, val: u32, mi: &mut super::mi::Mi) -> SpRegWrite {
         match addr & 0x0F_FFFF {
-            0x4_0000 => { self.dma_mem_addr = val & 0x1FFF; SpRegWrite::None }
-            0x4_0004 => { self.dma_dram_addr = val & 0x00FF_FFFF; SpRegWrite::None }
+            0x4_0000 => {
+                self.dma_mem_addr = val & 0x1FFF;
+                SpRegWrite::None
+            }
+            0x4_0004 => {
+                self.dma_dram_addr = val & 0x00FF_FFFF;
+                SpRegWrite::None
+            }
             0x4_0008 => {
                 // SP_RD_LEN write: trigger DMA RDRAM → SP MEM
                 self.dma_len = (val & 0xFFF) + 1;
@@ -155,8 +164,14 @@ impl Rsp {
                     SpRegWrite::None
                 }
             }
-            0x4_001C => { self.semaphore.set(0); SpRegWrite::None }
-            0x8_0000 => { self.pc = val & 0xFFC; SpRegWrite::None }
+            0x4_001C => {
+                self.semaphore.set(0);
+                SpRegWrite::None
+            }
+            0x8_0000 => {
+                self.pc = val & 0xFFC;
+                SpRegWrite::None
+            }
             _ => SpRegWrite::None,
         }
     }
@@ -170,26 +185,48 @@ impl Rsp {
         let was_halted = self.status & 0x01 != 0;
 
         // Process set/clear pairs
-        if val & 0x01 != 0 { self.status &= !0x01; } // Clear halt
-        if val & 0x02 != 0 { self.status |= 0x01; }  // Set halt
-        if val & 0x04 != 0 { self.status &= !0x02; } // Clear broke
-        if val & 0x08 != 0 { mi.clear_interrupt(super::mi::MiInterrupt::SP); }
-        if val & 0x10 != 0 { mi.set_interrupt(super::mi::MiInterrupt::SP); }
+        if val & 0x01 != 0 {
+            self.status &= !0x01;
+        } // Clear halt
+        if val & 0x02 != 0 {
+            self.status |= 0x01;
+        } // Set halt
+        if val & 0x04 != 0 {
+            self.status &= !0x02;
+        } // Clear broke
+        if val & 0x08 != 0 {
+            mi.clear_interrupt(super::mi::MiInterrupt::SP);
+        }
+        if val & 0x10 != 0 {
+            mi.set_interrupt(super::mi::MiInterrupt::SP);
+        }
         // Bits 5/6: clear/set single step (status bit 5)
-        if val & (1 << 5) != 0 { self.status &= !(1 << 5); }
-        if val & (1 << 6) != 0 { self.status |= 1 << 5; }
+        if val & (1 << 5) != 0 {
+            self.status &= !(1 << 5);
+        }
+        if val & (1 << 6) != 0 {
+            self.status |= 1 << 5;
+        }
         // Bits 7/8: clear/set interrupt on break (status bit 6)
-        if val & (1 << 7) != 0 { self.status &= !(1 << 6); }
-        if val & (1 << 8) != 0 { self.status |= 1 << 6; }
+        if val & (1 << 7) != 0 {
+            self.status &= !(1 << 6);
+        }
+        if val & (1 << 8) != 0 {
+            self.status |= 1 << 6;
+        }
         // Bits 9-24: clear/set signal 0-7 (status bits 7-14)
         for i in 0..8u32 {
             let clear_bit = 9 + i * 2;
             let set_bit = 10 + i * 2;
             if clear_bit < 25 {
-                if val & (1 << clear_bit) != 0 { self.status &= !(1 << (7 + i)); }
+                if val & (1 << clear_bit) != 0 {
+                    self.status &= !(1 << (7 + i));
+                }
             }
             if set_bit < 25 {
-                if val & (1 << set_bit) != 0 { self.status |= 1 << (7 + i); }
+                if val & (1 << set_bit) != 0 {
+                    self.status |= 1 << (7 + i);
+                }
             }
         }
 
@@ -200,8 +237,12 @@ impl Rsp {
         // by the bus only for GFX tasks (after display list processing),
         // matching real hardware where DP fires when the RDP finishes.
         if was_halted && (self.status & 0x01 == 0) {
-            log::debug!("RSP auto-complete #{}: write={:#010X} → status={:#010X}",
-                self.start_count + 1, val, self.status | 0x01 | 0x02 | (1 << 7) | (1 << 8));
+            log::debug!(
+                "RSP auto-complete #{}: write={:#010X} → status={:#010X}",
+                self.start_count + 1,
+                val,
+                self.status | 0x01 | 0x02 | (1 << 7) | (1 << 8)
+            );
             self.status |= 0x01 | 0x02 | (1 << 7) | (1 << 8); // halt + broke + sig0 + sig1
             mi.set_interrupt(super::mi::MiInterrupt::SP);
             self.start_count += 1;
@@ -211,8 +252,12 @@ impl Rsp {
             return true;
         } else if val & 0x01 != 0 {
             // Tried to clear halt but didn't trigger auto-complete
-            log::debug!("RSP clear-halt NO-OP: was_halted={} status={:#010X} write={:#010X}",
-                was_halted, self.status, val);
+            log::debug!(
+                "RSP clear-halt NO-OP: was_halted={} status={:#010X} write={:#010X}",
+                was_halted,
+                self.status,
+                val
+            );
         }
         if self.status_log.len() < 100 {
             self.status_log.push((val, self.status, false));
