@@ -142,39 +142,116 @@ impl Vr4300 {
         }
     }
 
+    #[inline(always)]
+    fn kseg_direct_phys(addr32: u32) -> Option<u32> {
+        match addr32 & 0xE000_0000 {
+            0x8000_0000 | 0xA000_0000 => Some(addr32 & 0x1FFF_FFFF),
+            _ => None,
+        }
+    }
+
+    #[cold]
+    fn handle_fetch_tlb_miss(&mut self, faulting_pc: u64, was_delay_slot: bool) -> u64 {
+        let epc = if was_delay_slot {
+            faulting_pc.wrapping_sub(4) // branch instruction
+        } else {
+            faulting_pc
+        };
+        self.take_tlb_exception(ExceptionCode::TlbLoad, faulting_pc, epc);
+        if was_delay_slot {
+            self.cop0.regs[Cop0::CAUSE] |= 1u64 << 31; // BD bit
+        }
+        self.cop0.increment_count();
+        self.cop0.decrement_random();
+        self.cop0.check_timer_interrupt();
+        1
+    }
+
+    #[cold]
+    fn handle_data_tlb_miss(
+        &mut self,
+        code: ExceptionCode,
+        bad_vaddr: u64,
+        current_pc: u64,
+        was_delay_slot: bool,
+    ) -> u64 {
+        self.tlb_miss_count += 1;
+        if self.tlb_miss_count <= 5 {
+            log::warn!(
+                "TLB {:?} #{} at PC={:#010X} bad_vaddr={:#018X} step={}",
+                code,
+                self.tlb_miss_count,
+                current_pc as u32,
+                bad_vaddr,
+                self.step_count
+            );
+        }
+        let epc = if was_delay_slot {
+            current_pc.wrapping_sub(4) // branch instruction
+        } else {
+            current_pc
+        };
+        self.take_tlb_exception(code, bad_vaddr, epc);
+        if was_delay_slot {
+            self.cop0.regs[Cop0::CAUSE] |= 1u64 << 31; // BD bit
+        }
+        self.gpr[0] = 0;
+        self.cop0.increment_count();
+        self.cop0.decrement_random();
+        self.cop0.check_timer_interrupt();
+        1
+    }
+
+    #[cold]
+    fn handle_reserved_instruction(&mut self, current_pc: u64, was_delay_slot: bool) -> u64 {
+        self.reserved_instr = false;
+        let epc = if was_delay_slot {
+            current_pc.wrapping_sub(4)
+        } else {
+            current_pc
+        };
+        self.cop0.regs[Cop0::EPC] = epc;
+        let cause = self.cop0.regs[Cop0::CAUSE] as u32;
+        let cause = (cause & !0x7C) | ((ExceptionCode::ReservedInstruction as u32) << 2);
+        self.cop0.regs[Cop0::CAUSE] = cause as i32 as i64 as u64;
+        if was_delay_slot {
+            self.cop0.regs[Cop0::CAUSE] |= 1u64 << 31;
+        }
+        self.cop0.regs[Cop0::STATUS] |= 0x02; // Set EXL
+        let bev = (self.cop0.regs[Cop0::STATUS] >> 22) & 1;
+        let vector = if bev != 0 {
+            0xFFFF_FFFF_BFC0_0200u64
+        } else {
+            0xFFFF_FFFF_8000_0180u64
+        };
+        self.pc = vector;
+        self.next_pc = vector.wrapping_add(4);
+        self.gpr[0] = 0;
+        self.cop0.increment_count();
+        self.cop0.decrement_random();
+        self.cop0.check_timer_interrupt();
+        1
+    }
+
     /// Execute one instruction. Returns number of cycles consumed.
     pub fn step(&mut self, bus: &mut impl Bus) -> u64 {
         // Record PC in ring buffer for crash debugging
         self.pc_history[self.pc_history_idx] = self.pc as u32;
         self.pc_history_idx = (self.pc_history_idx + 1) & 63;
         self.step_count += 1;
-
-        let pc32 = self.pc as u32;
+        let current_pc = self.pc;
 
         // Save and clear delay slot flag. execute() will set it for branches.
         let was_delay_slot = self.in_delay_slot;
         self.in_delay_slot = false;
 
         // 1. Translate virtual PC to physical address
-        let phys_addr = match self.try_translate(self.pc) {
+        let phys_addr = match Self::kseg_direct_phys(current_pc as u32) {
             Some(addr) => addr,
-            None => {
-                // TLB miss on instruction fetch
-                let faulting_pc = self.pc;
-                let epc = if was_delay_slot {
-                    faulting_pc.wrapping_sub(4) // branch instruction
-                } else {
-                    faulting_pc
-                };
-                self.take_tlb_exception(ExceptionCode::TlbLoad, faulting_pc, epc);
-                if was_delay_slot {
-                    self.cop0.regs[Cop0::CAUSE] |= 1u64 << 31; // BD bit
-                }
-                self.cop0.increment_count();
-                self.cop0.decrement_random();
-                self.cop0.check_timer_interrupt();
-                return 1;
-            }
+            None => match self.try_translate(current_pc) {
+                Some(addr) => addr,
+                None => return self.handle_fetch_tlb_miss(current_pc, was_delay_slot),
+            },
         };
 
         // 2. Fetch instruction
@@ -182,7 +259,6 @@ impl Vr4300 {
         let instr = Instruction::decode(opcode);
 
         // 3. Advance PC before execution (branch delay slot handling)
-        let current_pc = self.pc;
         self.pc = self.next_pc;
         self.next_pc = self.next_pc.wrapping_add(4);
 
@@ -191,63 +267,12 @@ impl Vr4300 {
 
         // 5. Check for TLB miss during data access (set by load/store ops)
         if let Some((bad_vaddr, code)) = self.tlb_miss.take() {
-            // Track TLB misses for debugging
-            self.tlb_miss_count += 1;
-            if self.tlb_miss_count <= 5 {
-                log::warn!(
-                    "TLB {:?} #{} at PC={:#010X} bad_vaddr={:#018X} step={}",
-                    code,
-                    self.tlb_miss_count,
-                    current_pc as u32,
-                    bad_vaddr,
-                    self.step_count
-                );
-            }
-            let epc = if was_delay_slot {
-                current_pc.wrapping_sub(4) // branch instruction
-            } else {
-                current_pc
-            };
-            self.take_tlb_exception(code, bad_vaddr, epc);
-            if was_delay_slot {
-                self.cop0.regs[Cop0::CAUSE] |= 1u64 << 31; // BD bit
-            }
-            self.gpr[0] = 0;
-            self.cop0.increment_count();
-            self.cop0.decrement_random();
-            self.cop0.check_timer_interrupt();
-            return 1;
+            return self.handle_data_tlb_miss(code, bad_vaddr, current_pc, was_delay_slot);
         }
 
         // 5b. Check for Reserved Instruction exception (undefined opcode)
         if self.reserved_instr {
-            self.reserved_instr = false;
-            let epc = if was_delay_slot {
-                current_pc.wrapping_sub(4)
-            } else {
-                current_pc
-            };
-            self.cop0.regs[Cop0::EPC] = epc;
-            let cause = self.cop0.regs[Cop0::CAUSE] as u32;
-            let cause = (cause & !0x7C) | ((ExceptionCode::ReservedInstruction as u32) << 2);
-            self.cop0.regs[Cop0::CAUSE] = cause as i32 as i64 as u64;
-            if was_delay_slot {
-                self.cop0.regs[Cop0::CAUSE] |= 1u64 << 31;
-            }
-            self.cop0.regs[Cop0::STATUS] |= 0x02; // Set EXL
-            let bev = (self.cop0.regs[Cop0::STATUS] >> 22) & 1;
-            let vector = if bev != 0 {
-                0xFFFF_FFFF_BFC0_0200u64
-            } else {
-                0xFFFF_FFFF_8000_0180u64
-            };
-            self.pc = vector;
-            self.next_pc = vector.wrapping_add(4);
-            self.gpr[0] = 0;
-            self.cop0.increment_count();
-            self.cop0.decrement_random();
-            self.cop0.check_timer_interrupt();
-            return 1;
+            return self.handle_reserved_instruction(current_pc, was_delay_slot);
         }
 
         // 6. r0 is hardwired to 0 — enforce after every instruction
@@ -309,23 +334,28 @@ impl Vr4300 {
 
     /// Try to translate a virtual address. Returns None on TLB miss.
     /// Used by step() and load/store ops to detect TLB exceptions.
+    #[inline(always)]
     pub fn try_translate(&self, vaddr: u64) -> Option<u32> {
         let addr32 = vaddr as u32;
-        match addr32 {
-            0x8000_0000..=0x9FFF_FFFF => Some(addr32 - 0x8000_0000),
-            0xA000_0000..=0xBFFF_FFFF => Some(addr32 - 0xA000_0000),
-            _ => {
-                let asid = self.cop0.regs[Cop0::ENTRY_HI] as u8;
-                self.tlb.lookup(vaddr, asid)
-            }
+        if let Some(phys) = Self::kseg_direct_phys(addr32) {
+            return Some(phys);
         }
+
+        let asid = self.cop0.regs[Cop0::ENTRY_HI] as u8;
+        self.tlb.lookup(vaddr, asid)
     }
 
     /// Translate a virtual address with fallback for debug/diagnostic use.
     /// On TLB miss, returns addr & 0x1FFFFFFF instead of None.
+    #[inline(always)]
     pub fn translate_address(&self, vaddr: u64) -> u32 {
-        self.try_translate(vaddr)
-            .unwrap_or_else(|| vaddr as u32 & 0x1FFF_FFFF)
+        let addr32 = vaddr as u32;
+        if let Some(phys) = Self::kseg_direct_phys(addr32) {
+            return phys;
+        }
+
+        let asid = self.cop0.regs[Cop0::ENTRY_HI] as u8;
+        self.tlb.lookup(vaddr, asid).unwrap_or(addr32 & 0x1FFF_FFFF)
     }
 
     /// Take a TLB exception (Refill or Invalid).

@@ -311,11 +311,13 @@ impl Vr4300 {
     /// Compute branch target: PC + 4 + (sign_extend(offset) << 2).
     /// Note: current_pc is the branch instruction's PC. The offset is
     /// relative to current_pc + 4 (the delay slot).
+    #[inline(always)]
     fn branch_target(&self, instr: Instruction, current_pc: u64) -> u64 {
         let offset = (instr.imm() as i16 as i64) << 2;
         (current_pc.wrapping_add(4)).wrapping_add(offset as u64)
     }
 
+    #[inline(always)]
     fn branch(&mut self, condition: bool, instr: Instruction, current_pc: u64) {
         if condition {
             self.next_pc = self.branch_target(instr, current_pc);
@@ -324,6 +326,7 @@ impl Vr4300 {
     }
 
     /// "Likely" branch: if NOT taken, nullify the delay slot.
+    #[inline(always)]
     fn branch_likely(&mut self, condition: bool, instr: Instruction, current_pc: u64) {
         if condition {
             self.next_pc = self.branch_target(instr, current_pc);
@@ -736,6 +739,7 @@ impl Vr4300 {
 
     /// Compute and translate a load address. Returns None on TLB miss
     /// (sets tlb_miss flag so step() can take the exception).
+    #[inline(always)]
     fn load_addr(&mut self, instr: Instruction) -> Option<u32> {
         let vaddr = self.gpr[instr.rs()].wrapping_add(instr.imm_sign_ext());
         match self.try_translate(vaddr) {
@@ -750,6 +754,7 @@ impl Vr4300 {
     }
 
     /// Compute and translate a store address. Returns None on TLB miss.
+    #[inline(always)]
     fn store_addr(&mut self, instr: Instruction) -> Option<u32> {
         let vaddr = self.gpr[instr.rs()].wrapping_add(instr.imm_sign_ext());
         match self.try_translate(vaddr) {
