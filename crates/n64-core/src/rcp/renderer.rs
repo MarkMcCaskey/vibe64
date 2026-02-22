@@ -1255,12 +1255,14 @@ impl Renderer {
             // Transform vertex by MVP matrix → clip space
             let [cx, cy, cz, cw] = mat4_mul_vec(&self.mvp, [x, y, z, 1.0]);
 
-            // When G_FOG (0x10000) is enabled, compute fog factor from clip W
-            // and replace vertex alpha with it. The blender then uses shade alpha
+            // When G_FOG (0x10000) is enabled, compute fog factor from
+            // normalized depth (clip Z / clip W, approximately -1..1) and
+            // replace vertex alpha with it. The blender then uses shade alpha
             // to lerp between pixel color and fog_color.
             let a = if self.geometry_mode & 0x10000 != 0 && cw.abs() > 0.0001 {
+                let ndc_z = (cz / cw).clamp(-1.0, 1.0);
                 let fog =
-                    (cw * self.fog_multiplier as f32 + self.fog_offset as f32).clamp(0.0, 255.0);
+                    (ndc_z * self.fog_multiplier as f32 + self.fog_offset as f32).clamp(0.0, 255.0);
                 fog as u8
             } else {
                 a
