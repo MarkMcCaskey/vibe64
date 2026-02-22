@@ -421,6 +421,29 @@ impl Recompiler {
         self.cache_pages.contains_key(&page)
     }
 
+    /// Returns true when any compiled block overlaps `start_phys..start_phys+len`.
+    pub fn has_cached_overlap(&self, start_phys: u32, len: u32) -> bool {
+        if len == 0 {
+            return false;
+        }
+        let (first_page, last_page) = page_span_from_start_len(start_phys, len);
+        let end_phys = start_phys.saturating_add(len);
+        for page in first_page..=last_page {
+            let Some(keys) = self.cache_pages.get(&page) else {
+                continue;
+            };
+            for key in keys {
+                let Some(block) = self.cache.get(key) else {
+                    continue;
+                };
+                if block.start_phys < end_phys && start_phys < block.end_phys {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     pub fn is_failed_cached(&self, start_phys: u32) -> bool {
         self.failed_cache.contains(&start_phys)
     }

@@ -267,20 +267,11 @@ unsafe fn queue_store_invalidation_if_compiled<B: Bus>(
     if len == 0 {
         return;
     }
-    let first_page = page_of(phys);
-    let last_page = page_of(phys.saturating_add(len.saturating_sub(1)));
     // SAFETY: pointer initialized in `run_native_block` for this invocation.
     let recompiler = unsafe { &*ctx.recompiler };
     // SAFETY: pointer initialized in `run_native_block` for this invocation.
     let pending = unsafe { &mut *ctx.pending_code_writes };
-    let mut touches_cached_page = false;
-    for page in first_page..=last_page {
-        if recompiler.has_cached_page(page) {
-            touches_cached_page = true;
-            break;
-        }
-    }
-    if touches_cached_page {
+    if recompiler.has_cached_overlap(phys, len) {
         pending.push((phys, len));
     }
 }
@@ -1600,7 +1591,7 @@ impl DynarecEngine {
         }
         let start_pc = cpu.pc;
         let fastmem = bus.dynarec_fastmem().unwrap_or_default();
-        let mut pending_code_writes: Vec<(u32, u32)> = Vec::with_capacity(8);
+        let mut pending_code_writes: Vec<(u32, u32)> = Vec::new();
         let recompiler_ptr: *const Recompiler = &self.recompiler;
         let mut callback_ctx = CallbackContext {
             cpu: (cpu as *mut Vr4300),
