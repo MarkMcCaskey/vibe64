@@ -64,6 +64,14 @@ pub struct DynarecRuntimeStats {
     pub fallback_failed_cache: u64,
     pub fallback_cold: u64,
     pub fallback_compile_budget: u64,
+    pub guard_reject_zero_insn: u64,
+    pub guard_reject_min_block: u64,
+    pub guard_reject_interp_dominated: u64,
+    pub guard_reject_delay_or_nonlinear: u64,
+    pub guard_reject_non_kseg: u64,
+    pub guard_reject_start_phys_mismatch: u64,
+    pub guard_reject_pending_interrupt: u64,
+    pub guard_reject_timer_interrupt: u64,
     pub ensure_compiled_calls: u64,
     pub ensure_compiled_compiled: u64,
     pub ensure_compiled_compile_failed: u64,
@@ -114,6 +122,18 @@ enum FallbackReason {
     FailedCache,
     Cold,
     CompileBudget,
+}
+
+#[derive(Clone, Copy)]
+enum NativeGuardRejectReason {
+    ZeroInsn,
+    MinBlock,
+    InterpDominated,
+    DelayOrNonLinearPc,
+    NonKsegAddress,
+    StartPhysMismatch,
+    PendingInterrupt,
+    TimerInterrupt,
 }
 
 #[derive(Clone, Copy)]
@@ -659,7 +679,7 @@ impl DynarecEngine {
     pub fn stats_line(&self) -> String {
         let stats = self.stats();
         format!(
-            "native_blocks={} native_instr={} native_interp_instr={} native_gas_exits={} native_link_hits={} native_link_misses={} native_link_inserts={} promote_calls={} promote_compiled={} promote_compile_failed={} promote_cache_hit={} promote_skipped_budget={} promote_time_us={} promote_time_max_us={} promote_async_enqueued={} promote_async_completed={} promote_async_dropped_stale={} promote_async_queue_full={} promote_async_snapshot_miss={} promote_async_worker_down={} fallback_instr={} fallback_early_guard={} fallback_guard_after_lookup={} fallback_no_block={} fallback_failed_cache={} fallback_cold={} fallback_compile_budget={} ensure_calls={} ensure_compiled={} ensure_compile_failed={} ensure_cache_hit={} ensure_time_us={} ensure_time_max_us={} recompiler_cache_hits={} recompiler_failed_cache_hits={} recompiler_blocks_compiled={} recompiler_compile_failures={} recompiler_invalidated_blocks={} invalidate_calls={} invalidate_bytes={} invalidate_time_us={} invalidate_time_max_us={} block_cache_len={} native_link_cache_len={} native_link_fanout={} failed_cache_len={} hot_entries={} hot_threshold={} max_block_insns={} tier1_max_block_insns={} promote_hot_threshold={} async_promote_enabled={} async_snapshot_insns={} async_queue_limit={} min_block_insns={} native_gas={} chain_limit={} compile_budget_us_per_ms={} compile_budget_burst_ms={} compile_budget_cap_us={} compile_budget_credit_us={}",
+            "native_blocks={} native_instr={} native_interp_instr={} native_gas_exits={} native_link_hits={} native_link_misses={} native_link_inserts={} promote_calls={} promote_compiled={} promote_compile_failed={} promote_cache_hit={} promote_skipped_budget={} promote_time_us={} promote_time_max_us={} promote_async_enqueued={} promote_async_completed={} promote_async_dropped_stale={} promote_async_queue_full={} promote_async_snapshot_miss={} promote_async_worker_down={} fallback_instr={} fallback_early_guard={} fallback_guard_after_lookup={} fallback_no_block={} fallback_failed_cache={} fallback_cold={} fallback_compile_budget={} guard_reject_zero_insn={} guard_reject_min_block={} guard_reject_interp_dominated={} guard_reject_delay_or_nonlinear={} guard_reject_non_kseg={} guard_reject_start_phys_mismatch={} guard_reject_pending_interrupt={} guard_reject_timer_interrupt={} ensure_calls={} ensure_compiled={} ensure_compile_failed={} ensure_cache_hit={} ensure_time_us={} ensure_time_max_us={} recompiler_cache_hits={} recompiler_failed_cache_hits={} recompiler_blocks_compiled={} recompiler_compile_failures={} recompiler_invalidated_blocks={} invalidate_calls={} invalidate_bytes={} invalidate_time_us={} invalidate_time_max_us={} block_cache_len={} native_link_cache_len={} native_link_fanout={} failed_cache_len={} hot_entries={} hot_threshold={} max_block_insns={} tier1_max_block_insns={} promote_hot_threshold={} async_promote_enabled={} async_snapshot_insns={} async_queue_limit={} min_block_insns={} native_gas={} chain_limit={} compile_budget_us_per_ms={} compile_budget_burst_ms={} compile_budget_cap_us={} compile_budget_credit_us={}",
             stats.runtime.native_blocks_executed,
             stats.runtime.native_instructions_executed,
             stats.runtime.native_interp_delegated_instructions,
@@ -687,6 +707,14 @@ impl DynarecEngine {
             stats.runtime.fallback_failed_cache,
             stats.runtime.fallback_cold,
             stats.runtime.fallback_compile_budget,
+            stats.runtime.guard_reject_zero_insn,
+            stats.runtime.guard_reject_min_block,
+            stats.runtime.guard_reject_interp_dominated,
+            stats.runtime.guard_reject_delay_or_nonlinear,
+            stats.runtime.guard_reject_non_kseg,
+            stats.runtime.guard_reject_start_phys_mismatch,
+            stats.runtime.guard_reject_pending_interrupt,
+            stats.runtime.guard_reject_timer_interrupt,
             stats.runtime.ensure_compiled_calls,
             stats.runtime.ensure_compiled_compiled,
             stats.runtime.ensure_compiled_compile_failed,
@@ -767,6 +795,29 @@ impl DynarecEngine {
             }
         }
         retired
+    }
+
+    fn record_guard_reject_reason(&mut self, reason: NativeGuardRejectReason) {
+        match reason {
+            NativeGuardRejectReason::ZeroInsn => self.runtime.guard_reject_zero_insn += 1,
+            NativeGuardRejectReason::MinBlock => self.runtime.guard_reject_min_block += 1,
+            NativeGuardRejectReason::InterpDominated => {
+                self.runtime.guard_reject_interp_dominated += 1
+            }
+            NativeGuardRejectReason::DelayOrNonLinearPc => {
+                self.runtime.guard_reject_delay_or_nonlinear += 1
+            }
+            NativeGuardRejectReason::NonKsegAddress => self.runtime.guard_reject_non_kseg += 1,
+            NativeGuardRejectReason::StartPhysMismatch => {
+                self.runtime.guard_reject_start_phys_mismatch += 1
+            }
+            NativeGuardRejectReason::PendingInterrupt => {
+                self.runtime.guard_reject_pending_interrupt += 1
+            }
+            NativeGuardRejectReason::TimerInterrupt => {
+                self.runtime.guard_reject_timer_interrupt += 1
+            }
+        }
     }
 
     fn should_attempt_compile(&mut self, start_phys: u32) -> bool {
@@ -1325,6 +1376,78 @@ impl DynarecEngine {
         delta != 0 && delta <= instructions
     }
 
+    fn external_interrupt_would_fire(cpu: &Vr4300, bus: &impl Bus) -> bool {
+        if !bus.pending_interrupts() {
+            return false;
+        }
+
+        let status = cpu.cop0.regs[Cop0::STATUS] as u32;
+        let ie = (status & 1) != 0;
+        let exl = ((status >> 1) & 1) != 0;
+        let erl = ((status >> 2) & 1) != 0;
+        let im2 = ((status >> 10) & 1) != 0;
+        ie && !exl && !erl && im2
+    }
+
+    fn block_timer_guard_instructions(block: &CompiledBlock) -> u32 {
+        if block.has_backedge {
+            block.max_retired_instructions
+        } else {
+            block.instruction_count.max(1)
+        }
+    }
+
+    fn native_guard_reject_reason(
+        &self,
+        cpu: &Vr4300,
+        bus: &impl Bus,
+        block: &CompiledBlock,
+        start_phys: u32,
+    ) -> Option<NativeGuardRejectReason> {
+        if block.instruction_count == 0 {
+            return Some(NativeGuardRejectReason::ZeroInsn);
+        }
+        if block.instruction_count < self.min_native_instructions {
+            return Some(NativeGuardRejectReason::MinBlock);
+        }
+
+        // Blocks dominated by interpreter-delegated ops are usually slower than
+        // the plain interpreter path.
+        if block.interp_op_count != 0 && block.interp_op_count >= block.instruction_count {
+            return Some(NativeGuardRejectReason::InterpDominated);
+        }
+
+        // Delay-slot and non-linear PC paths need exact per-instruction handling.
+        if cpu.in_delay_slot || cpu.next_pc != cpu.pc.wrapping_add(4) {
+            return Some(NativeGuardRejectReason::DelayOrNonLinearPc);
+        }
+
+        // Restrict to kseg0/kseg1 direct mappings for now.
+        let pc32 = cpu.pc as u32;
+        if !(0x8000_0000..=0xBFFF_FFFF).contains(&pc32) {
+            return Some(NativeGuardRejectReason::NonKsegAddress);
+        }
+
+        if start_phys != (pc32 & 0x1FFF_FFFF) {
+            return Some(NativeGuardRejectReason::StartPhysMismatch);
+        }
+
+        // If an interrupt could be taken, we must stay instruction-granular.
+        if cpu.cop0.interrupt_pending()
+            || Self::external_interrupt_would_fire(cpu, bus)
+            || (bus.pending_interrupts() && block.may_write_interrupt_state)
+        {
+            return Some(NativeGuardRejectReason::PendingInterrupt);
+        }
+
+        let timer_guard_insns = Self::block_timer_guard_instructions(block);
+        if Self::timer_interrupt_would_fire(cpu, timer_guard_insns) {
+            return Some(NativeGuardRejectReason::TimerInterrupt);
+        }
+
+        None
+    }
+
     fn can_run_native_block(
         &self,
         cpu: &Vr4300,
@@ -1332,44 +1455,8 @@ impl DynarecEngine {
         block: &CompiledBlock,
         start_phys: u32,
     ) -> bool {
-        if block.instruction_count == 0 {
-            return false;
-        }
-        if block.instruction_count < self.min_native_instructions {
-            return false;
-        }
-
-        // Blocks dominated by interpreter-delegated ops are usually slower than
-        // the plain interpreter path.
-        if block.interp_op_count != 0 && block.interp_op_count >= block.instruction_count {
-            return false;
-        }
-
-        // Delay-slot and non-linear PC paths need exact per-instruction handling.
-        if cpu.in_delay_slot || cpu.next_pc != cpu.pc.wrapping_add(4) {
-            return false;
-        }
-
-        // Restrict to kseg0/kseg1 direct mappings for now.
-        let pc32 = cpu.pc as u32;
-        if !(0x8000_0000..=0xBFFF_FFFF).contains(&pc32) {
-            return false;
-        }
-
-        if start_phys != (pc32 & 0x1FFF_FFFF) {
-            return false;
-        }
-
-        // If an interrupt could be taken, we must stay instruction-granular.
-        if bus.pending_interrupts() || cpu.cop0.interrupt_pending() {
-            return false;
-        }
-
-        if Self::timer_interrupt_would_fire(cpu, block.max_retired_instructions) {
-            return false;
-        }
-
-        true
+        self.native_guard_reject_reason(cpu, bus, block, start_phys)
+            .is_none()
     }
 
     fn run_native_block<B: Bus>(
@@ -1532,10 +1619,11 @@ impl ExecutionEngine for DynarecEngine {
         let start_phys = pc32 & 0x1FFF_FFFF;
         if let Some(block) = self.recompiler.lookup(start_phys).copied() {
             self.raise_tier_floor(start_phys, block.max_retired_instructions);
-            if self.can_run_native_block(cpu, bus, &block, start_phys) {
-                return self.run_native_chain(cpu, bus, block);
+            if let Some(reason) = self.native_guard_reject_reason(cpu, bus, &block, start_phys) {
+                self.record_guard_reject_reason(reason);
+                return self.run_fallback(cpu, bus, FallbackReason::GuardAfterLookup);
             }
-            return self.run_fallback(cpu, bus, FallbackReason::GuardAfterLookup);
+            return self.run_native_chain(cpu, bus, block);
         }
 
         if self.recompiler.is_failed_cached(start_phys) {
@@ -1595,10 +1683,11 @@ impl ExecutionEngine for DynarecEngine {
 
         if let Some(block) = self.recompiler.lookup(start_phys).copied() {
             self.raise_tier_floor(start_phys, block.max_retired_instructions);
-            if self.can_run_native_block(cpu, bus, &block, start_phys) {
-                return self.run_native_chain(cpu, bus, block);
+            if let Some(reason) = self.native_guard_reject_reason(cpu, bus, &block, start_phys) {
+                self.record_guard_reject_reason(reason);
+                return self.run_fallback(cpu, bus, FallbackReason::GuardAfterLookup);
             }
-            return self.run_fallback(cpu, bus, FallbackReason::GuardAfterLookup);
+            return self.run_native_chain(cpu, bus, block);
         }
 
         self.run_fallback(cpu, bus, FallbackReason::NoBlock)

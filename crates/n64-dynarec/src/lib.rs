@@ -212,6 +212,11 @@ pub struct CompiledBlock {
     pub interp_op_count: u32,
     /// Maximum number of guest instructions one native entry may retire.
     pub max_retired_instructions: u32,
+    /// True when this block may enable or signal interrupts via COP0 writes or
+    /// interpreter-delegated instructions.
+    pub may_write_interrupt_state: bool,
+    /// True when this trace contains a control-flow backedge.
+    pub has_backedge: bool,
     /// True if the block ended on a control-transfer boundary.
     pub has_control_flow: bool,
     /// True when compilation stopped at an unsupported non-branch opcode.
@@ -1010,6 +1015,14 @@ fn can_inline_interp_non_branch(raw: u32) -> bool {
         // Special control-flow and explicit exception traps should terminate.
         0x00 if matches!(funct, 0x08 | 0x09 | 0x0C | 0x0D | 0x30..=0x37) => false,
         _ => true,
+    }
+}
+
+fn op_may_write_interrupt_state(op: Op) -> bool {
+    match op {
+        Op::Mtc0 { rd, .. } | Op::Dmtc0 { rd, .. } => matches!(rd, 12 | 13),
+        Op::Interp { .. } => true,
+        _ => false,
     }
 }
 
@@ -2354,6 +2367,7 @@ impl BlockCompiler for CraneliftCompiler {
         let mut interp_op_count = 0u32;
         let mut has_control_flow = false;
         let mut ended_on_unsupported = false;
+        let mut may_write_interrupt_state = false;
 
         while decoded_count < max_instructions {
             let opcode = match source.read_u32(phys) {
@@ -2397,6 +2411,9 @@ impl BlockCompiler for CraneliftCompiler {
                 };
                 if matches!(delay_op, Op::Interp { .. }) {
                     interp_op_count = interp_op_count.saturating_add(1);
+                }
+                if op_may_write_interrupt_state(delay_op) {
+                    may_write_interrupt_state = true;
                 }
                 let continue_fallthrough = matches!(
                     branch,
@@ -2452,12 +2469,16 @@ impl BlockCompiler for CraneliftCompiler {
                     if matches!(op, Op::Interp { .. }) {
                         interp_op_count = interp_op_count.saturating_add(1);
                     }
+                    if op_may_write_interrupt_state(op) {
+                        may_write_interrupt_state = true;
+                    }
                     steps.push(TraceStep::Op { phys, op });
                     decoded_count += 1;
                     phys = phys.wrapping_add(4);
                 }
                 None => {
                     if can_inline_interp_non_branch(opcode) {
+                        may_write_interrupt_state = true;
                         steps.push(TraceStep::Op {
                             phys,
                             op: Op::Interp { raw: opcode },
@@ -3365,6 +3386,8 @@ impl BlockCompiler for CraneliftCompiler {
             instruction_count,
             interp_op_count,
             max_retired_instructions: request.max_instructions.max(1),
+            may_write_interrupt_state,
+            has_backedge,
             has_control_flow,
             ended_on_unsupported,
             entry,
@@ -3713,6 +3736,7 @@ mod tests {
         let exec = block.execute(&mut gpr, &mut fpr, 0xFFFF_FFFF_8000_2000, &mut callbacks);
 
         assert_eq!(block.instruction_count, 5);
+        assert!(!block.may_write_interrupt_state);
         assert_eq!(gpr[8], 5);
         assert_eq!(gpr[9], 7);
         assert_eq!(gpr[10], 12);
@@ -3756,6 +3780,33 @@ mod tests {
         assert_eq!(gpr[10], 5);
         assert_eq!(exec.next_pc, start_pc + 20);
         assert_eq!(exec.retired_instructions, 4);
+    }
+
+    #[test]
+    fn compiled_block_marks_backedge_loop_metadata() {
+        let start = 0x22C0u32;
+        let mut src = TestSource::with_words(&[
+            (start, 0x2408_0003),      // addiu t0, r0, 3
+            (start + 4, 0x2508_FFFF),  // addiu t0, t0, -1
+            (start + 8, 0x1500_FFFE),  // bne t0, r0, -2 (backedge to start+4)
+            (start + 12, 0x0000_0000), // nop (delay slot)
+            (start + 16, 0x4200_0018), // eret (sentinel: unsupported)
+        ]);
+
+        let mut compiler = CraneliftCompiler::default();
+        let block = compiler
+            .compile(
+                &CompileRequest {
+                    start_phys: start,
+                    max_instructions: 16,
+                },
+                &mut src,
+            )
+            .expect("compile");
+
+        assert!(block.has_control_flow);
+        assert!(block.has_backedge);
+        assert!(!block.may_write_interrupt_state);
     }
 
     #[test]
@@ -4089,6 +4140,7 @@ mod tests {
 
         assert_eq!(exec.next_pc, start_pc + 36);
         assert_eq!(exec.retired_instructions, 9);
+        assert!(block.may_write_interrupt_state);
         assert_eq!(gpr[9], 0x12);
         assert_eq!(gpr[11], 0x34);
         assert_eq!(gpr[2], 0x34);
