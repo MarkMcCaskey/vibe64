@@ -71,6 +71,9 @@ pub struct DynarecRuntimeStats {
     pub guard_reject_non_kseg: u64,
     pub guard_reject_start_phys_mismatch: u64,
     pub guard_reject_pending_interrupt: u64,
+    pub guard_reject_pending_cop0: u64,
+    pub guard_reject_pending_external: u64,
+    pub guard_reject_pending_write_state: u64,
     pub guard_reject_timer_interrupt: u64,
     pub ensure_compiled_calls: u64,
     pub ensure_compiled_compiled: u64,
@@ -132,8 +135,15 @@ enum NativeGuardRejectReason {
     DelayOrNonLinearPc,
     NonKsegAddress,
     StartPhysMismatch,
-    PendingInterrupt,
+    PendingInterrupt(PendingInterruptRejectReason),
     TimerInterrupt,
+}
+
+#[derive(Clone, Copy)]
+enum PendingInterruptRejectReason {
+    Cop0Pending,
+    ExternalFire,
+    PendingLineWithWriteState,
 }
 
 #[derive(Clone, Copy)]
@@ -679,7 +689,7 @@ impl DynarecEngine {
     pub fn stats_line(&self) -> String {
         let stats = self.stats();
         format!(
-            "native_blocks={} native_instr={} native_interp_instr={} native_gas_exits={} native_link_hits={} native_link_misses={} native_link_inserts={} promote_calls={} promote_compiled={} promote_compile_failed={} promote_cache_hit={} promote_skipped_budget={} promote_time_us={} promote_time_max_us={} promote_async_enqueued={} promote_async_completed={} promote_async_dropped_stale={} promote_async_queue_full={} promote_async_snapshot_miss={} promote_async_worker_down={} fallback_instr={} fallback_early_guard={} fallback_guard_after_lookup={} fallback_no_block={} fallback_failed_cache={} fallback_cold={} fallback_compile_budget={} guard_reject_zero_insn={} guard_reject_min_block={} guard_reject_interp_dominated={} guard_reject_delay_or_nonlinear={} guard_reject_non_kseg={} guard_reject_start_phys_mismatch={} guard_reject_pending_interrupt={} guard_reject_timer_interrupt={} ensure_calls={} ensure_compiled={} ensure_compile_failed={} ensure_cache_hit={} ensure_time_us={} ensure_time_max_us={} recompiler_cache_hits={} recompiler_failed_cache_hits={} recompiler_blocks_compiled={} recompiler_compile_failures={} recompiler_invalidated_blocks={} invalidate_calls={} invalidate_bytes={} invalidate_time_us={} invalidate_time_max_us={} block_cache_len={} native_link_cache_len={} native_link_fanout={} failed_cache_len={} hot_entries={} hot_threshold={} max_block_insns={} tier1_max_block_insns={} promote_hot_threshold={} async_promote_enabled={} async_snapshot_insns={} async_queue_limit={} min_block_insns={} native_gas={} chain_limit={} compile_budget_us_per_ms={} compile_budget_burst_ms={} compile_budget_cap_us={} compile_budget_credit_us={}",
+            "native_blocks={} native_instr={} native_interp_instr={} native_gas_exits={} native_link_hits={} native_link_misses={} native_link_inserts={} promote_calls={} promote_compiled={} promote_compile_failed={} promote_cache_hit={} promote_skipped_budget={} promote_time_us={} promote_time_max_us={} promote_async_enqueued={} promote_async_completed={} promote_async_dropped_stale={} promote_async_queue_full={} promote_async_snapshot_miss={} promote_async_worker_down={} fallback_instr={} fallback_early_guard={} fallback_guard_after_lookup={} fallback_no_block={} fallback_failed_cache={} fallback_cold={} fallback_compile_budget={} guard_reject_zero_insn={} guard_reject_min_block={} guard_reject_interp_dominated={} guard_reject_delay_or_nonlinear={} guard_reject_non_kseg={} guard_reject_start_phys_mismatch={} guard_reject_pending_interrupt={} guard_reject_pending_cop0={} guard_reject_pending_external={} guard_reject_pending_write_state={} guard_reject_timer_interrupt={} ensure_calls={} ensure_compiled={} ensure_compile_failed={} ensure_cache_hit={} ensure_time_us={} ensure_time_max_us={} recompiler_cache_hits={} recompiler_failed_cache_hits={} recompiler_blocks_compiled={} recompiler_compile_failures={} recompiler_invalidated_blocks={} invalidate_calls={} invalidate_bytes={} invalidate_time_us={} invalidate_time_max_us={} block_cache_len={} native_link_cache_len={} native_link_fanout={} failed_cache_len={} hot_entries={} hot_threshold={} max_block_insns={} tier1_max_block_insns={} promote_hot_threshold={} async_promote_enabled={} async_snapshot_insns={} async_queue_limit={} min_block_insns={} native_gas={} chain_limit={} compile_budget_us_per_ms={} compile_budget_burst_ms={} compile_budget_cap_us={} compile_budget_credit_us={}",
             stats.runtime.native_blocks_executed,
             stats.runtime.native_instructions_executed,
             stats.runtime.native_interp_delegated_instructions,
@@ -714,6 +724,9 @@ impl DynarecEngine {
             stats.runtime.guard_reject_non_kseg,
             stats.runtime.guard_reject_start_phys_mismatch,
             stats.runtime.guard_reject_pending_interrupt,
+            stats.runtime.guard_reject_pending_cop0,
+            stats.runtime.guard_reject_pending_external,
+            stats.runtime.guard_reject_pending_write_state,
             stats.runtime.guard_reject_timer_interrupt,
             stats.runtime.ensure_compiled_calls,
             stats.runtime.ensure_compiled_compiled,
@@ -811,12 +824,44 @@ impl DynarecEngine {
             NativeGuardRejectReason::StartPhysMismatch => {
                 self.runtime.guard_reject_start_phys_mismatch += 1
             }
-            NativeGuardRejectReason::PendingInterrupt => {
-                self.runtime.guard_reject_pending_interrupt += 1
+            NativeGuardRejectReason::PendingInterrupt(
+                PendingInterruptRejectReason::Cop0Pending,
+            ) => {
+                self.runtime.guard_reject_pending_interrupt += 1;
+                self.runtime.guard_reject_pending_cop0 += 1;
+            }
+            NativeGuardRejectReason::PendingInterrupt(
+                PendingInterruptRejectReason::ExternalFire,
+            ) => {
+                self.runtime.guard_reject_pending_interrupt += 1;
+                self.runtime.guard_reject_pending_external += 1;
+            }
+            NativeGuardRejectReason::PendingInterrupt(
+                PendingInterruptRejectReason::PendingLineWithWriteState,
+            ) => {
+                self.runtime.guard_reject_pending_interrupt += 1;
+                self.runtime.guard_reject_pending_write_state += 1;
             }
             NativeGuardRejectReason::TimerInterrupt => {
                 self.runtime.guard_reject_timer_interrupt += 1
             }
+        }
+    }
+
+    fn should_blacklist_guard_reject(reason: NativeGuardRejectReason) -> bool {
+        matches!(
+            reason,
+            NativeGuardRejectReason::MinBlock | NativeGuardRejectReason::InterpDominated
+        )
+    }
+
+    fn blacklist_unusable_block(&mut self, start_phys: u32, reason: NativeGuardRejectReason) {
+        if !Self::should_blacklist_guard_reject(reason) {
+            return;
+        }
+        if self.recompiler.blacklist_start(start_phys) {
+            self.clear_native_links();
+            self.remove_promote_tracking(start_phys);
         }
     }
 
@@ -1389,12 +1434,44 @@ impl DynarecEngine {
         ie && !exl && !erl && im2
     }
 
-    fn block_timer_guard_instructions(block: &CompiledBlock) -> u32 {
-        if block.has_backedge {
+    fn backedge_timer_safe_cap(cpu: &Vr4300, block: &CompiledBlock) -> u32 {
+        let count = cpu.cop0.regs[Cop0::COUNT] as u32;
+        let compare = cpu.cop0.regs[Cop0::COMPARE] as u32;
+        let delta = compare.wrapping_sub(count);
+        if delta == 0 {
             block.max_retired_instructions
+        } else {
+            delta.saturating_sub(1).min(block.max_retired_instructions)
+        }
+    }
+
+    fn block_timer_guard_instructions(cpu: &Vr4300, block: &CompiledBlock) -> u32 {
+        if block.has_backedge {
+            Self::backedge_timer_safe_cap(cpu, block)
         } else {
             block.instruction_count.max(1)
         }
+    }
+
+    fn runtime_retire_limit_for_block(
+        &self,
+        cpu: &Vr4300,
+        block: &CompiledBlock,
+        gas_left: u64,
+    ) -> u32 {
+        let gas_cap = gas_left.min(u64::from(u32::MAX)) as u32;
+        if gas_cap == 0 {
+            return 0;
+        }
+        let mut cap = block.max_retired_instructions.min(gas_cap);
+        if block.has_backedge {
+            let timer_cap = Self::backedge_timer_safe_cap(cpu, block);
+            if timer_cap == 0 {
+                return 0;
+            }
+            cap = cap.min(timer_cap);
+        }
+        cap.max(1)
     }
 
     fn native_guard_reject_reason(
@@ -1433,15 +1510,24 @@ impl DynarecEngine {
         }
 
         // If an interrupt could be taken, we must stay instruction-granular.
-        if cpu.cop0.interrupt_pending()
-            || Self::external_interrupt_would_fire(cpu, bus)
-            || (bus.pending_interrupts() && block.may_write_interrupt_state)
-        {
-            return Some(NativeGuardRejectReason::PendingInterrupt);
+        if cpu.cop0.interrupt_pending() {
+            return Some(NativeGuardRejectReason::PendingInterrupt(
+                PendingInterruptRejectReason::Cop0Pending,
+            ));
+        }
+        if Self::external_interrupt_would_fire(cpu, bus) {
+            return Some(NativeGuardRejectReason::PendingInterrupt(
+                PendingInterruptRejectReason::ExternalFire,
+            ));
+        }
+        if bus.pending_interrupts() && block.may_write_interrupt_state {
+            return Some(NativeGuardRejectReason::PendingInterrupt(
+                PendingInterruptRejectReason::PendingLineWithWriteState,
+            ));
         }
 
-        let timer_guard_insns = Self::block_timer_guard_instructions(block);
-        if Self::timer_interrupt_would_fire(cpu, timer_guard_insns) {
+        let timer_guard_insns = Self::block_timer_guard_instructions(cpu, block);
+        if timer_guard_insns == 0 || Self::timer_interrupt_would_fire(cpu, timer_guard_insns) {
             return Some(NativeGuardRejectReason::TimerInterrupt);
         }
 
@@ -1464,7 +1550,11 @@ impl DynarecEngine {
         cpu: &mut Vr4300,
         bus: &mut B,
         block: &CompiledBlock,
+        retire_limit: u32,
     ) -> u64 {
+        if retire_limit == 0 {
+            return 0;
+        }
         let start_pc = cpu.pc;
         let fastmem = bus.dynarec_fastmem().unwrap_or_default();
         let mut callback_ctx = CallbackContext {
@@ -1496,7 +1586,13 @@ impl DynarecEngine {
             fastmem_phys_limit: fastmem.rdram_phys_limit,
             fastmem_phys_mask: fastmem.rdram_phys_mask,
         };
-        let execution = block.execute(&mut cpu.gpr, &mut cpu.cop1.fpr, start_pc, &mut callbacks);
+        let execution = block.execute_with_limit(
+            &mut cpu.gpr,
+            &mut cpu.cop1.fpr,
+            start_pc,
+            &mut callbacks,
+            retire_limit,
+        );
         let count = execution.retired_instructions;
         let next_pc = execution.next_pc;
 
@@ -1554,8 +1650,17 @@ impl DynarecEngine {
         let mut block = first_block;
 
         loop {
+            let gas_left = gas_limit.saturating_sub(total_retired);
+            if gas_left == 0 {
+                self.runtime.native_gas_exits = self.runtime.native_gas_exits.wrapping_add(1);
+                break;
+            }
+            let retire_limit = self.runtime_retire_limit_for_block(cpu, &block, gas_left);
+            if retire_limit == 0 {
+                break;
+            }
             let source_start_phys = block.start_phys;
-            let retired = self.run_native_block(cpu, bus, &block);
+            let retired = self.run_native_block(cpu, bus, &block, retire_limit);
             if retired == 0 {
                 break;
             }
@@ -1620,6 +1725,7 @@ impl ExecutionEngine for DynarecEngine {
         if let Some(block) = self.recompiler.lookup(start_phys).copied() {
             self.raise_tier_floor(start_phys, block.max_retired_instructions);
             if let Some(reason) = self.native_guard_reject_reason(cpu, bus, &block, start_phys) {
+                self.blacklist_unusable_block(start_phys, reason);
                 self.record_guard_reject_reason(reason);
                 return self.run_fallback(cpu, bus, FallbackReason::GuardAfterLookup);
             }
@@ -1684,6 +1790,7 @@ impl ExecutionEngine for DynarecEngine {
         if let Some(block) = self.recompiler.lookup(start_phys).copied() {
             self.raise_tier_floor(start_phys, block.max_retired_instructions);
             if let Some(reason) = self.native_guard_reject_reason(cpu, bus, &block, start_phys) {
+                self.blacklist_unusable_block(start_phys, reason);
                 self.record_guard_reject_reason(reason);
                 return self.run_fallback(cpu, bus, FallbackReason::GuardAfterLookup);
             }

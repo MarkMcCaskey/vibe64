@@ -172,7 +172,7 @@ unsafe extern "C" fn n64_jit_lo_write(ctx: *mut u8, value: u64) {
     unsafe { (cbs.lo_write)(cbs.user, value) }
 }
 
-type JitBlockFn = unsafe extern "C" fn(*mut u64, *mut u64, u64, *mut u8, *mut u32) -> u64;
+type JitBlockFn = unsafe extern "C" fn(*mut u64, *mut u64, u64, *mut u8, *mut u32, u32) -> u64;
 
 /// Pointer to compiled native entry point.
 #[derive(Clone, Copy)]
@@ -231,17 +231,19 @@ pub struct BlockExecution {
 }
 
 impl CompiledBlock {
-    /// Execute this compiled block against the GPR file.
-    pub fn execute(
+    /// Execute this compiled block against the GPR/FPR file with an explicit
+    /// upper bound on retired instructions for this invocation.
+    pub fn execute_with_limit(
         &self,
         gpr: &mut [u64; 32],
         fpr: &mut [u64; 32],
         start_pc: u64,
         callbacks: *mut RuntimeCallbacks,
+        retire_limit: u32,
     ) -> BlockExecution {
         let mut retired = 0u32;
         // SAFETY: compiled blocks are generated with signature
-        // `extern "C" fn(*mut u64, *mut u64, u64, *mut u8, *mut u32) -> u64`,
+        // `extern "C" fn(*mut u64, *mut u64, u64, *mut u8, *mut u32, u32) -> u64`,
         // `gpr`/`fpr` point to 32 contiguous u64s, and callback pointer comes
         // from the caller.
         let next_pc = unsafe {
@@ -251,12 +253,24 @@ impl CompiledBlock {
                 start_pc,
                 callbacks.cast::<u8>(),
                 (&mut retired as *mut u32).cast::<u32>(),
+                retire_limit.max(1),
             )
         };
         BlockExecution {
             next_pc,
             retired_instructions: retired,
         }
+    }
+
+    /// Execute this compiled block against the GPR file.
+    pub fn execute(
+        &self,
+        gpr: &mut [u64; 32],
+        fpr: &mut [u64; 32],
+        start_pc: u64,
+        callbacks: *mut RuntimeCallbacks,
+    ) -> BlockExecution {
+        self.execute_with_limit(gpr, fpr, start_pc, callbacks, self.max_retired_instructions)
     }
 }
 
@@ -395,6 +409,17 @@ impl Recompiler {
 
     pub fn is_failed_cached(&self, start_phys: u32) -> bool {
         self.failed_cache.contains(&start_phys)
+    }
+
+    /// Mark a start address as permanently non-native until invalidation.
+    ///
+    /// This removes any cached block at `start_phys` and inserts a failed-cache
+    /// marker so hot paths stop recompiling or probing guards repeatedly.
+    pub fn blacklist_start(&mut self, start_phys: u32) -> bool {
+        let removed_cached = self.remove_cached(start_phys);
+        let was_failed = self.failed_cache.contains(&start_phys);
+        self.insert_failed(start_phys);
+        removed_cached || !was_failed
     }
 
     /// Install an externally compiled block into the cache.
@@ -1020,7 +1045,7 @@ fn can_inline_interp_non_branch(raw: u32) -> bool {
 
 fn op_may_write_interrupt_state(op: Op) -> bool {
     match op {
-        Op::Mtc0 { rd, .. } | Op::Dmtc0 { rd, .. } => matches!(rd, 12 | 13),
+        Op::Mtc0 { rd, .. } | Op::Dmtc0 { rd, .. } => rd == 12,
         Op::Interp { .. } => true,
         _ => false,
     }
@@ -2466,10 +2491,15 @@ impl BlockCompiler for CraneliftCompiler {
 
             match decode_supported_non_branch(opcode) {
                 Some(op) => {
+                    let writes_interrupt_state = op_may_write_interrupt_state(op);
+                    let at_block_start = steps.is_empty();
+                    if writes_interrupt_state && !at_block_start {
+                        break;
+                    }
                     if matches!(op, Op::Interp { .. }) {
                         interp_op_count = interp_op_count.saturating_add(1);
                     }
-                    if op_may_write_interrupt_state(op) {
+                    if writes_interrupt_state {
                         may_write_interrupt_state = true;
                     }
                     steps.push(TraceStep::Op { phys, op });
@@ -2478,6 +2508,9 @@ impl BlockCompiler for CraneliftCompiler {
                 }
                 None => {
                     if can_inline_interp_non_branch(opcode) {
+                        if !steps.is_empty() {
+                            break;
+                        }
                         may_write_interrupt_state = true;
                         steps.push(TraceStep::Op {
                             phys,
@@ -2485,8 +2518,7 @@ impl BlockCompiler for CraneliftCompiler {
                         });
                         interp_op_count = interp_op_count.saturating_add(1);
                         decoded_count += 1;
-                        phys = phys.wrapping_add(4);
-                        continue;
+                        break;
                     }
                     if steps.is_empty() {
                         return Err(CompileError::UnsupportedOpcode {
@@ -2532,6 +2564,11 @@ impl BlockCompiler for CraneliftCompiler {
         self.context
             .func
             .signature
+            .params
+            .push(AbiParam::new(types::I32));
+        self.context
+            .func
+            .signature
             .returns
             .push(AbiParam::new(types::I64));
 
@@ -2546,6 +2583,7 @@ impl BlockCompiler for CraneliftCompiler {
         let start_pc = builder.block_params(entry_block)[2];
         let callbacks_ptr = builder.block_params(entry_block)[3];
         let retired_out_ptr = builder.block_params(entry_block)[4];
+        let runtime_retire_limit = builder.block_params(entry_block)[5];
         let mut callback_flags = MemFlags::new();
         callback_flags.set_notrap();
         callback_flags.set_aligned();
@@ -2717,12 +2755,17 @@ impl BlockCompiler for CraneliftCompiler {
             })
             .collect();
         let retire_limit = if has_backedge {
-            let retire_limit_value = request.max_instructions.max(1).min(i32::MAX as u32);
-            Some(
+            let compile_limit_value = request.max_instructions.max(1).min(i32::MAX as u32);
+            let compile_limit = builder
+                .ins()
+                .iconst(types::I32, i64::from(compile_limit_value));
+            let zero = builder.ins().iconst(types::I32, 0);
+            let runtime_is_zero = builder.ins().icmp(IntCC::Equal, runtime_retire_limit, zero);
+            let runtime_limit =
                 builder
                     .ins()
-                    .iconst(types::I32, i64::from(retire_limit_value)),
-            )
+                    .select(runtime_is_zero, compile_limit, runtime_retire_limit);
+            Some(builder.ins().umin(runtime_limit, compile_limit))
         } else {
             None
         };
@@ -4121,10 +4164,19 @@ mod tests {
         ]);
 
         let mut compiler = CraneliftCompiler::default();
-        let block = compiler
+        let mem_block = compiler
             .compile(
                 &CompileRequest {
                     start_phys: start,
+                    max_instructions: 16,
+                },
+                &mut src,
+            )
+            .expect("compile");
+        let cop0_block = compiler
+            .compile(
+                &CompileRequest {
+                    start_phys: start + 28,
                     max_instructions: 16,
                 },
                 &mut src,
@@ -4136,11 +4188,15 @@ mod tests {
         let mut state = CallbackState::default();
         let mut callbacks = state_callbacks(&mut state);
         let start_pc = 0xFFFF_FFFF_8000_2500u64;
-        let exec = block.execute(&mut gpr, &mut fpr, start_pc, &mut callbacks);
+        let mem_exec = mem_block.execute(&mut gpr, &mut fpr, start_pc, &mut callbacks);
+        let cop0_exec = cop0_block.execute(&mut gpr, &mut fpr, start_pc + 28, &mut callbacks);
 
-        assert_eq!(exec.next_pc, start_pc + 36);
-        assert_eq!(exec.retired_instructions, 9);
-        assert!(block.may_write_interrupt_state);
+        assert_eq!(mem_exec.next_pc, start_pc + 28);
+        assert_eq!(mem_exec.retired_instructions, 7);
+        assert!(!mem_block.may_write_interrupt_state);
+        assert_eq!(cop0_exec.next_pc, start_pc + 36);
+        assert_eq!(cop0_exec.retired_instructions, 2);
+        assert!(cop0_block.may_write_interrupt_state);
         assert_eq!(gpr[9], 0x12);
         assert_eq!(gpr[11], 0x34);
         assert_eq!(gpr[2], 0x34);
@@ -4434,5 +4490,32 @@ mod tests {
 
         rc.invalidate_range(start, 4);
         assert_eq!(rc.failed_cache_len(), 0);
+    }
+
+    #[test]
+    fn blacklist_start_moves_cached_block_to_failed_cache() {
+        let start = 0x4100u32;
+        let mut src = TestSource::with_words(&[
+            (start, 0x2408_0001),     // addiu t0, r0, 1
+            (start + 4, 0x2508_0001), // addiu t0, t0, 1
+        ]);
+        let mut rc = Recompiler::new(
+            Box::<CraneliftCompiler>::default(),
+            RecompilerConfig {
+                max_block_instructions: 4,
+            },
+        );
+
+        assert_eq!(rc.ensure_compiled(start, &mut src), EnsureResult::Compiled);
+        assert_eq!(rc.cache_len(), 1);
+        assert_eq!(rc.failed_cache_len(), 0);
+
+        assert!(rc.blacklist_start(start));
+        assert_eq!(rc.cache_len(), 0);
+        assert_eq!(rc.failed_cache_len(), 1);
+        assert!(rc.is_failed_cached(start));
+
+        assert_eq!(rc.ensure_compiled(start, &mut src), EnsureResult::CacheHit);
+        assert_eq!(rc.stats().failed_cache_hits, 1);
     }
 }
