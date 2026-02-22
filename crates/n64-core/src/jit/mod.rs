@@ -108,6 +108,22 @@ impl Engine {
         }
     }
 
+    pub fn dynarec_stats_line(&self) -> Option<String> {
+        match self {
+            Engine::Interpreter(_) => None,
+            #[cfg(feature = "dynarec")]
+            Engine::Dynarec(engine) => Some(engine.stats_line()),
+        }
+    }
+
+    pub fn reset_stats(&mut self) {
+        match self {
+            Engine::Interpreter(_) => {}
+            #[cfg(feature = "dynarec")]
+            Engine::Dynarec(engine) => engine.reset_stats(),
+        }
+    }
+
     #[cfg(all(test, feature = "dynarec"))]
     pub(crate) fn dynarec_for_tests() -> Self {
         Self::Dynarec(dynarec::DynarecEngine::new_cranelift())

@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+log = "0.4"
 cranelift-codegen = "0.124"
 cranelift-frontend = "0.124"
 cranelift-jit = "0.124"

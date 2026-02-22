@@ -178,6 +178,16 @@ impl N64 {
         self.engine.name()
     }
 
+    /// Human-readable dynarec stats summary for benchmarking.
+    pub fn dynarec_stats_line(&self) -> Option<String> {
+        self.engine.dynarec_stats_line()
+    }
+
+    /// Reset execution-engine runtime stats (cache contents are preserved).
+    pub fn reset_engine_stats(&mut self) {
+        self.engine.reset_stats();
+    }
+
     /// Set a callback that receives audio samples immediately when AI DMA fires.
     /// The callback receives (&[i16] stereo PCM, u32 N64 sample rate Hz).
     /// This decouples audio output from the video frame loop, matching real

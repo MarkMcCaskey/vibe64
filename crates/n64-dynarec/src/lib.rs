@@ -3,7 +3,7 @@
 //! This crate keeps backend/compiler concerns separate from core emulation logic.
 //! The first backend is Cranelift.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{HashMap, HashSet};
 
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{types, AbiParam, InstBuilder, MemFlags, Value};
@@ -26,7 +26,7 @@ pub trait InstructionSource {
     fn read_u32(&mut self, phys_addr: u32) -> Result<u32, CompileError>;
 }
 
-type JitBlockFn = unsafe extern "C" fn(*mut u64);
+type JitBlockFn = unsafe extern "C" fn(*mut u64, u64) -> u64;
 
 /// Pointer to compiled native entry point.
 #[derive(Clone, Copy)]
@@ -62,12 +62,11 @@ pub struct CompiledBlock {
 
 impl CompiledBlock {
     /// Execute this compiled block against the GPR file.
-    pub fn execute(&self, gpr: &mut [u64; 32]) {
+    pub fn execute(&self, gpr: &mut [u64; 32], start_pc: u64) -> u64 {
         // SAFETY: compiled blocks are generated with signature
-        // `extern "C" fn(*mut u64)` and `gpr` points to 32 contiguous u64s.
-        unsafe {
-            (self.entry.as_fn())(gpr.as_mut_ptr());
-        }
+        // `extern "C" fn(*mut u64, u64) -> u64` and `gpr` points to
+        // 32 contiguous u64s.
+        unsafe { (self.entry.as_fn())(gpr.as_mut_ptr(), start_pc) }
     }
 }
 
@@ -130,8 +129,8 @@ pub struct RecompilerStats {
 pub struct Recompiler {
     compiler: Box<dyn BlockCompiler>,
     config: RecompilerConfig,
-    cache: BTreeMap<u32, CompiledBlock>,
-    failed_cache: BTreeSet<u32>,
+    cache: HashMap<u32, CompiledBlock>,
+    failed_cache: HashSet<u32>,
     stats: RecompilerStats,
     last_error: Option<CompileError>,
 }
@@ -141,8 +140,8 @@ impl Recompiler {
         Self {
             compiler,
             config,
-            cache: BTreeMap::new(),
-            failed_cache: BTreeSet::new(),
+            cache: HashMap::new(),
+            failed_cache: HashSet::new(),
             stats: RecompilerStats::default(),
             last_error: None,
         }
@@ -164,12 +163,21 @@ impl Recompiler {
         self.stats
     }
 
+    pub fn reset_stats(&mut self) {
+        self.stats = RecompilerStats::default();
+        self.last_error = None;
+    }
+
     pub fn last_error(&self) -> Option<&CompileError> {
         self.last_error.as_ref()
     }
 
     pub fn lookup(&self, start_phys: u32) -> Option<&CompiledBlock> {
         self.cache.get(&start_phys)
+    }
+
+    pub fn is_failed_cached(&self, start_phys: u32) -> bool {
+        self.failed_cache.contains(&start_phys)
     }
 
     pub fn ensure_compiled(
@@ -233,8 +241,9 @@ impl Recompiler {
 
         let failed_to_drop: Vec<u32> = self
             .failed_cache
-            .range(start_phys..end_phys)
+            .iter()
             .copied()
+            .filter(|addr| *addr >= start_phys && *addr < end_phys)
             .collect();
         for key in failed_to_drop {
             if self.failed_cache.remove(&key) {
@@ -274,7 +283,25 @@ enum Op {
     Srav { rs: u8, rt: u8, rd: u8 },
 }
 
-fn decode_supported(raw: u32) -> Option<Op> {
+#[derive(Debug, Clone, Copy)]
+enum BranchTerminator {
+    Beq { rs: u8, rt: u8, offset: i16 },
+    Bne { rs: u8, rt: u8, offset: i16 },
+}
+
+fn decode_branch(raw: u32) -> Option<BranchTerminator> {
+    let opcode = (raw >> 26) as u8;
+    let rs = ((raw >> 21) & 0x1F) as u8;
+    let rt = ((raw >> 16) & 0x1F) as u8;
+    let offset = raw as u16 as i16;
+    match opcode {
+        0x04 => Some(BranchTerminator::Beq { rs, rt, offset }),
+        0x05 => Some(BranchTerminator::Bne { rs, rt, offset }),
+        _ => None,
+    }
+}
+
+fn decode_supported_non_branch(raw: u32) -> Option<Op> {
     let opcode = (raw >> 26) as u8;
     let rs = ((raw >> 21) & 0x1F) as u8;
     let rt = ((raw >> 16) & 0x1F) as u8;
@@ -340,6 +367,7 @@ fn decode_supported(raw: u32) -> Option<Op> {
             0x2F => Some(Op::Dsubu { rs, rt, rd }),
             _ => None,
         },
+        0x04 | 0x05 => None,
         _ => None,
     }
 }
@@ -565,10 +593,26 @@ pub struct CraneliftCompiler {
 
 impl Default for CraneliftCompiler {
     fn default() -> Self {
+        let env_level = std::env::var("N64_CRANELIFT_OPT_LEVEL")
+            .unwrap_or_else(|_| "speed".to_string())
+            .to_ascii_lowercase();
+        let opt_level = match env_level.as_str() {
+            "none" => "none",
+            "speed_and_size" | "speed-size" | "speedsize" => "speed_and_size",
+            "speed" => "speed",
+            other => {
+                log::warn!(
+                    "Unknown N64_CRANELIFT_OPT_LEVEL={:?}; using \"speed\"",
+                    other
+                );
+                "speed"
+            }
+        };
+
         let mut flag_builder = settings::builder();
-        // Favor runtime speed for hot instruction paths.
+        // Tweakable via N64_CRANELIFT_OPT_LEVEL for benchmarking and tuning.
         flag_builder
-            .set("opt_level", "speed")
+            .set("opt_level", opt_level)
             .expect("set cranelift opt_level");
         let flags = settings::Flags::new(flag_builder);
 
@@ -598,18 +642,50 @@ impl BlockCompiler for CraneliftCompiler {
         source: &mut dyn InstructionSource,
     ) -> Result<CompiledBlock, CompileError> {
         let mut ops = Vec::new();
+        let mut terminator: Option<(BranchTerminator, Op)> = None;
         let mut phys = request.start_phys;
+        let max_instructions = request.max_instructions.max(1);
+        let mut decoded_count = 0u32;
 
-        for _ in 0..request.max_instructions.max(1) {
+        while decoded_count < max_instructions {
             let opcode = source.read_u32(phys)?;
-            match decode_supported(opcode) {
+            if let Some(branch) = decode_branch(opcode) {
+                if decoded_count + 2 > max_instructions {
+                    if ops.is_empty() {
+                        return Err(CompileError::UnsupportedOpcode {
+                            phys_addr: phys,
+                            opcode,
+                        });
+                    }
+                    break;
+                }
+                let delay_phys = phys.wrapping_add(4);
+                let delay_raw = source.read_u32(delay_phys)?;
+                let Some(delay_op) = decode_supported_non_branch(delay_raw) else {
+                    if ops.is_empty() {
+                        return Err(CompileError::UnsupportedOpcode {
+                            phys_addr: phys,
+                            opcode,
+                        });
+                    }
+                    break;
+                };
+                terminator = Some((branch, delay_op));
+                break;
+            }
+
+            match decode_supported_non_branch(opcode) {
                 Some(op) => {
                     ops.push(op);
+                    decoded_count += 1;
                     phys = phys.wrapping_add(4);
                 }
                 None => {
                     if ops.is_empty() {
-                        return Err(CompileError::UnsupportedOpcode { phys_addr: phys, opcode });
+                        return Err(CompileError::UnsupportedOpcode {
+                            phys_addr: phys,
+                            opcode,
+                        });
                     }
                     break;
                 }
@@ -624,6 +700,16 @@ impl BlockCompiler for CraneliftCompiler {
             .signature
             .params
             .push(AbiParam::new(self.module.target_config().pointer_type()));
+        self.context
+            .func
+            .signature
+            .params
+            .push(AbiParam::new(types::I64));
+        self.context
+            .func
+            .signature
+            .returns
+            .push(AbiParam::new(types::I64));
 
         let mut builder = FunctionBuilder::new(&mut self.context.func, &mut self.builder_context);
         let entry_block = builder.create_block();
@@ -632,6 +718,7 @@ impl BlockCompiler for CraneliftCompiler {
         builder.seal_block(entry_block);
 
         let gpr_ptr = builder.block_params(entry_block)[0];
+        let start_pc = builder.block_params(entry_block)[1];
         let mut flags = MemFlags::new();
         flags.set_notrap();
         flags.set_aligned();
@@ -640,7 +727,45 @@ impl BlockCompiler for CraneliftCompiler {
             emit_op(&mut builder, gpr_ptr, flags, op);
         }
 
-        builder.ins().return_(&[]);
+        let ret_pc = if let Some((branch, delay_op)) = terminator {
+            let branch_pc = builder
+                .ins()
+                .iadd_imm(start_pc, i64::from(ops.len() as u32) * 4);
+
+            let cond = match branch {
+                BranchTerminator::Beq { rs, rt, .. } => {
+                    let lhs = load_gpr(&mut builder, gpr_ptr, rs, flags);
+                    let rhs = load_gpr(&mut builder, gpr_ptr, rt, flags);
+                    builder.ins().icmp(IntCC::Equal, lhs, rhs)
+                }
+                BranchTerminator::Bne { rs, rt, .. } => {
+                    let lhs = load_gpr(&mut builder, gpr_ptr, rs, flags);
+                    let rhs = load_gpr(&mut builder, gpr_ptr, rt, flags);
+                    builder.ins().icmp(IntCC::NotEqual, lhs, rhs)
+                }
+            };
+
+            // Branch delay slot always executes.
+            emit_op(&mut builder, gpr_ptr, flags, delay_op);
+
+            let next_of_branch = builder.ins().iadd_imm(branch_pc, 4);
+            let fallthrough_pc = builder.ins().iadd_imm(branch_pc, 8);
+            let offset = match branch {
+                BranchTerminator::Beq { offset, .. } | BranchTerminator::Bne { offset, .. } => {
+                    ((offset as i32) as i64) << 2
+                }
+            };
+            let offset_val = builder.ins().iconst(types::I64, offset);
+            let taken_pc = builder.ins().iadd(next_of_branch, offset_val);
+            builder.ins().select(cond, taken_pc, fallthrough_pc)
+        } else {
+            let delta = builder
+                .ins()
+                .iconst(types::I64, i64::from(ops.len() as u32) * 4);
+            builder.ins().iadd(start_pc, delta)
+        };
+
+        builder.ins().return_(&[ret_pc]);
         builder.finalize();
 
         let symbol = format!("n64_jit_block_{}", self.next_symbol_id);
@@ -668,13 +793,15 @@ impl BlockCompiler for CraneliftCompiler {
 
         let entry = BlockEntry(self.module.get_finalized_function(func_id));
 
+        let instruction_count = ops.len() as u32 + u32::from(terminator.is_some()) * 2;
+
         Ok(CompiledBlock {
             start_phys: request.start_phys,
             end_phys: request
                 .start_phys
-                .wrapping_add((ops.len() as u32).saturating_mul(4)),
-            instruction_count: ops.len() as u32,
-            has_control_flow: false,
+                .wrapping_add(instruction_count.saturating_mul(4)),
+            instruction_count,
+            has_control_flow: terminator.is_some(),
             entry,
         })
     }
@@ -714,7 +841,7 @@ mod tests {
         let mut src = TestSource::with_words(&[
             (start, 0x2408_0001),     // addiu t0, r0, 1
             (start + 4, 0x2409_0002), // addiu t1, r0, 2
-            (start + 8, 0x1109_0001), // beq t0, t1, +1 (unsupported)
+            (start + 8, 0x8D8A_0000), // lw t2, 0(t4) (unsupported)
         ]);
 
         let mut compiler = CraneliftCompiler::default();
@@ -756,7 +883,7 @@ mod tests {
             .expect("compile");
 
         let mut gpr = [0u64; 32];
-        block.execute(&mut gpr);
+        let end_pc = block.execute(&mut gpr, 0xFFFF_FFFF_8000_2000);
 
         assert_eq!(block.instruction_count, 5);
         assert_eq!(gpr[8], 5);
@@ -764,6 +891,39 @@ mod tests {
         assert_eq!(gpr[10], 12);
         assert_eq!(gpr[2], 0x123C);
         assert_eq!(gpr[0], 0);
+        assert_eq!(end_pc, 0xFFFF_FFFF_8000_2000 + 20);
+    }
+
+    #[test]
+    fn compiled_block_executes_beq_with_delay_slot() {
+        let start = 0x2200u32;
+        let mut src = TestSource::with_words(&[
+            (start, 0x2408_0001),      // addiu t0, r0, 1
+            (start + 4, 0x2409_0001),  // addiu t1, r0, 1
+            (start + 8, 0x1109_0001),  // beq t0, t1, +1
+            (start + 12, 0x240A_0005), // addiu t2, r0, 5 (delay slot)
+            (start + 16, 0x240A_0063), // addiu t2, r0, 99 (branch skips this)
+        ]);
+
+        let mut compiler = CraneliftCompiler::default();
+        let block = compiler
+            .compile(
+                &CompileRequest {
+                    start_phys: start,
+                    max_instructions: 8,
+                },
+                &mut src,
+            )
+            .expect("compile");
+
+        let mut gpr = [0u64; 32];
+        let start_pc = 0xFFFF_FFFF_8000_2200u64;
+        let end_pc = block.execute(&mut gpr, start_pc);
+
+        assert!(block.has_control_flow);
+        assert_eq!(block.instruction_count, 4);
+        assert_eq!(gpr[10], 5);
+        assert_eq!(end_pc, start_pc + 16);
     }
 
     #[test]
@@ -793,7 +953,7 @@ mod tests {
     #[test]
     fn compile_failure_is_recorded_and_cached() {
         let start = 0x4000u32;
-        let mut src = TestSource::with_words(&[(start, 0x1109_0001)]); // beq (unsupported)
+        let mut src = TestSource::with_words(&[(start, 0x0800_0000)]); // j (unsupported)
         let mut rc = Recompiler::new(
             Box::<CraneliftCompiler>::default(),
             RecompilerConfig::default(),
@@ -807,7 +967,7 @@ mod tests {
             rc.last_error(),
             Some(CompileError::UnsupportedOpcode {
                 phys_addr,
-                opcode: 0x1109_0001
+                opcode: 0x0800_0000
             }) if *phys_addr == start
         ));
 

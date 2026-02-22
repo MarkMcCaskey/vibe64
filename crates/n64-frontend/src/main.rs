@@ -2779,6 +2779,7 @@ fn main() {
         for _ in 0..warmup_steps {
             n64.step_one();
         }
+        n64.reset_engine_stats();
 
         let start_cycles = n64.cycles;
         let start = std::time::Instant::now();
@@ -2799,6 +2800,9 @@ fn main() {
             msteps,
             mcycles
         );
+        if let Some(stats) = n64.dynarec_stats_line() {
+            println!("BENCH_DYNAREC {}", stats);
+        }
         return;
     } else if use_test {
         // Test mode: run until r30 is set (50M cycles max)
