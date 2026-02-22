@@ -822,4 +822,22 @@ impl Bus for Interconnect {
     fn pending_interrupts(&self) -> bool {
         self.mi.interrupt_pending()
     }
+
+    fn cycles_until_next_interrupt_event(&self) -> Option<u64> {
+        let mut best: Option<u64> = None;
+        let mut consider = |candidate: Option<u64>| {
+            let Some(cycles) = candidate else {
+                return;
+            };
+            best = Some(match best {
+                Some(cur) => cur.min(cycles),
+                None => cycles,
+            });
+        };
+        consider(self.vi.cycles_until_interrupt());
+        consider(self.pi.cycles_until_interrupt());
+        consider(self.si.cycles_until_interrupt());
+        consider(self.ai.cycles_until_interrupt());
+        best
+    }
 }

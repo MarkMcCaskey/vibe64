@@ -108,4 +108,9 @@ impl Si {
         self.dma_busy_cycles -= elapsed;
         false
     }
+
+    /// Cycles until SI would raise its completion interrupt (if any DMA active).
+    pub fn cycles_until_interrupt(&self) -> Option<u64> {
+        (self.dma_busy_cycles > 0).then_some(self.dma_busy_cycles)
+    }
 }

@@ -1515,6 +1515,11 @@ impl DynarecEngine {
         cap.max(1)
     }
 
+    fn external_event_budget_left(bus: &impl Bus, retired: u64) -> Option<u64> {
+        bus.cycles_until_next_interrupt_event()
+            .map(|cycles| cycles.saturating_sub(retired))
+    }
+
     fn native_guard_reject_reason(
         &self,
         cpu: &Vr4300,
@@ -1720,7 +1725,14 @@ impl DynarecEngine {
         let mut block = first_block;
 
         loop {
-            let gas_left = gas_limit.saturating_sub(total_retired);
+            let mut gas_left = gas_limit.saturating_sub(total_retired);
+            if let Some(event_left) = Self::external_event_budget_left(&*bus, total_retired) {
+                if total_retired == 0 {
+                    gas_left = gas_left.min(event_left.max(1));
+                } else {
+                    gas_left = gas_left.min(event_left);
+                }
+            }
             if gas_left == 0 {
                 self.runtime.native_gas_exits = self.runtime.native_gas_exits.wrapping_add(1);
                 break;
@@ -1914,5 +1926,137 @@ impl Drop for DynarecEngine {
         if let Some(handle) = self.async_thread.take() {
             let _ = handle.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct InterruptBudgetBus {
+        mem: Vec<u8>,
+        event_cycles: Option<u64>,
+    }
+
+    impl InterruptBudgetBus {
+        fn new(size: usize) -> Self {
+            Self {
+                mem: vec![0; size],
+                event_cycles: None,
+            }
+        }
+
+        fn load_program(&mut self, start_phys: u32, words: &[u32]) {
+            for (i, word) in words.iter().enumerate() {
+                let addr = start_phys as usize + i * 4;
+                self.mem[addr..addr + 4].copy_from_slice(&word.to_be_bytes());
+            }
+        }
+    }
+
+    impl Bus for InterruptBudgetBus {
+        fn read_u8(&self, addr: u32) -> u8 {
+            self.mem[addr as usize]
+        }
+
+        fn read_u16(&self, addr: u32) -> u16 {
+            let i = addr as usize;
+            u16::from_be_bytes([self.mem[i], self.mem[i + 1]])
+        }
+
+        fn read_u32(&self, addr: u32) -> u32 {
+            let i = addr as usize;
+            u32::from_be_bytes([
+                self.mem[i],
+                self.mem[i + 1],
+                self.mem[i + 2],
+                self.mem[i + 3],
+            ])
+        }
+
+        fn read_u64(&self, addr: u32) -> u64 {
+            let hi = self.read_u32(addr) as u64;
+            let lo = self.read_u32(addr.wrapping_add(4)) as u64;
+            (hi << 32) | lo
+        }
+
+        fn write_u8(&mut self, addr: u32, val: u8) {
+            self.mem[addr as usize] = val;
+        }
+
+        fn write_u16(&mut self, addr: u32, val: u16) {
+            let i = addr as usize;
+            self.mem[i..i + 2].copy_from_slice(&val.to_be_bytes());
+        }
+
+        fn write_u32(&mut self, addr: u32, val: u32) {
+            let i = addr as usize;
+            self.mem[i..i + 4].copy_from_slice(&val.to_be_bytes());
+        }
+
+        fn write_u64(&mut self, addr: u32, val: u64) {
+            self.write_u32(addr, (val >> 32) as u32);
+            self.write_u32(addr.wrapping_add(4), val as u32);
+        }
+
+        fn notify_dma_write(&mut self, _start: u32, _len: u32) {}
+
+        fn pending_interrupts(&self) -> bool {
+            false
+        }
+
+        fn cycles_until_next_interrupt_event(&self) -> Option<u64> {
+            self.event_cycles
+        }
+    }
+
+    fn init_cpu() -> Vr4300 {
+        let mut cpu = Vr4300::new();
+        cpu.pc = 0xFFFF_FFFF_8000_0000;
+        cpu.next_pc = cpu.pc.wrapping_add(4);
+        cpu
+    }
+
+    #[test]
+    fn external_interrupt_budget_caps_native_retire() {
+        let mut bus = InterruptBudgetBus::new(0x2000);
+        let mut program = vec![0x2508_0001u32; 16]; // addiu t0, t0, 1
+        program.push(0x4200_0018); // eret sentinel
+        bus.load_program(0, &program);
+        bus.event_cycles = Some(5);
+
+        let mut cpu = init_cpu();
+        let mut engine = DynarecEngine::new_cranelift_for_tests();
+        engine.tier1_max_block_instructions = 64;
+        engine.max_block_instructions = 64;
+        engine.min_native_instructions = 1;
+        engine.native_gas_limit = u32::MAX;
+
+        let retired = engine.execute(&mut cpu, &mut bus);
+        assert_eq!(retired, 5);
+        assert_eq!(cpu.gpr[8], 5);
+        assert_eq!(cpu.pc, 0xFFFF_FFFF_8000_0014);
+        assert_eq!(engine.runtime.native_blocks_executed, 1);
+    }
+
+    #[test]
+    fn native_retire_exceeds_budget_when_no_external_event() {
+        let mut bus = InterruptBudgetBus::new(0x2000);
+        let mut program = vec![0x2508_0001u32; 16]; // addiu t0, t0, 1
+        program.push(0x4200_0018); // eret sentinel
+        bus.load_program(0, &program);
+        bus.event_cycles = None;
+
+        let mut cpu = init_cpu();
+        let mut engine = DynarecEngine::new_cranelift_for_tests();
+        engine.tier1_max_block_instructions = 64;
+        engine.max_block_instructions = 64;
+        engine.min_native_instructions = 1;
+        engine.native_gas_limit = u32::MAX;
+
+        let retired = engine.execute(&mut cpu, &mut bus);
+        assert!(retired > 5, "expected native run to exceed event-capped retire");
+        assert!(cpu.gpr[8] > 5);
+        assert_eq!(engine.runtime.native_blocks_executed, 1);
     }
 }

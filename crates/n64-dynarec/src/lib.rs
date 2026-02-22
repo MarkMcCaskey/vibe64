@@ -2815,21 +2815,16 @@ impl BlockCompiler for CraneliftCompiler {
                 b
             })
             .collect();
-        let retire_limit = if has_backedge {
-            let compile_limit_value = request.max_instructions.max(1).min(i32::MAX as u32);
-            let compile_limit = builder
-                .ins()
-                .iconst(types::I32, i64::from(compile_limit_value));
-            let zero = builder.ins().iconst(types::I32, 0);
-            let runtime_is_zero = builder.ins().icmp(IntCC::Equal, runtime_retire_limit, zero);
-            let runtime_limit =
-                builder
-                    .ins()
-                    .select(runtime_is_zero, compile_limit, runtime_retire_limit);
-            Some(builder.ins().umin(runtime_limit, compile_limit))
-        } else {
-            None
-        };
+        let compile_limit_value = request.max_instructions.max(1).min(i32::MAX as u32);
+        let compile_limit = builder
+            .ins()
+            .iconst(types::I32, i64::from(compile_limit_value));
+        let zero = builder.ins().iconst(types::I32, 0);
+        let runtime_is_zero = builder.ins().icmp(IntCC::Equal, runtime_retire_limit, zero);
+        let runtime_limit = builder
+            .ins()
+            .select(runtime_is_zero, compile_limit, runtime_retire_limit);
+        let retire_limit = builder.ins().umin(runtime_limit, compile_limit);
 
         let zero_retired = builder.ins().iconst(types::I32, 0);
         let args = [zero_retired.into()];
@@ -2850,23 +2845,21 @@ impl BlockCompiler for CraneliftCompiler {
             let step_phys = step.phys();
             let step_delta = i64::from(step_phys.wrapping_sub(request.start_phys));
             let current_pc = builder.ins().iadd_imm(start_pc, step_delta);
-            if let Some(retire_limit) = retire_limit {
-                let reached_budget = builder.ins().icmp(
-                    IntCC::UnsignedGreaterThanOrEqual,
-                    retired_count,
-                    retire_limit,
-                );
-                let execute_step_block = builder.create_block();
-                let exit_args = [current_pc.into(), retired_count.into()];
-                builder.ins().brif(
-                    reached_budget,
-                    exit_block,
-                    &exit_args,
-                    execute_step_block,
-                    &[],
-                );
-                builder.switch_to_block(execute_step_block);
-            }
+            let reached_budget = builder.ins().icmp(
+                IntCC::UnsignedGreaterThanOrEqual,
+                retired_count,
+                retire_limit,
+            );
+            let execute_step_block = builder.create_block();
+            let exit_args = [current_pc.into(), retired_count.into()];
+            builder.ins().brif(
+                reached_budget,
+                exit_block,
+                &exit_args,
+                execute_step_block,
+                &[],
+            );
+            builder.switch_to_block(execute_step_block);
 
             match step {
                 TraceStep::Op { op, .. } => {

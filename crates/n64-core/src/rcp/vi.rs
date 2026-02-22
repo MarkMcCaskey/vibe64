@@ -3,7 +3,6 @@
 /// Controls video output: framebuffer address, resolution, timing.
 /// Generates an interrupt once per frame at the configured scanline.
 /// Registers at physical 0x0440_0000.
-
 use super::mi::{Mi, MiInterrupt};
 
 pub struct Vi {
@@ -13,7 +12,7 @@ pub struct Vi {
     pub v_intr: u32,    // Scanline that triggers VI interrupt
     pub v_current: u32, // Current scanline
     pub burst: u32,
-    pub v_sync: u32,    // Total scanlines per frame (525 NTSC, 625 PAL)
+    pub v_sync: u32, // Total scanlines per frame (525 NTSC, 625 PAL)
     pub h_sync: u32,
     pub h_sync_leap: u32,
     pub h_video: u32,
@@ -71,7 +70,9 @@ impl Vi {
 
     pub fn write_u32(&mut self, addr: u32, val: u32, mi: &mut Mi) {
         let reg_idx = ((addr & 0x0F_FFFF) / 4) as usize;
-        if reg_idx < 14 { self.write_counts[reg_idx] += 1; }
+        if reg_idx < 14 {
+            self.write_counts[reg_idx] += 1;
+        }
         match addr & 0x0F_FFFF {
             0x00 => self.ctrl = val,
             0x04 => self.origin = val & 0x00FF_FFFF,
@@ -110,5 +111,28 @@ impl Vi {
                 mi.set_interrupt(MiInterrupt::VI);
             }
         }
+    }
+
+    /// Cycles until VI would raise its next scanline interrupt.
+    ///
+    /// Returns `None` when the configured interrupt line is unreachable
+    /// for the current `v_sync` configuration.
+    pub fn cycles_until_interrupt(&self) -> Option<u64> {
+        const CYCLES_PER_SCANLINE: u64 = 2970;
+        let v_sync = self.v_sync.max(1);
+        let target = self.v_intr;
+        if target >= v_sync {
+            return None;
+        }
+        let cur = self.v_current % v_sync;
+        let lines_ahead = if target > cur {
+            target - cur
+        } else {
+            v_sync - cur + target
+        };
+        let total = u64::from(lines_ahead)
+            .saturating_mul(CYCLES_PER_SCANLINE)
+            .saturating_sub(self.cycles);
+        Some(total.max(1))
     }
 }

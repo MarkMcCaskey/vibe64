@@ -202,6 +202,15 @@ impl Ai {
     pub fn dma_active(&self) -> bool {
         self.fifo_count > 0
     }
+
+    /// Cycles until AI would raise its next buffer-complete interrupt.
+    pub fn cycles_until_interrupt(&self) -> Option<u64> {
+        if self.control & 1 == 0 || self.fifo_count == 0 || self.dma_cycles == 0 {
+            None
+        } else {
+            Some(self.dma_cycles)
+        }
+    }
 }
 
 #[cfg(test)]

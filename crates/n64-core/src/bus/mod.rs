@@ -55,4 +55,12 @@ pub trait Bus {
 
     /// Check for pending unmasked interrupts (MI_INTR & MI_MASK).
     fn pending_interrupts(&self) -> bool;
+
+    /// Cycles until the next asynchronous external interrupt source edge
+    /// (VI/PI/SI/AI) would be raised in MI_INTR.
+    ///
+    /// `None` means no such event is currently scheduled.
+    fn cycles_until_next_interrupt_event(&self) -> Option<u64> {
+        None
+    }
 }
