@@ -4,11 +4,12 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
-default = []
+default = ["dynarec"]
 dynarec = ["dep:n64-dynarec"]
 
 [dependencies]
 log = "0.4"
 thiserror = "2"
 memmap2 = "0.9"
+rustc-hash = "1.1"
 n64-dynarec = { path = "../n64-dynarec", optional = true }

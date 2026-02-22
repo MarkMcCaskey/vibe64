@@ -3,7 +3,7 @@ use crate::cpu::cop0::Cop0;
 use crate::cpu::instruction::Instruction;
 use crate::cpu::Vr4300;
 use crate::jit::{ExecutionEngine, Interpreter};
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
@@ -371,6 +371,7 @@ pub struct DynarecEngine {
     runtime: DynarecRuntimeStats,
     hot_counts: HashMap<u32, u16>,
     promote_counts: HashMap<u32, u16>,
+    promote_attempted: HashSet<u32>,
     promote_spans: HashMap<u32, (u32, u32)>,
     promote_pages: HashMap<u32, HashSet<u32>>,
     tier_floor_insns: HashMap<u32, u32>,
@@ -454,7 +455,7 @@ impl DynarecEngine {
         let async_promote_enabled =
             Self::parse_env_bool("N64_DYNAREC_ASYNC_PROMOTE", false) && promote_hot_threshold > 0;
         let async_snapshot_instructions =
-            Self::parse_env_u32("N64_DYNAREC_ASYNC_SNAPSHOT_INSNS", 1024);
+            Self::parse_env_u32("N64_DYNAREC_ASYNC_SNAPSHOT_INSNS", 256);
         let async_queue_limit =
             Self::parse_env_u32("N64_DYNAREC_ASYNC_QUEUE_LIMIT", 256).max(1) as usize;
         let min_native_instructions = Self::parse_env_u32("N64_DYNAREC_MIN_BLOCK_INSNS", 2);
@@ -493,11 +494,12 @@ impl DynarecEngine {
             fallback: Interpreter,
             recompiler,
             runtime: DynarecRuntimeStats::default(),
-            hot_counts: HashMap::new(),
-            promote_counts: HashMap::new(),
-            promote_spans: HashMap::new(),
-            promote_pages: HashMap::new(),
-            tier_floor_insns: HashMap::new(),
+            hot_counts: HashMap::default(),
+            promote_counts: HashMap::default(),
+            promote_attempted: HashSet::default(),
+            promote_spans: HashMap::default(),
+            promote_pages: HashMap::default(),
+            tier_floor_insns: HashMap::default(),
             hot_threshold,
             max_block_instructions,
             tier1_max_block_instructions,
@@ -513,10 +515,10 @@ impl DynarecEngine {
             compile_budget_credit_us: compile_budget_cap_us,
             compile_budget_cap_us,
             compile_budget_last_refill: Instant::now(),
-            page_generations: HashMap::new(),
-            pending_promotions: HashSet::new(),
-            pending_spans: HashMap::new(),
-            pending_pages: HashMap::new(),
+            page_generations: HashMap::default(),
+            pending_promotions: HashSet::default(),
+            pending_spans: HashMap::default(),
+            pending_pages: HashMap::default(),
             async_tx,
             async_rx,
             async_thread,
@@ -537,11 +539,12 @@ impl DynarecEngine {
             fallback: Interpreter,
             recompiler,
             runtime: DynarecRuntimeStats::default(),
-            hot_counts: HashMap::new(),
-            promote_counts: HashMap::new(),
-            promote_spans: HashMap::new(),
-            promote_pages: HashMap::new(),
-            tier_floor_insns: HashMap::new(),
+            hot_counts: HashMap::default(),
+            promote_counts: HashMap::default(),
+            promote_attempted: HashSet::default(),
+            promote_spans: HashMap::default(),
+            promote_pages: HashMap::default(),
+            tier_floor_insns: HashMap::default(),
             hot_threshold: 1,
             max_block_instructions,
             tier1_max_block_instructions: 2,
@@ -557,10 +560,10 @@ impl DynarecEngine {
             compile_budget_credit_us: 0,
             compile_budget_cap_us: 0,
             compile_budget_last_refill: Instant::now(),
-            page_generations: HashMap::new(),
-            pending_promotions: HashSet::new(),
-            pending_spans: HashMap::new(),
-            pending_pages: HashMap::new(),
+            page_generations: HashMap::default(),
+            pending_promotions: HashSet::default(),
+            pending_spans: HashMap::default(),
+            pending_pages: HashMap::default(),
             async_tx: None,
             async_rx: None,
             async_thread: None,
@@ -658,6 +661,7 @@ impl DynarecEngine {
         self.runtime = DynarecRuntimeStats::default();
         self.recompiler.reset_stats();
         self.promote_counts.clear();
+        self.promote_attempted.clear();
         self.promote_spans.clear();
         self.promote_pages.clear();
         self.compile_budget_credit_us = self.compile_budget_cap_us;
@@ -796,7 +800,7 @@ impl DynarecEngine {
         first_page: u32,
         last_page: u32,
     ) -> HashSet<u32> {
-        let mut keys = HashSet::new();
+        let mut keys = HashSet::default();
         for page in first_page..=last_page {
             if let Some(page_keys) = index.get(&page) {
                 keys.extend(page_keys.iter().copied());
@@ -831,6 +835,9 @@ impl DynarecEngine {
         if self.promote_hot_threshold == 0
             || self.max_block_instructions <= self.tier1_max_block_instructions
         {
+            return;
+        }
+        if self.promote_attempted.contains(&block.start_phys) {
             return;
         }
         self.reindex_promote_span(block.start_phys, block);
@@ -973,6 +980,7 @@ impl DynarecEngine {
             return false;
         }
 
+        self.promote_attempted.insert(start_phys);
         self.index_pending_promotion(start_phys, span);
         self.runtime.promote_calls += 1;
         self.runtime.promote_async_enqueued += 1;
@@ -994,6 +1002,7 @@ impl DynarecEngine {
 
         if !self.page_generations_match(&result.page_generations) {
             self.runtime.promote_async_dropped_stale += 1;
+            self.promote_attempted.remove(&result.start_phys);
             return;
         }
 
@@ -1050,8 +1059,12 @@ impl DynarecEngine {
     fn maybe_promote_block<B: Bus>(&mut self, start_phys: u32, block: CompiledBlock, bus: &mut B) {
         if block.max_retired_instructions >= self.max_block_instructions {
             self.raise_tier_floor(start_phys, block.max_retired_instructions);
+            self.promote_attempted.insert(start_phys);
             self.remove_pending_promotion(start_phys);
             self.remove_promote_tracking(start_phys);
+            return;
+        }
+        if self.promote_attempted.contains(&start_phys) {
             return;
         }
         if !self.should_attempt_promotion(start_phys) {
@@ -1065,6 +1078,7 @@ impl DynarecEngine {
             return;
         }
 
+        self.promote_attempted.insert(start_phys);
         self.runtime.promote_calls += 1;
         let compile_start = Instant::now();
         let ensure_result = {
@@ -1399,11 +1413,13 @@ impl ExecutionEngine for DynarecEngine {
         let promote_drop = Self::collect_indexed_keys(&self.promote_pages, first_page, last_page);
         for key in promote_drop {
             self.remove_promote_tracking(key);
+            self.promote_attempted.remove(&key);
         }
 
         let pending_drop = Self::collect_indexed_keys(&self.pending_pages, first_page, last_page);
         for key in pending_drop {
             self.remove_pending_promotion(key);
+            self.promote_attempted.remove(&key);
         }
 
         let elapsed_us = invalidate_start
