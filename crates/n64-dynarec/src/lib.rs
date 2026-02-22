@@ -5,7 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use cranelift_codegen::ir::condcodes::IntCC;
+use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::{types, AbiParam, FuncRef, InstBuilder, MemFlags, Type, Value};
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
@@ -707,14 +707,24 @@ enum Op {
     Dmtc0 { rt: u8, rd: u8 },
     Mfc1 { rt: u8, fs: u8 },
     Mtc1 { rt: u8, fs: u8 },
+    SqrtS { fd: u8, fs: u8 },
+    AbsS { fd: u8, fs: u8 },
+    MovS { fd: u8, fs: u8 },
+    NegS { fd: u8, fs: u8 },
     AddS { fd: u8, fs: u8, ft: u8 },
     SubS { fd: u8, fs: u8, ft: u8 },
     MulS { fd: u8, fs: u8, ft: u8 },
     DivS { fd: u8, fs: u8, ft: u8 },
+    SqrtD { fd: u8, fs: u8 },
+    AbsD { fd: u8, fs: u8 },
+    MovD { fd: u8, fs: u8 },
+    NegD { fd: u8, fs: u8 },
     AddD { fd: u8, fs: u8, ft: u8 },
     SubD { fd: u8, fs: u8, ft: u8 },
     MulD { fd: u8, fs: u8, ft: u8 },
     DivD { fd: u8, fs: u8, ft: u8 },
+    CmpS { fs: u8, ft: u8, cond: u8, raw: u32 },
+    CmpD { fs: u8, ft: u8, cond: u8, raw: u32 },
     Interp { raw: u32 },
     Sync,
     Cache,
@@ -989,6 +999,10 @@ fn decode_supported_non_branch(raw: u32) -> Option<Op> {
             0x00 => Some(Op::Mfc1 { rt, fs: rd }),
             0x04 => Some(Op::Mtc1 { rt, fs: rd }),
             0x10 => match funct {
+                0x04 => Some(Op::SqrtS { fd: sa, fs: rd }),
+                0x05 => Some(Op::AbsS { fd: sa, fs: rd }),
+                0x06 => Some(Op::MovS { fd: sa, fs: rd }),
+                0x07 => Some(Op::NegS { fd: sa, fs: rd }),
                 0x00 => Some(Op::AddS {
                     fd: sa,
                     fs: rd,
@@ -1009,9 +1023,19 @@ fn decode_supported_non_branch(raw: u32) -> Option<Op> {
                     fs: rd,
                     ft: rt,
                 }),
+                0x30..=0x3F => Some(Op::CmpS {
+                    fs: rd,
+                    ft: rt,
+                    cond: funct & 0x0F,
+                    raw,
+                }),
                 _ => Some(Op::Interp { raw }),
             },
             0x11 => match funct {
+                0x04 => Some(Op::SqrtD { fd: sa, fs: rd }),
+                0x05 => Some(Op::AbsD { fd: sa, fs: rd }),
+                0x06 => Some(Op::MovD { fd: sa, fs: rd }),
+                0x07 => Some(Op::NegD { fd: sa, fs: rd }),
                 0x00 => Some(Op::AddD {
                     fd: sa,
                     fs: rd,
@@ -1031,6 +1055,12 @@ fn decode_supported_non_branch(raw: u32) -> Option<Op> {
                     fd: sa,
                     fs: rd,
                     ft: rt,
+                }),
+                0x30..=0x3F => Some(Op::CmpD {
+                    fs: rd,
+                    ft: rt,
+                    cond: funct & 0x0F,
+                    raw,
                 }),
                 _ => Some(Op::Interp { raw }),
             },
@@ -1577,6 +1607,56 @@ fn read_cop1_condition_flag(
     builder.block_params(done_block)[0]
 }
 
+fn write_cop1_condition_flag(
+    builder: &mut FunctionBuilder<'_>,
+    callbacks_ptr: Value,
+    helpers: ImportedFuncRefs,
+    runtime_ptrs: RuntimeStatePtrs,
+    condition: Value,
+    raw: u32,
+    current_pc: Value,
+) {
+    let zero_ptr = builder.ins().iconst(runtime_ptrs.ptr_ty, 0);
+    let has_ptr = builder
+        .ins()
+        .icmp(IntCC::NotEqual, runtime_ptrs.cop1_fcr31_ptr, zero_ptr);
+
+    let fast_block = builder.create_block();
+    let slow_block = builder.create_block();
+    let done_block = builder.create_block();
+    builder
+        .ins()
+        .brif(has_ptr, fast_block, &[], slow_block, &[]);
+
+    builder.switch_to_block(fast_block);
+    let mut flags = MemFlags::new();
+    flags.set_notrap();
+    flags.set_aligned();
+    let fcr31 = builder
+        .ins()
+        .load(types::I32, flags, runtime_ptrs.cop1_fcr31_ptr, 0);
+    let cond_mask = builder.ins().iconst(types::I32, i64::from(1 << 23));
+    let clear_mask = builder
+        .ins()
+        .iconst(types::I32, i64::from(0xFF7F_FFFFu32 as i32));
+    let set_val = builder.ins().bor(fcr31, cond_mask);
+    let clear_val = builder.ins().band(fcr31, clear_mask);
+    let updated = builder.ins().select(condition, set_val, clear_val);
+    builder
+        .ins()
+        .store(flags, updated, runtime_ptrs.cop1_fcr31_ptr, 0);
+    builder.ins().jump(done_block, &[]);
+
+    builder.switch_to_block(slow_block);
+    let raw = iconst_u64(builder, u64::from(raw));
+    builder
+        .ins()
+        .call(helpers.interp_exec, &[callbacks_ptr, raw, current_pc]);
+    builder.ins().jump(done_block, &[]);
+
+    builder.switch_to_block(done_block);
+}
+
 fn emit_op(
     builder: &mut FunctionBuilder<'_>,
     gpr_ptr: Value,
@@ -2099,6 +2179,33 @@ fn emit_op(
             let bits32 = builder.ins().ireduce(types::I32, value64);
             store_fpr_word(builder, fpr_ptr, fs, bits32, flags);
         }
+        Op::SqrtS { fd, fs } => {
+            let fs_bits = load_fpr_word(builder, fpr_ptr, fs, flags);
+            let fs_val = builder.ins().bitcast(types::F32, MemFlags::new(), fs_bits);
+            let result = builder.ins().sqrt(fs_val);
+            let result_bits = builder.ins().bitcast(types::I32, MemFlags::new(), result);
+            store_fpr_word(builder, fpr_ptr, fd, result_bits, flags);
+        }
+        Op::AbsS { fd, fs } => {
+            let fs_bits = load_fpr_word(builder, fpr_ptr, fs, flags);
+            let mask = builder
+                .ins()
+                .iconst(types::I32, i64::from(0x7FFF_FFFFu32 as i32));
+            let result_bits = builder.ins().band(fs_bits, mask);
+            store_fpr_word(builder, fpr_ptr, fd, result_bits, flags);
+        }
+        Op::MovS { fd, fs } => {
+            let fs_bits = load_fpr_word(builder, fpr_ptr, fs, flags);
+            store_fpr_word(builder, fpr_ptr, fd, fs_bits, flags);
+        }
+        Op::NegS { fd, fs } => {
+            let fs_bits = load_fpr_word(builder, fpr_ptr, fs, flags);
+            let sign = builder
+                .ins()
+                .iconst(types::I32, i64::from(0x8000_0000u32 as i32));
+            let result_bits = builder.ins().bxor(fs_bits, sign);
+            store_fpr_word(builder, fpr_ptr, fd, result_bits, flags);
+        }
         Op::AddS { fd, fs, ft } => {
             let fs_bits = load_fpr_word(builder, fpr_ptr, fs, flags);
             let ft_bits = load_fpr_word(builder, fpr_ptr, ft, flags);
@@ -2135,6 +2242,29 @@ fn emit_op(
             let result_bits = builder.ins().bitcast(types::I32, MemFlags::new(), result);
             store_fpr_word(builder, fpr_ptr, fd, result_bits, flags);
         }
+        Op::SqrtD { fd, fs } => {
+            let fs_bits = load_fpr_double_bits(builder, fpr_ptr, fs, flags);
+            let fs_val = builder.ins().bitcast(types::F64, MemFlags::new(), fs_bits);
+            let result = builder.ins().sqrt(fs_val);
+            let result_bits = builder.ins().bitcast(types::I64, MemFlags::new(), result);
+            store_fpr_double_bits(builder, fpr_ptr, fd, result_bits, flags);
+        }
+        Op::AbsD { fd, fs } => {
+            let fs_bits = load_fpr_double_bits(builder, fpr_ptr, fs, flags);
+            let mask = iconst_u64(builder, 0x7FFF_FFFF_FFFF_FFFFu64);
+            let result_bits = builder.ins().band(fs_bits, mask);
+            store_fpr_double_bits(builder, fpr_ptr, fd, result_bits, flags);
+        }
+        Op::MovD { fd, fs } => {
+            let fs_bits = load_fpr_double_bits(builder, fpr_ptr, fs, flags);
+            store_fpr_double_bits(builder, fpr_ptr, fd, fs_bits, flags);
+        }
+        Op::NegD { fd, fs } => {
+            let fs_bits = load_fpr_double_bits(builder, fpr_ptr, fs, flags);
+            let sign = iconst_u64(builder, 0x8000_0000_0000_0000u64);
+            let result_bits = builder.ins().bxor(fs_bits, sign);
+            store_fpr_double_bits(builder, fpr_ptr, fd, result_bits, flags);
+        }
         Op::AddD { fd, fs, ft } => {
             let fs_bits = load_fpr_double_bits(builder, fpr_ptr, fs, flags);
             let ft_bits = load_fpr_double_bits(builder, fpr_ptr, ft, flags);
@@ -2170,6 +2300,70 @@ fn emit_op(
             let result = builder.ins().fdiv(fs_val, ft_val);
             let result_bits = builder.ins().bitcast(types::I64, MemFlags::new(), result);
             store_fpr_double_bits(builder, fpr_ptr, fd, result_bits, flags);
+        }
+        Op::CmpS { fs, ft, cond, raw } => {
+            let fs_bits = load_fpr_word(builder, fpr_ptr, fs, flags);
+            let ft_bits = load_fpr_word(builder, fpr_ptr, ft, flags);
+            let fs_val = builder.ins().bitcast(types::F32, MemFlags::new(), fs_bits);
+            let ft_val = builder.ins().bitcast(types::F32, MemFlags::new(), ft_bits);
+            let unordered = builder.ins().fcmp(FloatCC::Unordered, fs_val, ft_val);
+            let equal = builder.ins().fcmp(FloatCC::Equal, fs_val, ft_val);
+            let less = builder.ins().fcmp(FloatCC::LessThan, fs_val, ft_val);
+            let zero = builder.ins().iconst(types::I32, 0);
+            let unordered_i32 = builder.ins().uextend(types::I32, unordered);
+            let equal_i32 = builder.ins().uextend(types::I32, equal);
+            let less_i32 = builder.ins().uextend(types::I32, less);
+            let unordered_term = if (cond & 0x01) != 0 {
+                unordered_i32
+            } else {
+                zero
+            };
+            let equal_term = if (cond & 0x02) != 0 { equal_i32 } else { zero };
+            let less_term = if (cond & 0x04) != 0 { less_i32 } else { zero };
+            let any = builder.ins().bor(unordered_term, equal_term);
+            let any = builder.ins().bor(any, less_term);
+            let condition = builder.ins().icmp(IntCC::NotEqual, any, zero);
+            write_cop1_condition_flag(
+                builder,
+                callbacks_ptr,
+                helpers,
+                runtime_ptrs,
+                condition,
+                raw,
+                current_pc,
+            );
+        }
+        Op::CmpD { fs, ft, cond, raw } => {
+            let fs_bits = load_fpr_double_bits(builder, fpr_ptr, fs, flags);
+            let ft_bits = load_fpr_double_bits(builder, fpr_ptr, ft, flags);
+            let fs_val = builder.ins().bitcast(types::F64, MemFlags::new(), fs_bits);
+            let ft_val = builder.ins().bitcast(types::F64, MemFlags::new(), ft_bits);
+            let unordered = builder.ins().fcmp(FloatCC::Unordered, fs_val, ft_val);
+            let equal = builder.ins().fcmp(FloatCC::Equal, fs_val, ft_val);
+            let less = builder.ins().fcmp(FloatCC::LessThan, fs_val, ft_val);
+            let zero = builder.ins().iconst(types::I32, 0);
+            let unordered_i32 = builder.ins().uextend(types::I32, unordered);
+            let equal_i32 = builder.ins().uextend(types::I32, equal);
+            let less_i32 = builder.ins().uextend(types::I32, less);
+            let unordered_term = if (cond & 0x01) != 0 {
+                unordered_i32
+            } else {
+                zero
+            };
+            let equal_term = if (cond & 0x02) != 0 { equal_i32 } else { zero };
+            let less_term = if (cond & 0x04) != 0 { less_i32 } else { zero };
+            let any = builder.ins().bor(unordered_term, equal_term);
+            let any = builder.ins().bor(any, less_term);
+            let condition = builder.ins().icmp(IntCC::NotEqual, any, zero);
+            write_cop1_condition_flag(
+                builder,
+                callbacks_ptr,
+                helpers,
+                runtime_ptrs,
+                condition,
+                raw,
+                current_pc,
+            );
         }
         Op::Mfc0 { rt, rd } => {
             let reg = iconst_u64(builder, u64::from(rd));
@@ -2483,14 +2677,20 @@ impl BlockCompiler for CraneliftCompiler {
                         break;
                     }
                 };
-                let Some(delay_op) = decode_supported_non_branch(delay_raw) else {
-                    if steps.is_empty() {
-                        return Err(CompileError::UnsupportedOpcode {
-                            phys_addr: phys,
-                            opcode,
-                        });
+                let delay_op = match decode_supported_non_branch(delay_raw) {
+                    Some(op) => op,
+                    None if can_inline_interp_non_branch(delay_raw) => {
+                        Op::Interp { raw: delay_raw }
                     }
-                    break;
+                    None => {
+                        if steps.is_empty() {
+                            return Err(CompileError::UnsupportedOpcode {
+                                phys_addr: phys,
+                                opcode,
+                            });
+                        }
+                        break;
+                    }
                 };
                 if matches!(delay_op, Op::Interp { .. }) {
                     interp_op_count = interp_op_count.saturating_add(1);
@@ -3818,6 +4018,33 @@ mod tests {
     }
 
     #[test]
+    fn compiler_allows_interp_delay_slot_for_branch() {
+        let start = 0x1020u32;
+        let mut src = TestSource::with_words(&[
+            (start, 0x5040_0001),      // beql v0, r0, +1
+            (start + 4, 0x8808_0000),  // lwl t0, 0(r0) (unsupported, inlined via interp)
+            (start + 8, 0x2409_0001),  // addiu t1, r0, 1
+            (start + 12, 0x4200_0018), // eret (sentinel: unsupported)
+        ]);
+
+        let mut compiler = CraneliftCompiler::default();
+        let block = compiler
+            .compile(
+                &CompileRequest {
+                    start_phys: start,
+                    max_instructions: 8,
+                },
+                &mut src,
+            )
+            .expect("compile");
+
+        assert!(block.has_control_flow);
+        assert_eq!(block.interp_op_count, 1);
+        assert_eq!(block.instruction_count, 3);
+        assert!(block.may_write_interrupt_state);
+    }
+
+    #[test]
     fn compiled_block_executes_alu_sequence() {
         let start = 0x2000u32;
         let mut src = TestSource::with_words(&[
@@ -4374,6 +4601,58 @@ mod tests {
         assert_eq!(fpr[9], 0x1122_3344);
         assert_eq!(state.store_invalidate_calls, 2);
         assert!(state.mem.is_empty(), "slow callback path should not run");
+    }
+
+    #[test]
+    fn compiled_block_executes_cop1_compare_and_unary_ops() {
+        let start = 0x2620u32;
+        let mut src = TestSource::with_words(&[
+            (start, 0x3C08_3F80),      // lui t0, 0x3f80  (1.0f32 bits)
+            (start + 4, 0x4488_0000),  // mtc1 t0, f0
+            (start + 8, 0x3C09_4000),  // lui t1, 0x4000  (2.0f32 bits)
+            (start + 12, 0x4489_1000), // mtc1 t1, f2
+            (start + 16, 0x4602_003C), // c.lt.s f0, f2
+            (start + 20, 0x4501_0002), // bc1t +2
+            (start + 24, 0x240A_0005), // addiu t2, r0, 5 (delay slot)
+            (start + 28, 0x240A_0063), // addiu t2, r0, 99 (skipped)
+            (start + 32, 0x240B_0007), // addiu t3, r0, 7 (target)
+            (start + 36, 0x4600_0186), // mov.s f6, f0
+            (start + 40, 0x4600_3207), // neg.s f8, f6
+            (start + 44, 0x4600_4285), // abs.s f10, f8
+            (start + 48, 0x4600_1304), // sqrt.s f12, f2
+            (start + 52, 0x4200_0018), // eret (sentinel: unsupported)
+        ]);
+
+        let mut compiler = CraneliftCompiler::default();
+        let block = compiler
+            .compile(
+                &CompileRequest {
+                    start_phys: start,
+                    max_instructions: 32,
+                },
+                &mut src,
+            )
+            .expect("compile");
+
+        let mut gpr = [0u64; 32];
+        let mut fpr = [0u64; 32];
+        let mut callbacks = default_callbacks();
+        let mut fcr31 = 0u32;
+        callbacks.cop1_fcr31_ptr = (&mut fcr31 as *mut u32).cast::<u32>();
+        let start_pc = 0xFFFF_FFFF_8000_2620u64;
+        let exec = block.execute(&mut gpr, &mut fpr, start_pc, &mut callbacks);
+
+        assert_eq!(block.interp_op_count, 0);
+        assert_eq!(exec.next_pc, start_pc + 52);
+        assert_eq!(exec.retired_instructions, 12);
+        assert_eq!(gpr[10], 5);
+        assert_eq!(gpr[11], 7);
+        assert_eq!(fpr[6] as u32, 0x3F80_0000);
+        assert_eq!(fpr[8] as u32, 0xBF80_0000);
+        assert_eq!(fpr[10] as u32, 0x3F80_0000);
+        let sqrt2 = f32::from_bits(fpr[12] as u32);
+        assert!((sqrt2 - 2.0f32.sqrt()).abs() < 1.0e-6);
+        assert_ne!(fcr31 & (1 << 23), 0);
     }
 
     #[test]
