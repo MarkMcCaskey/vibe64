@@ -461,15 +461,43 @@ fn main() {
     let use_test = args.iter().any(|a| a == "--test");
     let use_diag = args.iter().any(|a| a == "--diag");
     let use_bench = args.iter().any(|a| a == "--bench");
+    let force_no_jit = args
+        .iter()
+        .any(|a| matches!(a.as_str(), "--no-jit" | "--interp"));
+    let force_jit = args.iter().any(|a| a == "--jit");
+    let force_no_tiering = args.iter().any(|a| a == "--no-tiering");
+    let force_tiering = args.iter().any(|a| a == "--tiering");
     let rom_path = args
         .iter()
         .skip(1)
         .find(|a| !a.starts_with("--"))
         .map(PathBuf::from)
         .unwrap_or_else(|| {
-            eprintln!("Usage: n64-frontend [--tui|--test|--diag|--bench] <rom_path>");
+            eprintln!(
+                "Usage: n64-frontend [--tui|--test|--diag|--bench] [--jit|--no-jit|--interp] [--tiering|--no-tiering] <rom_path>"
+            );
             std::process::exit(1);
         });
+
+    if force_no_jit {
+        std::env::set_var("N64_DYNAREC", "0");
+    } else if force_jit {
+        std::env::set_var("N64_DYNAREC", "1");
+    }
+
+    if force_no_tiering {
+        std::env::set_var("N64_DYNAREC_PROMOTE_THRESHOLD", "0");
+        std::env::set_var("N64_DYNAREC_ASYNC_PROMOTE", "0");
+    } else if force_tiering {
+        if force_no_jit {
+            eprintln!("Ignoring --tiering because --no-jit/--interp is set.");
+        } else {
+            std::env::set_var("N64_DYNAREC", "1");
+            std::env::set_var("N64_DYNAREC_TIER1_MAX_BLOCK_INSNS", "64");
+            std::env::set_var("N64_DYNAREC_PROMOTE_THRESHOLD", "8");
+            std::env::set_var("N64_DYNAREC_ASYNC_PROMOTE", "1");
+        }
+    }
 
     let mut n64 = match n64_core::N64::new(&rom_path) {
         Ok(n64) => n64,

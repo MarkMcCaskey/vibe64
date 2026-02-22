@@ -53,13 +53,14 @@ impl Engine {
 
     /// Build engine from environment.
     ///
-    /// `N64_DYNAREC=1|on|true|cranelift` enables dynarec when compiled with
-    /// the `dynarec` feature.
+    /// With the `dynarec` feature compiled in, dynarec is enabled by default.
+    /// `N64_DYNAREC=0|off|false|no` forces interpreter.
+    /// `N64_DYNAREC=1|on|true|yes|cranelift` forces dynarec.
     pub fn from_env() -> Self {
         #[cfg(feature = "dynarec")]
         {
             let Some(raw) = std::env::var("N64_DYNAREC").ok() else {
-                return Self::interpreter();
+                return Self::Dynarec(dynarec::DynarecEngine::new_cranelift());
             };
             let normalized = raw.trim().to_ascii_lowercase();
             if matches!(normalized.as_str(), "" | "0" | "off" | "false" | "no") {

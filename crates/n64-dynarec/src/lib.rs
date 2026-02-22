@@ -180,6 +180,13 @@ impl BlockEntry {
     }
 }
 
+// SAFETY: `BlockEntry` is an immutable pointer to finalized executable memory
+// owned by the JIT module. Sharing or moving the pointer between threads does
+// not mutate underlying state; execution synchronization is managed by callers.
+unsafe impl Send for BlockEntry {}
+// SAFETY: same rationale as `Send`; the pointer is immutable metadata.
+unsafe impl Sync for BlockEntry {}
+
 impl std::fmt::Debug for BlockEntry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "BlockEntry({:p})", self.0)
@@ -377,6 +384,16 @@ impl Recompiler {
 
     pub fn is_failed_cached(&self, start_phys: u32) -> bool {
         self.failed_cache.contains(&start_phys)
+    }
+
+    /// Install an externally compiled block into the cache.
+    ///
+    /// This is used by async compilation pipelines where machine code is
+    /// produced off-thread and published to the main recompiler cache.
+    pub fn install_compiled_block(&mut self, start_phys: u32, block: CompiledBlock) {
+        self.stats.blocks_compiled += 1;
+        self.remove_failed(start_phys);
+        self.insert_cached(start_phys, block);
     }
 
     pub fn ensure_compiled(
