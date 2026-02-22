@@ -281,22 +281,41 @@ enum Op {
     Sllv { rs: u8, rt: u8, rd: u8 },
     Srlv { rs: u8, rt: u8, rd: u8 },
     Srav { rs: u8, rt: u8, rd: u8 },
+    Cache,
 }
 
 #[derive(Debug, Clone, Copy)]
 enum BranchTerminator {
     Beq { rs: u8, rt: u8, offset: i16 },
     Bne { rs: u8, rt: u8, offset: i16 },
+    Beql { rs: u8, rt: u8, offset: i16 },
+    Bnel { rs: u8, rt: u8, offset: i16 },
+    Bltz { rs: u8, offset: i16 },
+    Bgez { rs: u8, offset: i16 },
+    Bltzl { rs: u8, offset: i16 },
+    Bgezl { rs: u8, offset: i16 },
+    Jr { rs: u8 },
 }
 
 fn decode_branch(raw: u32) -> Option<BranchTerminator> {
     let opcode = (raw >> 26) as u8;
     let rs = ((raw >> 21) & 0x1F) as u8;
     let rt = ((raw >> 16) & 0x1F) as u8;
+    let funct = (raw & 0x3F) as u8;
     let offset = raw as u16 as i16;
     match opcode {
         0x04 => Some(BranchTerminator::Beq { rs, rt, offset }),
         0x05 => Some(BranchTerminator::Bne { rs, rt, offset }),
+        0x14 => Some(BranchTerminator::Beql { rs, rt, offset }),
+        0x15 => Some(BranchTerminator::Bnel { rs, rt, offset }),
+        0x01 => match rt {
+            0x00 => Some(BranchTerminator::Bltz { rs, offset }),
+            0x01 => Some(BranchTerminator::Bgez { rs, offset }),
+            0x02 => Some(BranchTerminator::Bltzl { rs, offset }),
+            0x03 => Some(BranchTerminator::Bgezl { rs, offset }),
+            _ => None,
+        },
+        0x00 if funct == 0x08 => Some(BranchTerminator::Jr { rs }),
         _ => None,
     }
 }
@@ -367,7 +386,8 @@ fn decode_supported_non_branch(raw: u32) -> Option<Op> {
             0x2F => Some(Op::Dsubu { rs, rt, rd }),
             _ => None,
         },
-        0x04 | 0x05 => None,
+        0x2F => Some(Op::Cache),
+        0x01 | 0x04 | 0x05 | 0x14 | 0x15 => None,
         _ => None,
     }
 }
@@ -580,6 +600,9 @@ fn emit_op(builder: &mut FunctionBuilder<'_>, gpr_ptr: Value, flags: MemFlags, o
             let result64 = builder.ins().sextend(types::I64, result32);
             store_gpr(builder, gpr_ptr, rd, result64, flags);
         }
+        Op::Cache => {
+            // CACHE is treated as a no-op by the interpreter.
+        }
     }
 }
 
@@ -731,33 +754,160 @@ impl BlockCompiler for CraneliftCompiler {
             let branch_pc = builder
                 .ins()
                 .iadd_imm(start_pc, i64::from(ops.len() as u32) * 4);
-
-            let cond = match branch {
-                BranchTerminator::Beq { rs, rt, .. } => {
-                    let lhs = load_gpr(&mut builder, gpr_ptr, rs, flags);
-                    let rhs = load_gpr(&mut builder, gpr_ptr, rt, flags);
-                    builder.ins().icmp(IntCC::Equal, lhs, rhs)
-                }
-                BranchTerminator::Bne { rs, rt, .. } => {
-                    let lhs = load_gpr(&mut builder, gpr_ptr, rs, flags);
-                    let rhs = load_gpr(&mut builder, gpr_ptr, rt, flags);
-                    builder.ins().icmp(IntCC::NotEqual, lhs, rhs)
-                }
-            };
-
-            // Branch delay slot always executes.
-            emit_op(&mut builder, gpr_ptr, flags, delay_op);
-
-            let next_of_branch = builder.ins().iadd_imm(branch_pc, 4);
             let fallthrough_pc = builder.ins().iadd_imm(branch_pc, 8);
-            let offset = match branch {
-                BranchTerminator::Beq { offset, .. } | BranchTerminator::Bne { offset, .. } => {
-                    ((offset as i32) as i64) << 2
-                }
+            let next_of_branch = builder.ins().iadd_imm(branch_pc, 4);
+
+            let offset_to_taken = |builder: &mut FunctionBuilder<'_>, offset: i16| {
+                let offset_val = builder.ins().iconst(types::I64, ((offset as i32) as i64) << 2);
+                builder.ins().iadd(next_of_branch, offset_val)
             };
-            let offset_val = builder.ins().iconst(types::I64, offset);
-            let taken_pc = builder.ins().iadd(next_of_branch, offset_val);
-            builder.ins().select(cond, taken_pc, fallthrough_pc)
+
+            match branch {
+                BranchTerminator::Jr { rs } => {
+                    emit_op(&mut builder, gpr_ptr, flags, delay_op);
+                    load_gpr(&mut builder, gpr_ptr, rs, flags)
+                }
+                BranchTerminator::Beq { rs, rt, offset } => {
+                    let lhs = load_gpr(&mut builder, gpr_ptr, rs, flags);
+                    let rhs = load_gpr(&mut builder, gpr_ptr, rt, flags);
+                    let cond = builder.ins().icmp(IntCC::Equal, lhs, rhs);
+                    emit_op(&mut builder, gpr_ptr, flags, delay_op);
+                    let taken_pc = offset_to_taken(&mut builder, offset);
+                    builder.ins().select(cond, taken_pc, fallthrough_pc)
+                }
+                BranchTerminator::Bne { rs, rt, offset } => {
+                    let lhs = load_gpr(&mut builder, gpr_ptr, rs, flags);
+                    let rhs = load_gpr(&mut builder, gpr_ptr, rt, flags);
+                    let cond = builder.ins().icmp(IntCC::NotEqual, lhs, rhs);
+                    emit_op(&mut builder, gpr_ptr, flags, delay_op);
+                    let taken_pc = offset_to_taken(&mut builder, offset);
+                    builder.ins().select(cond, taken_pc, fallthrough_pc)
+                }
+                BranchTerminator::Bltz { rs, offset } => {
+                    let lhs = load_gpr(&mut builder, gpr_ptr, rs, flags);
+                    let zero = iconst_u64(&mut builder, 0);
+                    let cond = builder.ins().icmp(IntCC::SignedLessThan, lhs, zero);
+                    emit_op(&mut builder, gpr_ptr, flags, delay_op);
+                    let taken_pc = offset_to_taken(&mut builder, offset);
+                    builder.ins().select(cond, taken_pc, fallthrough_pc)
+                }
+                BranchTerminator::Bgez { rs, offset } => {
+                    let lhs = load_gpr(&mut builder, gpr_ptr, rs, flags);
+                    let zero = iconst_u64(&mut builder, 0);
+                    let cond = builder
+                        .ins()
+                        .icmp(IntCC::SignedGreaterThanOrEqual, lhs, zero);
+                    emit_op(&mut builder, gpr_ptr, flags, delay_op);
+                    let taken_pc = offset_to_taken(&mut builder, offset);
+                    builder.ins().select(cond, taken_pc, fallthrough_pc)
+                }
+                BranchTerminator::Beql { rs, rt, offset } => {
+                    let lhs = load_gpr(&mut builder, gpr_ptr, rs, flags);
+                    let rhs = load_gpr(&mut builder, gpr_ptr, rt, flags);
+                    let cond = builder.ins().icmp(IntCC::Equal, lhs, rhs);
+                    let taken_block = builder.create_block();
+                    let not_taken_block = builder.create_block();
+                    let exit_block = builder.create_block();
+                    let ret_var = builder.declare_var(types::I64);
+                    builder.ins().brif(cond, taken_block, &[], not_taken_block, &[]);
+                    builder.seal_block(taken_block);
+                    builder.seal_block(not_taken_block);
+
+                    builder.switch_to_block(taken_block);
+                    emit_op(&mut builder, gpr_ptr, flags, delay_op);
+                    let taken_pc = offset_to_taken(&mut builder, offset);
+                    builder.def_var(ret_var, taken_pc);
+                    builder.ins().jump(exit_block, &[]);
+
+                    builder.switch_to_block(not_taken_block);
+                    builder.def_var(ret_var, fallthrough_pc);
+                    builder.ins().jump(exit_block, &[]);
+
+                    builder.switch_to_block(exit_block);
+                    builder.seal_block(exit_block);
+                    builder.use_var(ret_var)
+                }
+                BranchTerminator::Bnel { rs, rt, offset } => {
+                    let lhs = load_gpr(&mut builder, gpr_ptr, rs, flags);
+                    let rhs = load_gpr(&mut builder, gpr_ptr, rt, flags);
+                    let cond = builder.ins().icmp(IntCC::NotEqual, lhs, rhs);
+                    let taken_block = builder.create_block();
+                    let not_taken_block = builder.create_block();
+                    let exit_block = builder.create_block();
+                    let ret_var = builder.declare_var(types::I64);
+                    builder.ins().brif(cond, taken_block, &[], not_taken_block, &[]);
+                    builder.seal_block(taken_block);
+                    builder.seal_block(not_taken_block);
+
+                    builder.switch_to_block(taken_block);
+                    emit_op(&mut builder, gpr_ptr, flags, delay_op);
+                    let taken_pc = offset_to_taken(&mut builder, offset);
+                    builder.def_var(ret_var, taken_pc);
+                    builder.ins().jump(exit_block, &[]);
+
+                    builder.switch_to_block(not_taken_block);
+                    builder.def_var(ret_var, fallthrough_pc);
+                    builder.ins().jump(exit_block, &[]);
+
+                    builder.switch_to_block(exit_block);
+                    builder.seal_block(exit_block);
+                    builder.use_var(ret_var)
+                }
+                BranchTerminator::Bltzl { rs, offset } => {
+                    let lhs = load_gpr(&mut builder, gpr_ptr, rs, flags);
+                    let zero = iconst_u64(&mut builder, 0);
+                    let cond = builder.ins().icmp(IntCC::SignedLessThan, lhs, zero);
+                    let taken_block = builder.create_block();
+                    let not_taken_block = builder.create_block();
+                    let exit_block = builder.create_block();
+                    let ret_var = builder.declare_var(types::I64);
+                    builder.ins().brif(cond, taken_block, &[], not_taken_block, &[]);
+                    builder.seal_block(taken_block);
+                    builder.seal_block(not_taken_block);
+
+                    builder.switch_to_block(taken_block);
+                    emit_op(&mut builder, gpr_ptr, flags, delay_op);
+                    let taken_pc = offset_to_taken(&mut builder, offset);
+                    builder.def_var(ret_var, taken_pc);
+                    builder.ins().jump(exit_block, &[]);
+
+                    builder.switch_to_block(not_taken_block);
+                    builder.def_var(ret_var, fallthrough_pc);
+                    builder.ins().jump(exit_block, &[]);
+
+                    builder.switch_to_block(exit_block);
+                    builder.seal_block(exit_block);
+                    builder.use_var(ret_var)
+                }
+                BranchTerminator::Bgezl { rs, offset } => {
+                    let lhs = load_gpr(&mut builder, gpr_ptr, rs, flags);
+                    let zero = iconst_u64(&mut builder, 0);
+                    let cond = builder
+                        .ins()
+                        .icmp(IntCC::SignedGreaterThanOrEqual, lhs, zero);
+                    let taken_block = builder.create_block();
+                    let not_taken_block = builder.create_block();
+                    let exit_block = builder.create_block();
+                    let ret_var = builder.declare_var(types::I64);
+                    builder.ins().brif(cond, taken_block, &[], not_taken_block, &[]);
+                    builder.seal_block(taken_block);
+                    builder.seal_block(not_taken_block);
+
+                    builder.switch_to_block(taken_block);
+                    emit_op(&mut builder, gpr_ptr, flags, delay_op);
+                    let taken_pc = offset_to_taken(&mut builder, offset);
+                    builder.def_var(ret_var, taken_pc);
+                    builder.ins().jump(exit_block, &[]);
+
+                    builder.switch_to_block(not_taken_block);
+                    builder.def_var(ret_var, fallthrough_pc);
+                    builder.ins().jump(exit_block, &[]);
+
+                    builder.switch_to_block(exit_block);
+                    builder.seal_block(exit_block);
+                    builder.use_var(ret_var)
+                }
+            }
         } else {
             let delta = builder
                 .ins()
@@ -924,6 +1074,67 @@ mod tests {
         assert_eq!(block.instruction_count, 4);
         assert_eq!(gpr[10], 5);
         assert_eq!(end_pc, start_pc + 16);
+    }
+
+    #[test]
+    fn compiled_block_executes_beql_not_taken_skips_delay_slot() {
+        let start = 0x2300u32;
+        let mut src = TestSource::with_words(&[
+            (start, 0x2408_0001),      // addiu t0, r0, 1
+            (start + 4, 0x2409_0002),  // addiu t1, r0, 2
+            (start + 8, 0x5109_0001),  // beql t0, t1, +1 (not taken)
+            (start + 12, 0x240A_0005), // addiu t2, r0, 5 (delay slot, skipped)
+        ]);
+
+        let mut compiler = CraneliftCompiler::default();
+        let block = compiler
+            .compile(
+                &CompileRequest {
+                    start_phys: start,
+                    max_instructions: 8,
+                },
+                &mut src,
+            )
+            .expect("compile");
+
+        let mut gpr = [0u64; 32];
+        let start_pc = 0xFFFF_FFFF_8000_2300u64;
+        let end_pc = block.execute(&mut gpr, start_pc);
+
+        assert!(block.has_control_flow);
+        assert_eq!(block.instruction_count, 4);
+        assert_eq!(gpr[10], 0);
+        assert_eq!(end_pc, start_pc + 16);
+    }
+
+    #[test]
+    fn compiled_block_executes_jr_with_delay_slot() {
+        let start = 0x2400u32;
+        let mut src = TestSource::with_words(&[
+            (start, 0x0160_0008),     // jr t3
+            (start + 4, 0x2409_0007), // addiu t1, r0, 7 (delay slot)
+        ]);
+
+        let mut compiler = CraneliftCompiler::default();
+        let block = compiler
+            .compile(
+                &CompileRequest {
+                    start_phys: start,
+                    max_instructions: 8,
+                },
+                &mut src,
+            )
+            .expect("compile");
+
+        let mut gpr = [0u64; 32];
+        gpr[11] = 0xFFFF_FFFF_8000_2600;
+        let start_pc = 0xFFFF_FFFF_8000_2400u64;
+        let end_pc = block.execute(&mut gpr, start_pc);
+
+        assert!(block.has_control_flow);
+        assert_eq!(block.instruction_count, 2);
+        assert_eq!(gpr[9], 7);
+        assert_eq!(end_pc, gpr[11]);
     }
 
     #[test]

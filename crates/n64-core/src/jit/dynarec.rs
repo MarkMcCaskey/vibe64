@@ -86,7 +86,7 @@ impl DynarecEngine {
     }
 
     pub fn new_cranelift() -> Self {
-        let hot_threshold = Self::parse_env_u16("N64_DYNAREC_HOT_THRESHOLD", 4096);
+        let hot_threshold = Self::parse_env_u16("N64_DYNAREC_HOT_THRESHOLD", 8192);
         let min_native_instructions = Self::parse_env_u32("N64_DYNAREC_MIN_BLOCK_INSNS", 1);
         let compiler = Box::<CraneliftCompiler>::default();
         let recompiler = Recompiler::new(compiler, RecompilerConfig::default());
