@@ -1043,17 +1043,10 @@ fn can_inline_interp_non_branch(raw: u32) -> bool {
     }
 }
 
-fn raw_may_write_interrupt_state(raw: u32) -> bool {
-    let opcode = (raw >> 26) as u8;
-    let rs = ((raw >> 21) & 0x1F) as u8;
-    let rd = ((raw >> 11) & 0x1F) as u8;
-    matches!(opcode, 0x10) && matches!(rs, 0x04 | 0x05) && matches!(rd, 12 | 13)
-}
-
 fn op_may_write_interrupt_state(op: Op) -> bool {
     match op {
         Op::Mtc0 { rd, .. } | Op::Dmtc0 { rd, .. } => matches!(rd, 12 | 13),
-        Op::Interp { raw } => raw_may_write_interrupt_state(raw),
+        Op::Interp { .. } => true,
         _ => false,
     }
 }
@@ -2432,20 +2425,14 @@ impl BlockCompiler for CraneliftCompiler {
                         break;
                     }
                 };
-                let delay_op = match decode_supported_non_branch(delay_raw) {
-                    Some(op) => op,
-                    None if can_inline_interp_non_branch(delay_raw) => {
-                        Op::Interp { raw: delay_raw }
+                let Some(delay_op) = decode_supported_non_branch(delay_raw) else {
+                    if steps.is_empty() {
+                        return Err(CompileError::UnsupportedOpcode {
+                            phys_addr: phys,
+                            opcode,
+                        });
                     }
-                    None => {
-                        if steps.is_empty() {
-                            return Err(CompileError::UnsupportedOpcode {
-                                phys_addr: phys,
-                                opcode,
-                            });
-                        }
-                        break;
-                    }
+                    break;
                 };
                 if matches!(delay_op, Op::Interp { .. }) {
                     interp_op_count = interp_op_count.saturating_add(1);
@@ -2521,18 +2508,17 @@ impl BlockCompiler for CraneliftCompiler {
                 }
                 None => {
                     if can_inline_interp_non_branch(opcode) {
-                        let interp_op = Op::Interp { raw: opcode };
-                        if op_may_write_interrupt_state(interp_op) {
-                            may_write_interrupt_state = true;
+                        if !steps.is_empty() {
+                            break;
                         }
+                        may_write_interrupt_state = true;
                         steps.push(TraceStep::Op {
                             phys,
-                            op: interp_op,
+                            op: Op::Interp { raw: opcode },
                         });
                         interp_op_count = interp_op_count.saturating_add(1);
                         decoded_count += 1;
-                        phys = phys.wrapping_add(4);
-                        continue;
+                        break;
                     }
                     if steps.is_empty() {
                         return Err(CompileError::UnsupportedOpcode {
