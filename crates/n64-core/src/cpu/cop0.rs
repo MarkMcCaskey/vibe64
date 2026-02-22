@@ -45,6 +45,7 @@ impl Cop0 {
     }
 
     /// Read a COP0 register (MFC0)
+    #[inline]
     pub fn read_reg(&self, index: usize) -> u64 {
         self.regs[index & 0x1F]
     }
@@ -78,11 +79,13 @@ impl Cop0 {
     }
 
     /// Increment Count by 1 (Count increments every other PCycle)
+    #[inline]
     pub fn increment_count(&mut self) {
         self.regs[Self::COUNT] = self.regs[Self::COUNT].wrapping_add(1);
     }
 
     /// Check if Count == Compare → set IP7 in Cause
+    #[inline]
     pub fn check_timer_interrupt(&mut self) {
         if (self.regs[Self::COUNT] as u32) == (self.regs[Self::COMPARE] as u32) {
             self.regs[Self::CAUSE] |= 1 << 15; // IP7
@@ -117,6 +120,7 @@ impl Cop0 {
     }
 
     /// Decrement Random register (wraps from Wired back to 31)
+    #[inline]
     pub fn decrement_random(&mut self) {
         let wired = self.regs[Self::WIRED] & 0x1F;
         let random = self.regs[Self::RANDOM] & 0x1F;
@@ -124,17 +128,20 @@ impl Cop0 {
     }
 
     /// Set IP2 in Cause (external RCP interrupt from MI)
+    #[inline]
     pub fn set_ip2(&mut self) {
         self.regs[Self::CAUSE] |= 1 << 10;
     }
 
     /// Clear IP2 in Cause
+    #[inline]
     pub fn clear_ip2(&mut self) {
         self.regs[Self::CAUSE] &= !(1 << 10);
     }
 
     /// Check if an interrupt should be taken.
     /// Conditions: IE=1, EXL=0, ERL=0, and (Cause.IP & Status.IM) != 0
+    #[inline]
     pub fn interrupt_pending(&self) -> bool {
         let status = self.regs[Self::STATUS] as u32;
         let cause = self.regs[Self::CAUSE] as u32;

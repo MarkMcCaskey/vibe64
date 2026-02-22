@@ -106,6 +106,7 @@ impl Mi {
     }
 
     /// Returns true if any unmasked interrupt is pending.
+    #[inline]
     pub fn interrupt_pending(&self) -> bool {
         (self.intr & self.intr_mask) != 0
     }

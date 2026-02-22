@@ -309,6 +309,7 @@ impl Vr4300 {
 
     /// Try to translate a virtual address. Returns None on TLB miss.
     /// Used by step() and load/store ops to detect TLB exceptions.
+    #[inline]
     pub fn try_translate(&self, vaddr: u64) -> Option<u32> {
         let addr32 = vaddr as u32;
         match addr32 {

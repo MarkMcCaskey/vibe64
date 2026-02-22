@@ -22,11 +22,13 @@ impl Rdram {
         }
     }
 
+    #[inline]
     pub fn read_u8(&self, addr: u32) -> u8 {
         let index = (addr as usize) & (RDRAM_SIZE - 1);
         self.data[index]
     }
 
+    #[inline]
     pub fn read_u32(&self, addr: u32) -> u32 {
         let index = (addr as usize) & (RDRAM_SIZE - 1);
         u32::from_be_bytes([
@@ -37,6 +39,7 @@ impl Rdram {
         ])
     }
 
+    #[inline]
     pub fn write_u8(&mut self, addr: u32, val: u8) {
         let index = (addr as usize) & (RDRAM_SIZE - 1);
         self.data[index] = val;
@@ -65,6 +68,7 @@ impl Rdram {
         (RDRAM_SIZE - 1) as u64
     }
 
+    #[inline]
     pub fn write_u32(&mut self, addr: u32, val: u32) {
         let index = (addr as usize) & (RDRAM_SIZE - 1);
         let bytes = val.to_be_bytes();
@@ -72,5 +76,41 @@ impl Rdram {
         if addr > 0xA0000 && addr > self.debug_high_write {
             self.debug_high_write = addr;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rdram_read_write_roundtrip() {
+        let mut rdram = Rdram::new();
+
+        // Basic write/read at various aligned addresses
+        rdram.write_u32(0x0000_0000, 0xDEAD_BEEF);
+        assert_eq!(rdram.read_u32(0x0000_0000), 0xDEAD_BEEF);
+
+        rdram.write_u32(0x0000_0100, 0x1234_5678);
+        assert_eq!(rdram.read_u32(0x0000_0100), 0x1234_5678);
+
+        // Near end of RDRAM (8MB - 4)
+        rdram.write_u32(0x007F_FFFC, 0xCAFE_BABE);
+        assert_eq!(rdram.read_u32(0x007F_FFFC), 0xCAFE_BABE);
+
+        // Address wrapping: addr >= 8MB should wrap via mask
+        rdram.write_u32(0x0080_0000, 0xAAAA_BBBB);
+        assert_eq!(rdram.read_u32(0x0000_0000), 0xAAAA_BBBB); // wraps to 0
+
+        // Byte read/write
+        rdram.write_u8(0x0000_0200, 0x42);
+        assert_eq!(rdram.read_u8(0x0000_0200), 0x42);
+
+        // Verify big-endian byte ordering
+        rdram.write_u32(0x0000_0300, 0x01_02_03_04);
+        assert_eq!(rdram.read_u8(0x0000_0300), 0x01);
+        assert_eq!(rdram.read_u8(0x0000_0301), 0x02);
+        assert_eq!(rdram.read_u8(0x0000_0302), 0x03);
+        assert_eq!(rdram.read_u8(0x0000_0303), 0x04);
     }
 }

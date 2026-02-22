@@ -623,18 +623,21 @@ impl Interconnect {
 }
 
 impl Bus for Interconnect {
+    #[inline]
     fn read_u8(&self, addr: u32) -> u8 {
         let word = self.read_u32(addr & !3);
         let shift = (3 - (addr & 3)) * 8;
         (word >> shift) as u8
     }
 
+    #[inline]
     fn read_u16(&self, addr: u32) -> u16 {
         let word = self.read_u32(addr & !3);
         let shift = (2 - (addr & 2)) * 8;
         (word >> shift) as u16
     }
 
+    #[inline]
     fn read_u32(&self, addr: u32) -> u32 {
         match addr {
             0x0000_0000..=0x03EF_FFFF => self.rdram.read_u32(addr),
@@ -698,6 +701,7 @@ impl Bus for Interconnect {
         self.write_u32(aligned, (current & mask) | ((val as u32) << shift));
     }
 
+    #[inline]
     fn write_u32(&mut self, addr: u32, val: u32) {
         match addr {
             0x0000_0000..=0x03EF_FFFF => {
@@ -819,6 +823,7 @@ impl Bus for Interconnect {
         })
     }
 
+    #[inline]
     fn pending_interrupts(&self) -> bool {
         self.mi.interrupt_pending()
     }

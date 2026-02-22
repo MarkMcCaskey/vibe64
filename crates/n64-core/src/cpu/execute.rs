@@ -736,6 +736,7 @@ impl Vr4300 {
 
     /// Compute and translate a load address. Returns None on TLB miss
     /// (sets tlb_miss flag so step() can take the exception).
+    #[inline]
     fn load_addr(&mut self, instr: Instruction) -> Option<u32> {
         let vaddr = self.gpr[instr.rs()].wrapping_add(instr.imm_sign_ext());
         match self.try_translate(vaddr) {
@@ -750,6 +751,7 @@ impl Vr4300 {
     }
 
     /// Compute and translate a store address. Returns None on TLB miss.
+    #[inline]
     fn store_addr(&mut self, instr: Instruction) -> Option<u32> {
         let vaddr = self.gpr[instr.rs()].wrapping_add(instr.imm_sign_ext());
         match self.try_translate(vaddr) {
