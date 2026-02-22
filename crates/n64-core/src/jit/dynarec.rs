@@ -552,7 +552,7 @@ impl DynarecEngine {
     pub fn new_cranelift() -> Self {
         let hot_threshold = Self::parse_env_u16("N64_DYNAREC_HOT_THRESHOLD", 24);
         let max_block_instructions = Self::parse_env_u32("N64_DYNAREC_MAX_BLOCK_INSNS", 512);
-        let tier1_default = max_block_instructions.min(64).max(1);
+        let tier1_default = max_block_instructions.min(32).max(1);
         let tier1_max_block_instructions =
             Self::parse_env_u32("N64_DYNAREC_TIER1_MAX_BLOCK_INSNS", tier1_default)
                 .min(max_block_instructions)

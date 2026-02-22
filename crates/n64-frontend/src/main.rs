@@ -479,6 +479,12 @@ fn main() {
             std::process::exit(1);
         });
 
+    fn set_env_default(name: &str, value: &str) {
+        if std::env::var_os(name).is_none() {
+            std::env::set_var(name, value);
+        }
+    }
+
     if force_no_jit {
         std::env::set_var("N64_DYNAREC", "0");
     } else if force_jit {
@@ -492,10 +498,10 @@ fn main() {
         if force_no_jit {
             eprintln!("Ignoring --tiering because --no-jit/--interp is set.");
         } else {
-            std::env::set_var("N64_DYNAREC", "1");
-            std::env::set_var("N64_DYNAREC_TIER1_MAX_BLOCK_INSNS", "64");
-            std::env::set_var("N64_DYNAREC_PROMOTE_THRESHOLD", "8");
-            std::env::set_var("N64_DYNAREC_ASYNC_PROMOTE", "1");
+            set_env_default("N64_DYNAREC", "1");
+            set_env_default("N64_DYNAREC_TIER1_MAX_BLOCK_INSNS", "32");
+            set_env_default("N64_DYNAREC_PROMOTE_THRESHOLD", "8");
+            set_env_default("N64_DYNAREC_ASYNC_PROMOTE", "1");
         }
     }
 
