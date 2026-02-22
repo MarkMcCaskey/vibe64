@@ -120,6 +120,10 @@ enum FallbackReason {
 struct NativeEdgeLink {
     target_start_phys: u32,
     target_block: CompiledBlock,
+    target_first_page: u32,
+    target_first_generation: u64,
+    target_last_page: u32,
+    target_last_generation: u64,
 }
 
 struct BusSource<'a, B: Bus> {
@@ -493,7 +497,7 @@ impl DynarecEngine {
         let min_native_instructions = Self::parse_env_u32("N64_DYNAREC_MIN_BLOCK_INSNS", 2);
         let native_gas_limit = Self::parse_env_u32("N64_DYNAREC_NATIVE_GAS", 512);
         let chain_limit = Self::parse_env_u32_allow_zero("N64_DYNAREC_CHAIN_LIMIT", 0);
-        let native_link_fanout = Self::parse_env_u32("N64_DYNAREC_LINK_FANOUT", 4) as usize;
+        let native_link_fanout = Self::parse_env_u32("N64_DYNAREC_LINK_FANOUT", 8) as usize;
         let compile_budget_us_per_ms =
             Self::parse_env_u32_allow_zero("N64_DYNAREC_COMPILE_BUDGET_US_PER_MS", 0);
         let compile_budget_burst_ms =
@@ -599,7 +603,7 @@ impl DynarecEngine {
             promote_pages: HashMap::default(),
             tier_floor_insns: HashMap::default(),
             native_links: HashMap::default(),
-            native_link_fanout: 4,
+            native_link_fanout: 8,
             hot_threshold: 1,
             max_block_instructions,
             tier1_max_block_instructions: 2,
@@ -912,6 +916,39 @@ impl DynarecEngine {
         self.native_links.clear();
     }
 
+    fn native_link_target_generations_match(&self, link: &NativeEdgeLink) -> bool {
+        let first_generation = self
+            .page_generations
+            .get(&link.target_first_page)
+            .copied()
+            .unwrap_or(0);
+        if first_generation != link.target_first_generation {
+            return false;
+        }
+        let last_generation = self
+            .page_generations
+            .get(&link.target_last_page)
+            .copied()
+            .unwrap_or(0);
+        last_generation == link.target_last_generation
+    }
+
+    fn remove_native_link(&mut self, source_start_phys: u32, next_phys: u32) {
+        let mut remove_source = false;
+        if let Some(links) = self.native_links.get_mut(&source_start_phys) {
+            if let Some(idx) = links
+                .iter()
+                .position(|link| link.target_start_phys == next_phys)
+            {
+                links.remove(idx);
+            }
+            remove_source = links.is_empty();
+        }
+        if remove_source {
+            self.native_links.remove(&source_start_phys);
+        }
+    }
+
     fn lookup_native_link<B: Bus>(
         &mut self,
         source_start_phys: u32,
@@ -928,6 +965,11 @@ impl DynarecEngine {
             self.runtime.native_link_misses = self.runtime.native_link_misses.wrapping_add(1);
             return None;
         };
+        if !self.native_link_target_generations_match(&link) {
+            self.remove_native_link(source_start_phys, next_phys);
+            self.runtime.native_link_misses = self.runtime.native_link_misses.wrapping_add(1);
+            return None;
+        }
         if !self.can_run_native_block(cpu, bus, &link.target_block, next_phys) {
             self.runtime.native_link_misses = self.runtime.native_link_misses.wrapping_add(1);
             return None;
@@ -942,9 +984,24 @@ impl DynarecEngine {
         next_phys: u32,
         target_block: CompiledBlock,
     ) {
+        let (target_first_page, target_last_page) = page_span_for_block(&target_block);
+        let target_first_generation = self
+            .page_generations
+            .get(&target_first_page)
+            .copied()
+            .unwrap_or(0);
+        let target_last_generation = self
+            .page_generations
+            .get(&target_last_page)
+            .copied()
+            .unwrap_or(0);
         let link = NativeEdgeLink {
             target_start_phys: next_phys,
             target_block,
+            target_first_page,
+            target_first_generation,
+            target_last_page,
+            target_last_generation,
         };
         let fanout = self.native_link_fanout.max(1);
         let links = self.native_links.entry(source_start_phys).or_default();
@@ -952,7 +1009,9 @@ impl DynarecEngine {
             .iter_mut()
             .find(|existing| existing.target_start_phys == next_phys)
         {
-            let needs_update = existing.target_block.start_phys != target_block.start_phys
+            let needs_update = existing.target_first_generation != target_first_generation
+                || existing.target_last_generation != target_last_generation
+                || existing.target_block.start_phys != target_block.start_phys
                 || existing.target_block.end_phys != target_block.end_phys
                 || existing.target_block.max_retired_instructions
                     != target_block.max_retired_instructions;
@@ -1553,7 +1612,6 @@ impl ExecutionEngine for DynarecEngine {
         let (first_page, last_page) = page_span_from_start_len(start, len);
         self.bump_page_generations(first_page, last_page);
         self.recompiler.invalidate_range(start, len);
-        self.clear_native_links();
 
         let promote_drop = Self::collect_indexed_keys(&self.promote_pages, first_page, last_page);
         for key in promote_drop {
