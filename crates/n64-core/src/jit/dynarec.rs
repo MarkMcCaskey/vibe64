@@ -15,6 +15,7 @@ pub struct DynarecRuntimeStats {
     pub native_blocks_executed: u64,
     pub native_instructions_executed: u64,
     pub native_interp_delegated_instructions: u64,
+    pub native_gas_exits: u64,
     pub fallback_instructions_executed: u64,
     pub fallback_early_guard: u64,
     pub fallback_guard_after_lookup: u64,
@@ -35,7 +36,10 @@ pub struct DynarecStats {
     pub failed_cache_len: usize,
     pub hot_entries: usize,
     pub hot_threshold: u16,
+    pub max_block_instructions: u32,
     pub min_native_instructions: u32,
+    pub native_gas_limit: u32,
+    /// 0 means unlimited chaining (bounded by `native_gas_limit`).
     pub chain_limit: u32,
 }
 
@@ -227,7 +231,10 @@ pub struct DynarecEngine {
     runtime: DynarecRuntimeStats,
     hot_counts: HashMap<u32, u16>,
     hot_threshold: u16,
+    max_block_instructions: u32,
     min_native_instructions: u32,
+    native_gas_limit: u32,
+    /// 0 means unlimited chaining (bounded by `native_gas_limit`).
     chain_limit: u32,
 }
 
@@ -248,20 +255,59 @@ impl DynarecEngine {
             .unwrap_or(default)
     }
 
+    fn parse_env_u32_allow_zero(name: &str, default: u32) -> u32 {
+        std::env::var(name)
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(default)
+    }
+
     pub fn new_cranelift() -> Self {
         let hot_threshold = Self::parse_env_u16("N64_DYNAREC_HOT_THRESHOLD", 8192);
+        let max_block_instructions = Self::parse_env_u32("N64_DYNAREC_MAX_BLOCK_INSNS", 256);
         let min_native_instructions = Self::parse_env_u32("N64_DYNAREC_MIN_BLOCK_INSNS", 2);
-        let chain_limit = Self::parse_env_u32("N64_DYNAREC_CHAIN_LIMIT", 3);
+        let native_gas_limit = Self::parse_env_u32("N64_DYNAREC_NATIVE_GAS", 2048);
+        let chain_limit = Self::parse_env_u32_allow_zero("N64_DYNAREC_CHAIN_LIMIT", 2);
         let compiler = Box::<CraneliftCompiler>::default();
-        let recompiler = Recompiler::new(compiler, RecompilerConfig::default());
+        let recompiler = Recompiler::new(
+            compiler,
+            RecompilerConfig {
+                max_block_instructions,
+            },
+        );
         Self {
             fallback: Interpreter,
             recompiler,
             runtime: DynarecRuntimeStats::default(),
             hot_counts: HashMap::new(),
             hot_threshold,
+            max_block_instructions,
             min_native_instructions,
+            native_gas_limit,
             chain_limit,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn new_cranelift_for_tests() -> Self {
+        let max_block_instructions = 256;
+        let compiler = Box::<CraneliftCompiler>::default();
+        let recompiler = Recompiler::new(
+            compiler,
+            RecompilerConfig {
+                max_block_instructions,
+            },
+        );
+        Self {
+            fallback: Interpreter,
+            recompiler,
+            runtime: DynarecRuntimeStats::default(),
+            hot_counts: HashMap::new(),
+            hot_threshold: 1,
+            max_block_instructions,
+            min_native_instructions: 1,
+            native_gas_limit: 1024,
+            chain_limit: 2,
         }
     }
 
@@ -273,7 +319,9 @@ impl DynarecEngine {
             failed_cache_len: self.recompiler.failed_cache_len(),
             hot_entries: self.hot_counts.len(),
             hot_threshold: self.hot_threshold,
+            max_block_instructions: self.max_block_instructions,
             min_native_instructions: self.min_native_instructions,
+            native_gas_limit: self.native_gas_limit,
             chain_limit: self.chain_limit,
         }
     }
@@ -281,10 +329,11 @@ impl DynarecEngine {
     pub fn stats_line(&self) -> String {
         let stats = self.stats();
         format!(
-            "native_blocks={} native_instr={} native_interp_instr={} fallback_instr={} fallback_early_guard={} fallback_guard_after_lookup={} fallback_no_block={} fallback_failed_cache={} fallback_cold={} ensure_calls={} ensure_compiled={} ensure_compile_failed={} ensure_cache_hit={} recompiler_cache_hits={} recompiler_failed_cache_hits={} recompiler_blocks_compiled={} recompiler_compile_failures={} recompiler_invalidated_blocks={} block_cache_len={} failed_cache_len={} hot_entries={} hot_threshold={} min_block_insns={} chain_limit={}",
+            "native_blocks={} native_instr={} native_interp_instr={} native_gas_exits={} fallback_instr={} fallback_early_guard={} fallback_guard_after_lookup={} fallback_no_block={} fallback_failed_cache={} fallback_cold={} ensure_calls={} ensure_compiled={} ensure_compile_failed={} ensure_cache_hit={} recompiler_cache_hits={} recompiler_failed_cache_hits={} recompiler_blocks_compiled={} recompiler_compile_failures={} recompiler_invalidated_blocks={} block_cache_len={} failed_cache_len={} hot_entries={} hot_threshold={} max_block_insns={} min_block_insns={} native_gas={} chain_limit={}",
             stats.runtime.native_blocks_executed,
             stats.runtime.native_instructions_executed,
             stats.runtime.native_interp_delegated_instructions,
+            stats.runtime.native_gas_exits,
             stats.runtime.fallback_instructions_executed,
             stats.runtime.fallback_early_guard,
             stats.runtime.fallback_guard_after_lookup,
@@ -304,7 +353,9 @@ impl DynarecEngine {
             stats.failed_cache_len,
             stats.hot_entries,
             stats.hot_threshold,
+            stats.max_block_instructions,
             stats.min_native_instructions,
+            stats.native_gas_limit,
             stats.chain_limit
         )
     }
@@ -401,7 +452,7 @@ impl DynarecEngine {
             return false;
         }
 
-        if Self::timer_interrupt_would_fire(cpu, block.instruction_count) {
+        if Self::timer_interrupt_would_fire(cpu, block.max_retired_instructions) {
             return false;
         }
 
@@ -490,7 +541,12 @@ impl DynarecEngine {
         first_block: CompiledBlock,
     ) -> u64 {
         let mut total_retired = 0u64;
-        let mut blocks_left = self.chain_limit.max(1);
+        let gas_limit = u64::from(self.native_gas_limit.max(1));
+        let mut blocks_left = if self.chain_limit == 0 {
+            None
+        } else {
+            Some(self.chain_limit)
+        };
         let mut block = first_block;
 
         loop {
@@ -499,18 +555,26 @@ impl DynarecEngine {
                 break;
             }
             total_retired = total_retired.wrapping_add(retired);
-            blocks_left -= 1;
-            if blocks_left == 0 {
+            if total_retired >= gas_limit {
+                self.runtime.native_gas_exits = self.runtime.native_gas_exits.wrapping_add(1);
+                break;
+            }
+
+            if let Some(left) = blocks_left.as_mut() {
+                *left -= 1;
+                if *left == 0 {
+                    break;
+                }
+            }
+
+            if cpu.in_delay_slot
+                || cpu.next_pc != cpu.pc.wrapping_add(4)
+                || !(0x8000_0000..=0xBFFF_FFFF).contains(&(cpu.pc as u32))
+            {
                 break;
             }
 
             let pc32 = cpu.pc as u32;
-            if cpu.in_delay_slot
-                || cpu.next_pc != cpu.pc.wrapping_add(4)
-                || !(0x8000_0000..=0xBFFF_FFFF).contains(&pc32)
-            {
-                break;
-            }
             let next_phys = pc32 & 0x1FFF_FFFF;
             let Some(next_block) = self.recompiler.lookup(next_phys).copied() else {
                 break;

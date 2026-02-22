@@ -197,6 +197,8 @@ pub struct CompiledBlock {
     pub instruction_count: u32,
     /// Number of instructions in this block delegated via `Op::Interp`.
     pub interp_op_count: u32,
+    /// Maximum number of guest instructions one native entry may retire.
+    pub max_retired_instructions: u32,
     /// True if the block ended on a control-transfer boundary.
     pub has_control_flow: bool,
     /// True when compilation stopped at an unsupported non-branch opcode.
@@ -583,6 +585,10 @@ fn decode_branch(raw: u32) -> Option<BranchTerminator> {
         }),
         _ => None,
     }
+}
+
+fn jump_target_phys(from_phys: u32, target: u32) -> u32 {
+    from_phys.wrapping_add(4) & 0xF000_0000 | (target << 2)
 }
 
 fn decode_supported_non_branch(raw: u32) -> Option<Op> {
@@ -1095,9 +1101,7 @@ fn emit_store_via_fastmem(
     builder.ins().jump(done_block, &[]);
 
     builder.switch_to_block(slow_block);
-    builder
-        .ins()
-        .call(helper, &[callbacks_ptr, vaddr, value64]);
+    builder.ins().call(helper, &[callbacks_ptr, vaddr, value64]);
     builder.ins().jump(done_block, &[]);
 
     builder.switch_to_block(done_block);
@@ -1484,14 +1488,8 @@ fn emit_op(
         Op::Lb { base, rt, imm } => {
             let base_addr = load_gpr(builder, gpr_ptr, base, flags);
             let vaddr = builder.ins().iadd_imm(base_addr, i64::from(imm));
-            let loaded = emit_load_via_fastmem(
-                builder,
-                callbacks_ptr,
-                helpers.load_u8,
-                fastmem,
-                vaddr,
-                1,
-            );
+            let loaded =
+                emit_load_via_fastmem(builder, callbacks_ptr, helpers.load_u8, fastmem, vaddr, 1);
             let loaded8 = builder.ins().ireduce(types::I8, loaded);
             let loaded64 = builder.ins().sextend(types::I64, loaded8);
             store_gpr(builder, gpr_ptr, rt, loaded64, flags);
@@ -1499,14 +1497,8 @@ fn emit_op(
         Op::Lh { base, rt, imm } => {
             let base_addr = load_gpr(builder, gpr_ptr, base, flags);
             let vaddr = builder.ins().iadd_imm(base_addr, i64::from(imm));
-            let loaded = emit_load_via_fastmem(
-                builder,
-                callbacks_ptr,
-                helpers.load_u16,
-                fastmem,
-                vaddr,
-                2,
-            );
+            let loaded =
+                emit_load_via_fastmem(builder, callbacks_ptr, helpers.load_u16, fastmem, vaddr, 2);
             let loaded16 = builder.ins().ireduce(types::I16, loaded);
             let loaded64 = builder.ins().sextend(types::I64, loaded16);
             store_gpr(builder, gpr_ptr, rt, loaded64, flags);
@@ -1514,14 +1506,8 @@ fn emit_op(
         Op::Lhu { base, rt, imm } => {
             let base_addr = load_gpr(builder, gpr_ptr, base, flags);
             let vaddr = builder.ins().iadd_imm(base_addr, i64::from(imm));
-            let loaded = emit_load_via_fastmem(
-                builder,
-                callbacks_ptr,
-                helpers.load_u16,
-                fastmem,
-                vaddr,
-                2,
-            );
+            let loaded =
+                emit_load_via_fastmem(builder, callbacks_ptr, helpers.load_u16, fastmem, vaddr, 2);
             let loaded16 = builder.ins().ireduce(types::I16, loaded);
             let loaded64 = builder.ins().uextend(types::I64, loaded16);
             store_gpr(builder, gpr_ptr, rt, loaded64, flags);
@@ -1529,14 +1515,8 @@ fn emit_op(
         Op::Lw { base, rt, imm } => {
             let base_addr = load_gpr(builder, gpr_ptr, base, flags);
             let vaddr = builder.ins().iadd_imm(base_addr, i64::from(imm));
-            let loaded = emit_load_via_fastmem(
-                builder,
-                callbacks_ptr,
-                helpers.load_u32,
-                fastmem,
-                vaddr,
-                4,
-            );
+            let loaded =
+                emit_load_via_fastmem(builder, callbacks_ptr, helpers.load_u32, fastmem, vaddr, 4);
             let loaded32 = builder.ins().ireduce(types::I32, loaded);
             let loaded64 = builder.ins().sextend(types::I64, loaded32);
             store_gpr(builder, gpr_ptr, rt, loaded64, flags);
@@ -1544,14 +1524,8 @@ fn emit_op(
         Op::Lwu { base, rt, imm } => {
             let base_addr = load_gpr(builder, gpr_ptr, base, flags);
             let vaddr = builder.ins().iadd_imm(base_addr, i64::from(imm));
-            let loaded = emit_load_via_fastmem(
-                builder,
-                callbacks_ptr,
-                helpers.load_u32,
-                fastmem,
-                vaddr,
-                4,
-            );
+            let loaded =
+                emit_load_via_fastmem(builder, callbacks_ptr, helpers.load_u32, fastmem, vaddr, 4);
             let loaded32 = builder.ins().ireduce(types::I32, loaded);
             let loaded64 = builder.ins().uextend(types::I64, loaded32);
             store_gpr(builder, gpr_ptr, rt, loaded64, flags);
@@ -1559,27 +1533,15 @@ fn emit_op(
         Op::Ld { base, rt, imm } => {
             let base_addr = load_gpr(builder, gpr_ptr, base, flags);
             let vaddr = builder.ins().iadd_imm(base_addr, i64::from(imm));
-            let loaded64 = emit_load_via_fastmem(
-                builder,
-                callbacks_ptr,
-                helpers.load_u64,
-                fastmem,
-                vaddr,
-                8,
-            );
+            let loaded64 =
+                emit_load_via_fastmem(builder, callbacks_ptr, helpers.load_u64, fastmem, vaddr, 8);
             store_gpr(builder, gpr_ptr, rt, loaded64, flags);
         }
         Op::Lbu { base, rt, imm } => {
             let base_addr = load_gpr(builder, gpr_ptr, base, flags);
             let vaddr = builder.ins().iadd_imm(base_addr, i64::from(imm));
-            let loaded = emit_load_via_fastmem(
-                builder,
-                callbacks_ptr,
-                helpers.load_u8,
-                fastmem,
-                vaddr,
-                1,
-            );
+            let loaded =
+                emit_load_via_fastmem(builder, callbacks_ptr, helpers.load_u8, fastmem, vaddr, 1);
             let loaded8 = builder.ins().ireduce(types::I8, loaded);
             let loaded64 = builder.ins().uextend(types::I64, loaded8);
             store_gpr(builder, gpr_ptr, rt, loaded64, flags);
@@ -1649,14 +1611,8 @@ fn emit_op(
         Op::Lwc1 { base, ft, imm } => {
             let base_addr = load_gpr(builder, gpr_ptr, base, flags);
             let vaddr = builder.ins().iadd_imm(base_addr, i64::from(imm));
-            let loaded = emit_load_via_fastmem(
-                builder,
-                callbacks_ptr,
-                helpers.load_u32,
-                fastmem,
-                vaddr,
-                4,
-            );
+            let loaded =
+                emit_load_via_fastmem(builder, callbacks_ptr, helpers.load_u32, fastmem, vaddr, 4);
             let bits32 = builder.ins().ireduce(types::I32, loaded);
             store_fpr_word(builder, fpr_ptr, ft, bits32, flags);
         }
@@ -1678,14 +1634,8 @@ fn emit_op(
         Op::Ldc1 { base, ft, imm } => {
             let base_addr = load_gpr(builder, gpr_ptr, base, flags);
             let vaddr = builder.ins().iadd_imm(base_addr, i64::from(imm));
-            let loaded = emit_load_via_fastmem(
-                builder,
-                callbacks_ptr,
-                helpers.load_u64,
-                fastmem,
-                vaddr,
-                8,
-            );
+            let loaded =
+                emit_load_via_fastmem(builder, callbacks_ptr, helpers.load_u64, fastmem, vaddr, 8);
             store_fpr_double_bits(builder, fpr_ptr, ft, loaded, flags);
         }
         Op::Sdc1 { base, ft, imm } => {
@@ -1846,8 +1796,19 @@ pub struct CraneliftCompiler {
 
 impl Default for CraneliftCompiler {
     fn default() -> Self {
+        fn parse_env_bool(name: &str, default: bool) -> bool {
+            match std::env::var(name) {
+                Ok(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+                    "1" | "on" | "true" | "yes" => true,
+                    "0" | "off" | "false" | "no" => false,
+                    _ => default,
+                },
+                Err(_) => default,
+            }
+        }
+
         let env_level = std::env::var("N64_CRANELIFT_OPT_LEVEL")
-            .unwrap_or_else(|_| "speed".to_string())
+            .unwrap_or_else(|_| "none".to_string())
             .to_ascii_lowercase();
         let opt_level = match env_level.as_str() {
             "none" => "none",
@@ -1855,18 +1816,23 @@ impl Default for CraneliftCompiler {
             "speed" => "speed",
             other => {
                 log::warn!(
-                    "Unknown N64_CRANELIFT_OPT_LEVEL={:?}; using \"speed\"",
+                    "Unknown N64_CRANELIFT_OPT_LEVEL={:?}; using \"none\"",
                     other
                 );
-                "speed"
+                "none"
             }
         };
+        let verify_ir = parse_env_bool("N64_CRANELIFT_VERIFY", false);
 
         let mut flag_builder = settings::builder();
         // Tweakable via N64_CRANELIFT_OPT_LEVEL for benchmarking and tuning.
         flag_builder
             .set("opt_level", opt_level)
             .expect("set cranelift opt_level");
+        // Useful for debugging backend issues; disabled by default for JIT throughput.
+        flag_builder
+            .set("enable_verifier", if verify_ir { "true" } else { "false" })
+            .expect("set cranelift verifier");
         let flags = settings::Flags::new(flag_builder);
 
         let isa_builder = cranelift_native::builder().expect("create host ISA builder");
@@ -1882,7 +1848,10 @@ impl Default for CraneliftCompiler {
         jit_builder.symbol("n64_jit_store_u64", n64_jit_store_u64 as *const u8);
         jit_builder.symbol("n64_jit_cop0_read", n64_jit_cop0_read as *const u8);
         jit_builder.symbol("n64_jit_cop0_write", n64_jit_cop0_write as *const u8);
-        jit_builder.symbol("n64_jit_cop1_condition", n64_jit_cop1_condition as *const u8);
+        jit_builder.symbol(
+            "n64_jit_cop1_condition",
+            n64_jit_cop1_condition as *const u8,
+        );
         jit_builder.symbol("n64_jit_interp_exec", n64_jit_interp_exec as *const u8);
         jit_builder.symbol("n64_jit_hi_read", n64_jit_hi_read as *const u8);
         jit_builder.symbol("n64_jit_hi_write", n64_jit_hi_write as *const u8);
@@ -2065,6 +2034,13 @@ impl BlockCompiler for CraneliftCompiler {
                         | BranchTerminator::Bc1fl { .. }
                         | BranchTerminator::Bc1tl { .. }
                 );
+                let follow_unconditional_target = match branch {
+                    BranchTerminator::J { target } | BranchTerminator::Jal { target } => {
+                        let target_phys = jump_target_phys(phys, target);
+                        (target_phys != phys).then_some(target_phys)
+                    }
+                    _ => None,
+                };
                 steps.push(TraceStep::Branch {
                     phys,
                     branch,
@@ -2073,10 +2049,18 @@ impl BlockCompiler for CraneliftCompiler {
                 });
                 has_control_flow = true;
                 decoded_count += 2;
-                phys = phys.wrapping_add(8);
                 if !continue_fallthrough {
+                    if let Some(target_phys) = follow_unconditional_target {
+                        let already_seen =
+                            steps.iter().copied().any(|step| step.phys() == target_phys);
+                        if !already_seen {
+                            phys = target_phys;
+                            continue;
+                        }
+                    }
                     break;
                 }
+                phys = phys.wrapping_add(8);
                 continue;
             }
 
@@ -2255,6 +2239,10 @@ impl BlockCompiler for CraneliftCompiler {
                 b
             })
             .collect();
+        let retire_limit_value = request.max_instructions.max(1).min(i32::MAX as u32);
+        let retire_limit = builder
+            .ins()
+            .iconst(types::I32, i64::from(retire_limit_value));
 
         let zero_retired = builder.ins().iconst(types::I32, 0);
         let args = [zero_retired.into()];
@@ -2267,6 +2255,21 @@ impl BlockCompiler for CraneliftCompiler {
             let step_phys = step.phys();
             let step_delta = i64::from(step_phys.wrapping_sub(request.start_phys));
             let current_pc = builder.ins().iadd_imm(start_pc, step_delta);
+            let reached_budget = builder.ins().icmp(
+                IntCC::UnsignedGreaterThanOrEqual,
+                retired_count,
+                retire_limit,
+            );
+            let execute_step_block = builder.create_block();
+            let exit_args = [current_pc.into(), retired_count.into()];
+            builder.ins().brif(
+                reached_budget,
+                exit_block,
+                &exit_args,
+                execute_step_block,
+                &[],
+            );
+            builder.switch_to_block(execute_step_block);
 
             match step {
                 TraceStep::Op { op, .. } => {
@@ -2307,9 +2310,11 @@ impl BlockCompiler for CraneliftCompiler {
 
                     match branch {
                         BranchTerminator::J { target } => {
-                            let upper = iconst_u64(&mut builder, 0xFFFF_FFFF_F000_0000);
-                            let upper_pc = builder.ins().band(current_pc, upper);
-                            let low = iconst_u64(&mut builder, u64::from(target) << 2);
+                            let target_phys = jump_target_phys(phys, target);
+                            let target_block = phys_to_index
+                                .get(&target_phys)
+                                .copied()
+                                .map(|idx| step_blocks[idx]);
                             emit_op(
                                 &mut builder,
                                 gpr_ptr,
@@ -2321,15 +2326,25 @@ impl BlockCompiler for CraneliftCompiler {
                                 next_of_branch,
                                 delay_op,
                             );
-                            let target_pc = builder.ins().bor(upper_pc, low);
                             let retired_after = builder.ins().iadd_imm(retired_count, 2);
-                            let args = [target_pc.into(), retired_after.into()];
-                            builder.ins().jump(exit_block, &args);
+                            if let Some(target) = target_block {
+                                let args = [retired_after.into()];
+                                builder.ins().jump(target, &args);
+                            } else {
+                                let upper = iconst_u64(&mut builder, 0xFFFF_FFFF_F000_0000);
+                                let upper_pc = builder.ins().band(current_pc, upper);
+                                let low = iconst_u64(&mut builder, u64::from(target) << 2);
+                                let target_pc = builder.ins().bor(upper_pc, low);
+                                let args = [target_pc.into(), retired_after.into()];
+                                builder.ins().jump(exit_block, &args);
+                            }
                         }
                         BranchTerminator::Jal { target } => {
-                            let upper = iconst_u64(&mut builder, 0xFFFF_FFFF_F000_0000);
-                            let upper_pc = builder.ins().band(current_pc, upper);
-                            let low = iconst_u64(&mut builder, u64::from(target) << 2);
+                            let target_phys = jump_target_phys(phys, target);
+                            let target_block = phys_to_index
+                                .get(&target_phys)
+                                .copied()
+                                .map(|idx| step_blocks[idx]);
                             let link = builder.ins().iadd_imm(current_pc, 8);
                             store_gpr(&mut builder, gpr_ptr, 31, link, flags);
                             emit_op(
@@ -2343,10 +2358,18 @@ impl BlockCompiler for CraneliftCompiler {
                                 next_of_branch,
                                 delay_op,
                             );
-                            let target_pc = builder.ins().bor(upper_pc, low);
                             let retired_after = builder.ins().iadd_imm(retired_count, 2);
-                            let args = [target_pc.into(), retired_after.into()];
-                            builder.ins().jump(exit_block, &args);
+                            if let Some(target) = target_block {
+                                let args = [retired_after.into()];
+                                builder.ins().jump(target, &args);
+                            } else {
+                                let upper = iconst_u64(&mut builder, 0xFFFF_FFFF_F000_0000);
+                                let upper_pc = builder.ins().band(current_pc, upper);
+                                let low = iconst_u64(&mut builder, u64::from(target) << 2);
+                                let target_pc = builder.ins().bor(upper_pc, low);
+                                let args = [target_pc.into(), retired_after.into()];
+                                builder.ins().jump(exit_block, &args);
+                            }
                         }
                         BranchTerminator::Jr { rs } => {
                             emit_op(
@@ -2406,7 +2429,6 @@ impl BlockCompiler for CraneliftCompiler {
                             let taken_block = phys_to_index
                                 .get(&target_phys)
                                 .copied()
-                                .filter(|idx| *idx > step_idx)
                                 .map(|idx| step_blocks[idx]);
                             let is_likely = matches!(
                                 branch,
@@ -2538,7 +2560,6 @@ impl BlockCompiler for CraneliftCompiler {
                             let taken_block = phys_to_index
                                 .get(&target_phys)
                                 .copied()
-                                .filter(|idx| *idx > step_idx)
                                 .map(|idx| step_blocks[idx]);
                             let is_likely = matches!(
                                 branch,
@@ -2641,11 +2662,7 @@ impl BlockCompiler for CraneliftCompiler {
                                         let targs = [taken_pc.into(), retired_after.into()];
                                         let fargs = [fallthrough_pc.into(), retired_after.into()];
                                         builder.ins().brif(
-                                            cond_taken,
-                                            exit_block,
-                                            &targs,
-                                            exit_block,
-                                            &fargs,
+                                            cond_taken, exit_block, &targs, exit_block, &fargs,
                                         );
                                     }
                                 }
@@ -2685,7 +2702,6 @@ impl BlockCompiler for CraneliftCompiler {
                             let taken_block = phys_to_index
                                 .get(&target_phys)
                                 .copied()
-                                .filter(|idx| *idx > step_idx)
                                 .map(|idx| step_blocks[idx]);
                             let is_likely = matches!(
                                 branch,
@@ -2848,6 +2864,7 @@ impl BlockCompiler for CraneliftCompiler {
                 .wrapping_add(instruction_count.saturating_mul(4)),
             instruction_count,
             interp_op_count,
+            max_retired_instructions: request.max_instructions.max(1),
             has_control_flow,
             ended_on_unsupported,
             entry,
@@ -3284,9 +3301,9 @@ mod tests {
     fn compiled_block_executes_bc1fl_not_taken_skips_delay_slot() {
         let start = 0x2380u32;
         let mut src = TestSource::with_words(&[
-            (start, 0x4502_0001),      // bc1fl +1 (not taken when condition=true)
-            (start + 4, 0x2408_0005),  // addiu t0, r0, 5 (delay slot, skipped)
-            (start + 8, 0x2409_0007),  // addiu t1, r0, 7
+            (start, 0x4502_0001),     // bc1fl +1 (not taken when condition=true)
+            (start + 4, 0x2408_0005), // addiu t0, r0, 5 (delay slot, skipped)
+            (start + 8, 0x2409_0007), // addiu t1, r0, 7
         ]);
 
         let mut compiler = CraneliftCompiler::default();
@@ -3384,6 +3401,79 @@ mod tests {
     }
 
     #[test]
+    fn compiled_block_traces_through_direct_jump_target() {
+        let start = 0x2800u32;
+        let mut src = TestSource::with_words(&[
+            (start, 0x0800_0A04),      // j 0x2810
+            (start + 4, 0x2408_0005),  // addiu t0, r0, 5 (delay slot)
+            (start + 16, 0x2409_0007), // addiu t1, r0, 7 (jump target)
+            (start + 20, 0x4200_0018), // eret (sentinel: unsupported)
+        ]);
+
+        let mut compiler = CraneliftCompiler::default();
+        let block = compiler
+            .compile(
+                &CompileRequest {
+                    start_phys: start,
+                    max_instructions: 8,
+                },
+                &mut src,
+            )
+            .expect("compile");
+
+        let mut gpr = [0u64; 32];
+        let mut fpr = [0u64; 32];
+        let mut callbacks = default_callbacks();
+        let start_pc = 0xFFFF_FFFF_8000_2800u64;
+        let exec = block.execute(&mut gpr, &mut fpr, start_pc, &mut callbacks);
+
+        assert!(block.has_control_flow);
+        assert_eq!(block.instruction_count, 3);
+        assert_eq!(gpr[8], 5);
+        assert_eq!(gpr[9], 7);
+        assert_eq!(exec.next_pc, start_pc + 20);
+        assert_eq!(exec.retired_instructions, 3);
+    }
+
+    #[test]
+    fn compiled_block_traces_through_jal_target_and_return() {
+        let start = 0x2840u32;
+        let mut src = TestSource::with_words(&[
+            (start, 0x0C00_0A14),      // jal 0x2850
+            (start + 4, 0x2408_0005),  // addiu t0, r0, 5 (delay slot)
+            (start + 16, 0x2409_0007), // addiu t1, r0, 7 (jal target)
+            (start + 20, 0x03E0_0008), // jr ra
+            (start + 24, 0x240A_0009), // addiu t2, r0, 9 (delay slot)
+        ]);
+
+        let mut compiler = CraneliftCompiler::default();
+        let block = compiler
+            .compile(
+                &CompileRequest {
+                    start_phys: start,
+                    max_instructions: 16,
+                },
+                &mut src,
+            )
+            .expect("compile");
+
+        let mut gpr = [0u64; 32];
+        let mut fpr = [0u64; 32];
+        let mut callbacks = default_callbacks();
+        let start_pc = 0xFFFF_FFFF_8000_2840u64;
+        let exec = block.execute(&mut gpr, &mut fpr, start_pc, &mut callbacks);
+
+        assert!(block.has_control_flow);
+        assert_eq!(block.instruction_count, 5);
+        assert_eq!(gpr[31], start_pc + 8);
+        assert_eq!(gpr[8], 5);
+        assert_eq!(gpr[9], 7);
+        assert_eq!(gpr[10], 9);
+        assert_eq!(exec.next_pc, start_pc + 8);
+        assert_eq!(exec.retired_instructions, 5);
+    }
+
+    #[test]
     fn compiled_block_executes_hilo_mul_div_sequence() {
         let start = 0x24C0u32;
         let mut src = TestSource::with_words(&[
@@ -3478,9 +3568,9 @@ mod tests {
     fn compiled_block_uses_fastmem_for_integer_load_store() {
         let start = 0x2580u32;
         let mut src = TestSource::with_words(&[
-            (start, 0x3C0C_8000),     // lui t4, 0x8000
-            (start + 4, 0x8D88_0000), // lw t0, 0(t4)
-            (start + 8, 0xA188_0007), // sb t0, 7(t4)
+            (start, 0x3C0C_8000),      // lui t4, 0x8000
+            (start + 4, 0x8D88_0000),  // lw t0, 0(t4)
+            (start + 8, 0xA188_0007),  // sb t0, 7(t4)
             (start + 12, 0x9189_0007), // lbu t1, 7(t4)
         ]);
 
@@ -3557,11 +3647,20 @@ mod tests {
 
         assert_eq!(exec.next_pc, start_pc + 28);
         assert_eq!(exec.retired_instructions, 7);
-        assert_eq!(u32::from_be_bytes([fastmem[8], fastmem[9], fastmem[10], fastmem[11]]), 0x4070_0000);
+        assert_eq!(
+            u32::from_be_bytes([fastmem[8], fastmem[9], fastmem[10], fastmem[11]]),
+            0x4070_0000
+        );
         assert_eq!(
             u64::from_be_bytes([
-                fastmem[24], fastmem[25], fastmem[26], fastmem[27], fastmem[28], fastmem[29],
-                fastmem[30], fastmem[31]
+                fastmem[24],
+                fastmem[25],
+                fastmem[26],
+                fastmem[27],
+                fastmem[28],
+                fastmem[29],
+                fastmem[30],
+                fastmem[31]
             ]),
             0x1122_3344_5566_7788
         );

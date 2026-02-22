@@ -126,7 +126,7 @@ impl Engine {
 
     #[cfg(all(test, feature = "dynarec"))]
     pub(crate) fn dynarec_for_tests() -> Self {
-        Self::Dynarec(dynarec::DynarecEngine::new_cranelift())
+        Self::Dynarec(dynarec::DynarecEngine::new_cranelift_for_tests())
     }
 }
 
@@ -375,5 +375,58 @@ mod tests {
 
         assert_cpu_equal(&cpu_interp, &cpu_dynarec);
         assert_eq!(cpu_dynarec.gpr[2], 7); // v0 should see delay-slot value path
+    }
+
+    #[cfg(feature = "dynarec")]
+    #[test]
+    fn dynarec_matches_interpreter_on_backward_branch_loop() {
+        let program = [
+            0x3C0C_8000, // lui t4, 0x8000
+            0x2408_0000, // addiu t0, r0, 0
+            0x2409_0008, // addiu t1, r0, 8
+            0x240A_0000, // addiu t2, r0, 0
+            0x2508_0001, // addiu t0, t0, 1
+            0x0148_5021, // addu t2, t2, t0
+            0x1509_FFFD, // bne t0, t1, -3
+            0xAD88_0100, // sw t0, 0x100(t4) (delay slot)
+            0xAD8A_0104, // sw t2, 0x104(t4)
+            0x8D8B_0100, // lw t3, 0x100(t4)
+            0x8D8D_0104, // lw t5, 0x104(t4)
+            0x3562_0000, // ori v0, t3, 0
+            0x35A3_0000, // ori v1, t5, 0
+            0x4200_0018, // eret (sentinel: unsupported by dynarec)
+        ];
+
+        let mut bus_interp = TestBus::new(0x3000);
+        bus_interp.load_program(0, &program);
+        let mut bus_dynarec = TestBus::new(0x3000);
+        bus_dynarec.load_program(0, &program);
+
+        let mut cpu_interp = init_cpu();
+        let mut cpu_dynarec = init_cpu();
+        let mut interpreter_engine = Engine::Interpreter(Interpreter);
+        let mut dynarec_engine = Engine::dynarec_for_tests();
+
+        let end_pc = init_cpu().pc + 13 * 4;
+        run_until_pc(
+            &mut interpreter_engine,
+            &mut cpu_interp,
+            &mut bus_interp,
+            end_pc,
+            256,
+        );
+        run_until_pc(
+            &mut dynarec_engine,
+            &mut cpu_dynarec,
+            &mut bus_dynarec,
+            end_pc,
+            256,
+        );
+
+        assert_cpu_equal(&cpu_interp, &cpu_dynarec);
+        assert_eq!(cpu_dynarec.gpr[2], 8); // v0: final loop counter
+        assert_eq!(cpu_dynarec.gpr[3], 36); // v1: sum 1..8
+        assert_eq!(bus_dynarec.read_u32(0x100), 8);
+        assert_eq!(bus_dynarec.read_u32(0x104), 36);
     }
 }
