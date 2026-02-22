@@ -6,6 +6,7 @@ These rules are mandatory for AI agents working in this repo.
 - Keep diffs tightly scoped to the user request.
 - Do not modify unrelated files.
 - Before committing, verify changed paths match intended work.
+- For hard-to-reproduce bugs or perf issues, explicitly ask for a record/replay capture when available.
 
 ## Formatting policy
 - Run `cargo fmt` before every commit.
