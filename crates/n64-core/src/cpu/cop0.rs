@@ -45,6 +45,7 @@ impl Cop0 {
     }
 
     /// Read a COP0 register (MFC0)
+    #[inline(always)]
     pub fn read_reg(&self, index: usize) -> u64 {
         self.regs[index & 0x1F]
     }
@@ -127,11 +128,13 @@ impl Cop0 {
     }
 
     /// Set IP2 in Cause (external RCP interrupt from MI)
+    #[inline(always)]
     pub fn set_ip2(&mut self) {
         self.regs[Self::CAUSE] |= 1 << 10;
     }
 
     /// Clear IP2 in Cause
+    #[inline(always)]
     pub fn clear_ip2(&mut self) {
         self.regs[Self::CAUSE] &= !(1 << 10);
     }
