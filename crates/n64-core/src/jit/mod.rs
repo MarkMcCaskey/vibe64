@@ -22,12 +22,29 @@ pub trait ExecutionEngine {
 }
 
 /// The interpreter — our initial ExecutionEngine.
+///
+/// Batches multiple instructions per `execute()` call to amortize the
+/// per-step overhead from `tick_peripherals_and_invalidate` in the outer
+/// frame loop. The batch is capped at the next external interrupt event
+/// (same mechanism the dynarec uses) so peripheral timing stays correct.
 #[derive(Default)]
 pub struct Interpreter;
 
+/// Maximum instructions the interpreter will batch per `execute()` call.
+const INTERP_BATCH_MAX: u64 = 64;
+
 impl ExecutionEngine for Interpreter {
     fn execute(&mut self, cpu: &mut Vr4300, bus: &mut impl Bus) -> u64 {
-        cpu.step(bus)
+        let event_budget = bus
+            .cycles_until_next_interrupt_event()
+            .unwrap_or(INTERP_BATCH_MAX);
+        let limit = event_budget.min(INTERP_BATCH_MAX).max(1);
+
+        let mut retired = 0u64;
+        for _ in 0..limit {
+            retired += cpu.step(bus);
+        }
+        retired
     }
 
     fn invalidate_range(&mut self, _start: u32, _len: u32) {
@@ -142,6 +159,10 @@ mod tests {
     struct TestBus {
         mem: Vec<u8>,
         invalidations: Vec<(u32, u32)>,
+        /// Controls interpreter batch size via cycles_until_next_interrupt_event.
+        /// Some(1) = single-step (preserves pre-batching test semantics).
+        /// None = allow full batching.
+        event_budget: Option<u64>,
     }
 
     impl TestBus {
@@ -149,6 +170,7 @@ mod tests {
             Self {
                 mem: vec![0; size],
                 invalidations: Vec::new(),
+                event_budget: Some(1), // default: single-step for backward compat
             }
         }
 
@@ -225,6 +247,10 @@ mod tests {
         fn pending_interrupts(&self) -> bool {
             false
         }
+
+        fn cycles_until_next_interrupt_event(&self) -> Option<u64> {
+            self.event_budget
+        }
     }
 
     fn init_cpu() -> Vr4300 {
@@ -254,7 +280,6 @@ mod tests {
         assert_eq!(cpu.pc, end_pc, "engine did not reach target pc");
     }
 
-    #[cfg(feature = "dynarec")]
     fn assert_cpu_equal(a: &Vr4300, b: &Vr4300) {
         assert_eq!(a.gpr, b.gpr);
         assert_eq!(a.pc, b.pc);
@@ -446,6 +471,106 @@ mod tests {
         assert_eq!(cpu_dynarec.gpr[3], 36); // v1: sum 1..8
         assert_eq!(bus_dynarec.read_u32(0x100), 8);
         assert_eq!(bus_dynarec.read_u32(0x104), 36);
+    }
+
+    /// Run a program using single-step (cpu.step directly) and batched interpreter,
+    /// verify identical CPU state. This catches any correctness regressions from batching.
+    #[test]
+    fn interpreter_batch_matches_single_step() {
+        // A non-trivial program with branches, loads, stores, and ALU ops
+        let program = [
+            0x3C0C_8000u32, // lui t4, 0x8000
+            0x2408_0000,    // addiu t0, r0, 0
+            0x2409_000A,    // addiu t1, r0, 10
+            0x240A_0000,    // addiu t2, r0, 0
+            // loop:
+            0x2508_0001, // addiu t0, t0, 1
+            0x0148_5021, // addu t2, t2, t0
+            0x1509_FFFD, // bne t0, t1, -3 (back to loop)
+            0xAD88_0100, // sw t0, 0x100(t4) (delay slot)
+            // after loop:
+            0xAD8A_0104, // sw t2, 0x104(t4)
+            0x8D8B_0100, // lw t3, 0x100(t4)
+            0x8D8D_0104, // lw t5, 0x104(t4)
+            0x3562_0000, // ori v0, t3, 0
+            0x35A3_0000, // ori v1, t5, 0
+        ];
+        let total_steps = 4 + 10 * 4 + 5; // setup + loop iterations * body + post-loop
+
+        // Run with batched interpreter first (event_budget=None allows full batching)
+        let mut bus_batch = TestBus::new(0x3000);
+        bus_batch.load_program(0, &program);
+        bus_batch.event_budget = None; // enable batching
+        let mut cpu_batch = init_cpu();
+        let mut interp_batch = Interpreter;
+        let mut retired = 0u64;
+        while retired < total_steps as u64 {
+            retired += interp_batch.execute(&mut cpu_batch, &mut bus_batch);
+        }
+
+        // Run single-step for exactly the same number of instructions
+        let mut bus_single = TestBus::new(0x3000);
+        bus_single.load_program(0, &program);
+        let mut cpu_single = init_cpu();
+        for _ in 0..retired {
+            cpu_single.step(&mut bus_single);
+        }
+
+        // CPU state must match exactly
+        assert_cpu_equal(&cpu_single, &cpu_batch);
+        // Also verify memory writes match
+        assert_eq!(
+            bus_single.read_u32(0x100),
+            bus_batch.read_u32(0x100),
+            "memory at 0x100 differs"
+        );
+        assert_eq!(
+            bus_single.read_u32(0x104),
+            bus_batch.read_u32(0x104),
+            "memory at 0x104 differs"
+        );
+    }
+
+    /// Verify that Count/Compare timer interrupt fires correctly during batched execution.
+    /// This exercises the COP0 timer path that runs inside each step().
+    #[test]
+    fn interpreter_batch_handles_count_compare_interrupt() {
+        // Program: set Compare to current Count + small delta, then spin.
+        // When Count hits Compare, IP7 should be set in Cause.
+        //
+        // MFC0 t0, Count     -- read current Count
+        // ADDIU t0, t0, 20   -- set target = Count + 20
+        // MTC0 t0, Compare   -- write Compare
+        // NOP * 40            -- spin past the Compare match
+        // MFC0 t1, Cause     -- read Cause to check IP7
+        let mut program = vec![
+            0x4008_4800u32, // mfc0 t0, Count (COP0 reg 9)
+            0x2508_0014,    // addiu t0, t0, 20
+            0x4088_5800,    // mtc0 t0, Compare (COP0 reg 11)
+        ];
+        // 40 NOPs to spin past the timer
+        for _ in 0..40 {
+            program.push(0x0000_0000); // nop
+        }
+        // MFC0 t1, Cause (COP0 reg 13)
+        program.push(0x4009_6800);
+
+        let mut bus = TestBus::new(0x2000);
+        bus.load_program(0, &program);
+        bus.event_budget = None; // enable batching to test timer within batch
+
+        let mut cpu = init_cpu();
+        let mut interpreter = Interpreter;
+        // Execute enough steps to run through the program
+        let mut retired = 0u64;
+        while retired < program.len() as u64 {
+            retired += interpreter.execute(&mut cpu, &mut bus);
+        }
+
+        // IP7 (bit 15 of Cause) should be set since Count passed Compare
+        let cause = cpu.cop0.regs[crate::cpu::cop0::Cop0::CAUSE] as u32;
+        let ip7 = (cause >> 15) & 1;
+        assert_eq!(ip7, 1, "IP7 should be set after Count reached Compare");
     }
 
     #[cfg(feature = "dynarec")]
