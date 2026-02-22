@@ -555,7 +555,7 @@ fn main() {
         } else {
             set_env_default("N64_DYNAREC", "1");
             set_env_default("N64_DYNAREC_TIER1_MAX_BLOCK_INSNS", "32");
-            set_env_default("N64_DYNAREC_PROMOTE_THRESHOLD", "8");
+            set_env_default("N64_DYNAREC_PROMOTE_THRESHOLD", "16");
             set_env_default("N64_DYNAREC_ASYNC_PROMOTE", "1");
         }
     }

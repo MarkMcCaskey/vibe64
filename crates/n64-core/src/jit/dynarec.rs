@@ -558,7 +558,7 @@ impl DynarecEngine {
                 .min(max_block_instructions)
                 .max(1);
         let promote_hot_threshold =
-            Self::parse_env_u16_allow_zero("N64_DYNAREC_PROMOTE_THRESHOLD", 8);
+            Self::parse_env_u16_allow_zero("N64_DYNAREC_PROMOTE_THRESHOLD", 16);
         let async_promote_enabled =
             Self::parse_env_bool("N64_DYNAREC_ASYNC_PROMOTE", true) && promote_hot_threshold > 0;
         let async_snapshot_instructions =
