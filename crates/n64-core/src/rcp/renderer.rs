@@ -391,8 +391,8 @@ impl Renderer {
 
     /// G_LOADBLOCK: Copy texture data from RDRAM to TMEM as a contiguous block.
     pub fn cmd_load_block(&mut self, w0: u32, w1: u32, rdram: &[u8]) {
-        let _sl = (w0 >> 12) & 0xFFF;
-        let _tl = w0 & 0xFFF;
+        let sl = (w0 >> 12) & 0xFFF;
+        let tl = w0 & 0xFFF;
         let tile_idx = ((w1 >> 24) & 0x7) as usize;
         let texels = ((w1 >> 12) & 0xFFF) + 1; // number of texels
         let dxt = w1 & 0xFFF;
@@ -414,7 +414,24 @@ impl Renderer {
             texels as usize * bytes_per_texel
         };
 
-        let src = self.texture_image_addr as usize;
+        // LOADBLOCK can start from a sub-texel origin in the source image.
+        // sl/tl are 10.2 fixed-point texture coordinates.
+        let sl_i = (sl >> 2) as usize;
+        let tl_i = (tl >> 2) as usize;
+        let src_pitch_texels = self.texture_image_width as usize;
+        let src_bpp = match self.texture_image_size {
+            0 => 1, // 4bpp (handled as packed nibbles)
+            1 => 1,
+            2 => 2,
+            3 => 4,
+            _ => 1,
+        };
+        let src = self.texture_image_addr as usize
+            + if self.texture_image_size == 0 {
+                (tl_i * src_pitch_texels + sl_i) >> 1
+            } else {
+                (tl_i * src_pitch_texels + sl_i) * src_bpp
+            };
         let copy_len = byte_count.min(4096 - tmem_offset).min(rdram.len().saturating_sub(src));
 
         if dxt == 0 {
@@ -874,8 +891,10 @@ impl Renderer {
 
     /// Wrap/clamp a texture coordinate.
     fn wrap_coord(&self, coord: i32, mask: u8, cm: u8, span: i32) -> i32 {
-        let clamp = cm & 1 != 0;
-        let mirror = cm & 2 != 0;
+        // Tile CM bits follow G_TX_* encoding:
+        // bit0 = MIRROR, bit1 = CLAMP.
+        let mirror = cm & 1 != 0;
+        let clamp = cm & 2 != 0;
 
         if mask == 0 {
             return coord.clamp(0, span - 1);
@@ -1709,7 +1728,20 @@ impl Renderer {
                 let mut z_offset = 0usize;
                 let mut z_value = 0u16;
                 if z_enabled {
-                    let z = (w0 * v0.z + w1 * v1.z + w2 * v2.z).clamp(0.0, 0xFFFF as f32) as u16;
+                    // Perspective-correct depth interpolation. Linear interpolation
+                    // of post-divide Z causes camera-angle dependent overlap errors.
+                    let inv_w = w0 * v0.w + w1 * v1.w + w2 * v2.w;
+                    let zf = if inv_w.abs() > 1e-10 {
+                        let z_over_w = w0 * v0.clip_z * v0.w
+                            + w1 * v1.clip_z * v1.w
+                            + w2 * v2.clip_z * v2.w;
+                        let z_ndc = z_over_w / inv_w;
+                        z_ndc * self.viewport_scale[2] + self.viewport_trans[2]
+                    } else {
+                        // Degenerate fallback (avoid NaN/Inf on bad triangles).
+                        w0 * v0.z + w1 * v1.z + w2 * v2.z
+                    };
+                    let z = zf.clamp(0.0, 0xFFFF as f32).round() as u16;
                     z_offset = z_addr + ((y * width + x) as usize) * 2;
                     z_value = z;
                     if z_offset + 1 < rdram.len() {
