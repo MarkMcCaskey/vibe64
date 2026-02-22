@@ -479,6 +479,31 @@ fn main() {
         }
     };
 
+    // Optional startup savestate load for headless benchmarking and fast
+    // repros in realistic gameplay scenes.
+    let load_state_slot = std::env::var("N64_LOAD_STATE_SLOT")
+        .ok()
+        .or_else(|| std::env::var("N64_BENCH_STATE_SLOT").ok())
+        .and_then(|raw| raw.parse::<u8>().ok());
+    if let Some(slot) = load_state_slot {
+        if slot > 9 {
+            eprintln!(
+                "Invalid savestate slot {} (expected 0..=9 via N64_LOAD_STATE_SLOT/N64_BENCH_STATE_SLOT)",
+                slot
+            );
+            std::process::exit(1);
+        }
+        match n64.load_state(slot) {
+            Ok(()) => {
+                eprintln!("Loaded savestate slot {}", slot);
+            }
+            Err(e) => {
+                eprintln!("Failed to load savestate slot {}: {}", slot, e);
+                std::process::exit(1);
+            }
+        }
+    }
+
     if use_diag {
         let total_steps = std::env::var("N64_DIAG_STEPS")
             .ok()
