@@ -8,17 +8,16 @@ These rules are mandatory for AI agents working in this repo.
 - Before committing, verify changed paths match intended work.
 
 ## Formatting policy
-- Do not run repo-wide `cargo fmt` unless explicitly requested.
-- Do not make formatting-only commits.
-- If formatting is needed, format only files you intentionally changed.
-- If a formatter touched unrelated files, revert those files immediately.
+- Run `cargo fmt` before every commit.
+- Use standard Rust formatting as-is; do not hand-format against `rustfmt`.
+- If formatting-only changes are present, that is acceptable when they come from `cargo fmt`.
 
 ## Commit hygiene
 - Prefer small, focused commits with clear purpose.
-- Never mix behavior changes with broad style churn.
 - If there are unrelated local changes, leave them untouched unless asked.
 
 ## Pre-commit checklist
-- `git status --short` shows only intended files.
+- `cargo fmt` has been run successfully.
+- `git status --short` shows intended files (plus any `cargo fmt` output).
 - Tests run for the modified area (or explain why not run).
-- Diff contains behavioral intent, not style-only noise.
+- Diff is reviewed before commit.
