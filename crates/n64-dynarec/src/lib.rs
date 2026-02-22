@@ -297,12 +297,37 @@ pub struct RecompilerStats {
     pub invalidated_blocks: u64,
 }
 
+const INVALIDATION_PAGE_SHIFT: u32 = 12;
+
+fn page_of(addr: u32) -> u32 {
+    addr >> INVALIDATION_PAGE_SHIFT
+}
+
+fn page_span_from_start_len(start: u32, len: u32) -> (u32, u32) {
+    let end_inclusive = start.saturating_add(len.saturating_sub(1));
+    (page_of(start), page_of(end_inclusive))
+}
+
+fn page_span_for_block(block: &CompiledBlock) -> (u32, u32) {
+    // end_phys is exclusive. If malformed/wrapped, conservatively index only
+    // the start page.
+    if block.end_phys > block.start_phys {
+        let end_inclusive = block.end_phys - 1;
+        (page_of(block.start_phys), page_of(end_inclusive))
+    } else {
+        let page = page_of(block.start_phys);
+        (page, page)
+    }
+}
+
 /// Core recompiler pipeline: cache + backend compiler.
 pub struct Recompiler {
     compiler: Box<dyn BlockCompiler>,
     config: RecompilerConfig,
     cache: HashMap<u32, CompiledBlock>,
+    cache_pages: HashMap<u32, HashSet<u32>>,
     failed_cache: HashSet<u32>,
+    failed_pages: HashMap<u32, HashSet<u32>>,
     stats: RecompilerStats,
     last_error: Option<CompileError>,
 }
@@ -313,7 +338,9 @@ impl Recompiler {
             compiler,
             config,
             cache: HashMap::new(),
+            cache_pages: HashMap::new(),
             failed_cache: HashSet::new(),
+            failed_pages: HashMap::new(),
             stats: RecompilerStats::default(),
             last_error: None,
         }
@@ -374,13 +401,13 @@ impl Recompiler {
         match self.compiler.compile(&request, source) {
             Ok(block) => {
                 self.stats.blocks_compiled += 1;
-                self.failed_cache.remove(&start_phys);
-                self.cache.insert(start_phys, block);
+                self.remove_failed(start_phys);
+                self.insert_cached(start_phys, block);
                 EnsureResult::Compiled
             }
             Err(err) => {
                 self.stats.compile_failures += 1;
-                self.failed_cache.insert(start_phys);
+                self.insert_failed(start_phys);
                 self.last_error = Some(err);
                 EnsureResult::CompileFailed
             }
@@ -391,39 +418,95 @@ impl Recompiler {
         if len == 0 {
             return;
         }
+        let (first_page, last_page) = page_span_from_start_len(start_phys, len);
         let end_phys = start_phys.saturating_add(len);
-        let keys_to_drop: Vec<u32> = self
-            .cache
-            .iter()
-            .filter_map(|(key, block)| {
-                let overlap = block.start_phys < end_phys && start_phys < block.end_phys;
-                if overlap {
-                    Some(*key)
-                } else {
-                    None
-                }
-            })
-            .collect();
 
-        for key in keys_to_drop {
-            if self.cache.remove(&key).is_some() {
+        let mut cached_to_drop = HashSet::new();
+        for page in first_page..=last_page {
+            if let Some(keys) = self.cache_pages.get(&page) {
+                cached_to_drop.extend(keys.iter().copied());
+            }
+        }
+        for key in cached_to_drop {
+            let should_drop = self
+                .cache
+                .get(&key)
+                .map(|block| block.start_phys < end_phys && start_phys < block.end_phys)
+                .unwrap_or(false);
+            if should_drop && self.remove_cached(key) {
                 self.stats.invalidated_blocks += 1;
             }
         }
 
-        let failed_to_drop: Vec<u32> = self
-            .failed_cache
-            .iter()
-            .copied()
-            .filter(|addr| *addr >= start_phys && *addr < end_phys)
-            .collect();
+        let mut failed_to_drop = HashSet::new();
+        for page in first_page..=last_page {
+            if let Some(keys) = self.failed_pages.get(&page) {
+                failed_to_drop.extend(keys.iter().copied());
+            }
+        }
         for key in failed_to_drop {
-            if self.failed_cache.remove(&key) {
+            if key >= start_phys && key < end_phys && self.remove_failed(key) {
                 self.stats.invalidated_blocks += 1;
             }
         }
 
         self.compiler.invalidate_range(start_phys, len);
+    }
+
+    fn insert_cached(&mut self, start_phys: u32, block: CompiledBlock) {
+        if self.cache.contains_key(&start_phys) {
+            // Keep the page index coherent if we ever overwrite an entry.
+            self.remove_cached(start_phys);
+        }
+        self.cache.insert(start_phys, block);
+        let (first_page, last_page) = page_span_for_block(&block);
+        for page in first_page..=last_page {
+            self.cache_pages.entry(page).or_default().insert(start_phys);
+        }
+    }
+
+    fn remove_cached(&mut self, start_phys: u32) -> bool {
+        let Some(block) = self.cache.remove(&start_phys) else {
+            return false;
+        };
+        let (first_page, last_page) = page_span_for_block(&block);
+        for page in first_page..=last_page {
+            let mut remove_page = false;
+            if let Some(keys) = self.cache_pages.get_mut(&page) {
+                keys.remove(&start_phys);
+                remove_page = keys.is_empty();
+            }
+            if remove_page {
+                self.cache_pages.remove(&page);
+            }
+        }
+        true
+    }
+
+    fn insert_failed(&mut self, start_phys: u32) {
+        if self.failed_cache.insert(start_phys) {
+            let page = page_of(start_phys);
+            self.failed_pages
+                .entry(page)
+                .or_default()
+                .insert(start_phys);
+        }
+    }
+
+    fn remove_failed(&mut self, start_phys: u32) -> bool {
+        if !self.failed_cache.remove(&start_phys) {
+            return false;
+        }
+        let page = page_of(start_phys);
+        let mut remove_page = false;
+        if let Some(keys) = self.failed_pages.get_mut(&page) {
+            keys.remove(&start_phys);
+            remove_page = keys.is_empty();
+        }
+        if remove_page {
+            self.failed_pages.remove(&page);
+        }
+        true
     }
 }
 
@@ -3721,6 +3804,31 @@ mod tests {
         assert_eq!(rc.cache_len(), 1);
 
         rc.invalidate_range(start + 4, 4);
+        assert_eq!(rc.cache_len(), 0);
+        assert_eq!(rc.stats().invalidated_blocks, 1);
+    }
+
+    #[test]
+    fn invalidate_range_drops_block_spanning_pages() {
+        let start = 0x1FFCu32;
+        let mut src = TestSource::with_words(&[
+            (start, 0x2408_0001),      // addiu t0, r0, 1
+            (start + 4, 0x2508_0001),  // addiu t0, t0, 1
+            (start + 8, 0x2508_0001),  // addiu t0, t0, 1
+            (start + 12, 0x2508_0001), // addiu t0, t0, 1
+        ]);
+        let mut rc = Recompiler::new(
+            Box::<CraneliftCompiler>::default(),
+            RecompilerConfig {
+                max_block_instructions: 4,
+            },
+        );
+
+        assert_eq!(rc.ensure_compiled(start, &mut src), EnsureResult::Compiled);
+        assert_eq!(rc.cache_len(), 1);
+
+        // Invalidate one word on the second page touched by this block.
+        rc.invalidate_range(0x2000, 4);
         assert_eq!(rc.cache_len(), 0);
         assert_eq!(rc.stats().invalidated_blocks, 1);
     }

@@ -4,6 +4,7 @@ use crate::cpu::instruction::Instruction;
 use crate::cpu::Vr4300;
 use crate::jit::{ExecutionEngine, Interpreter};
 use std::collections::HashMap;
+use std::time::Instant;
 
 use n64_dynarec::{
     CompiledBlock, CraneliftCompiler, EnsureResult, InstructionSource, Recompiler,
@@ -22,10 +23,17 @@ pub struct DynarecRuntimeStats {
     pub fallback_no_block: u64,
     pub fallback_failed_cache: u64,
     pub fallback_cold: u64,
+    pub fallback_compile_budget: u64,
     pub ensure_compiled_calls: u64,
     pub ensure_compiled_compiled: u64,
     pub ensure_compiled_compile_failed: u64,
     pub ensure_compiled_cache_hit: u64,
+    pub ensure_compiled_time_us: u64,
+    pub ensure_compiled_time_max_us: u64,
+    pub invalidate_calls: u64,
+    pub invalidate_bytes: u64,
+    pub invalidate_time_us: u64,
+    pub invalidate_time_max_us: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -41,6 +49,14 @@ pub struct DynarecStats {
     pub native_gas_limit: u32,
     /// 0 means unlimited chaining (bounded by `native_gas_limit`).
     pub chain_limit: u32,
+    /// Compile budget refill rate in microseconds per millisecond of host time.
+    pub compile_budget_us_per_ms: u32,
+    /// Maximum host-time burst window for compile budget accumulation.
+    pub compile_budget_burst_ms: u32,
+    /// Current compile budget credit in microseconds.
+    pub compile_budget_credit_us: i64,
+    /// Max compile budget credit in microseconds.
+    pub compile_budget_cap_us: i64,
 }
 
 #[derive(Clone, Copy)]
@@ -50,6 +66,7 @@ enum FallbackReason {
     NoBlock,
     FailedCache,
     Cold,
+    CompileBudget,
 }
 
 struct BusSource<'a, B: Bus> {
@@ -236,6 +253,11 @@ pub struct DynarecEngine {
     native_gas_limit: u32,
     /// 0 means unlimited chaining (bounded by `native_gas_limit`).
     chain_limit: u32,
+    compile_budget_us_per_ms: u32,
+    compile_budget_burst_ms: u32,
+    compile_budget_credit_us: i64,
+    compile_budget_cap_us: i64,
+    compile_budget_last_refill: Instant,
 }
 
 impl DynarecEngine {
@@ -268,6 +290,12 @@ impl DynarecEngine {
         let min_native_instructions = Self::parse_env_u32("N64_DYNAREC_MIN_BLOCK_INSNS", 2);
         let native_gas_limit = Self::parse_env_u32("N64_DYNAREC_NATIVE_GAS", 512);
         let chain_limit = Self::parse_env_u32_allow_zero("N64_DYNAREC_CHAIN_LIMIT", 2);
+        let compile_budget_us_per_ms =
+            Self::parse_env_u32_allow_zero("N64_DYNAREC_COMPILE_BUDGET_US_PER_MS", 0);
+        let compile_budget_burst_ms =
+            Self::parse_env_u32("N64_DYNAREC_COMPILE_BUDGET_BURST_MS", 30);
+        let compile_budget_cap_us =
+            i64::from(compile_budget_us_per_ms.saturating_mul(compile_budget_burst_ms.max(1)));
         let compiler = Box::<CraneliftCompiler>::default();
         let recompiler = Recompiler::new(
             compiler,
@@ -285,6 +313,11 @@ impl DynarecEngine {
             min_native_instructions,
             native_gas_limit,
             chain_limit,
+            compile_budget_us_per_ms,
+            compile_budget_burst_ms,
+            compile_budget_credit_us: compile_budget_cap_us,
+            compile_budget_cap_us,
+            compile_budget_last_refill: Instant::now(),
         }
     }
 
@@ -308,6 +341,11 @@ impl DynarecEngine {
             min_native_instructions: 1,
             native_gas_limit: 1024,
             chain_limit: 2,
+            compile_budget_us_per_ms: 0,
+            compile_budget_burst_ms: 1,
+            compile_budget_credit_us: 0,
+            compile_budget_cap_us: 0,
+            compile_budget_last_refill: Instant::now(),
         }
     }
 
@@ -323,13 +361,17 @@ impl DynarecEngine {
             min_native_instructions: self.min_native_instructions,
             native_gas_limit: self.native_gas_limit,
             chain_limit: self.chain_limit,
+            compile_budget_us_per_ms: self.compile_budget_us_per_ms,
+            compile_budget_burst_ms: self.compile_budget_burst_ms,
+            compile_budget_credit_us: self.compile_budget_credit_us,
+            compile_budget_cap_us: self.compile_budget_cap_us,
         }
     }
 
     pub fn stats_line(&self) -> String {
         let stats = self.stats();
         format!(
-            "native_blocks={} native_instr={} native_interp_instr={} native_gas_exits={} fallback_instr={} fallback_early_guard={} fallback_guard_after_lookup={} fallback_no_block={} fallback_failed_cache={} fallback_cold={} ensure_calls={} ensure_compiled={} ensure_compile_failed={} ensure_cache_hit={} recompiler_cache_hits={} recompiler_failed_cache_hits={} recompiler_blocks_compiled={} recompiler_compile_failures={} recompiler_invalidated_blocks={} block_cache_len={} failed_cache_len={} hot_entries={} hot_threshold={} max_block_insns={} min_block_insns={} native_gas={} chain_limit={}",
+            "native_blocks={} native_instr={} native_interp_instr={} native_gas_exits={} fallback_instr={} fallback_early_guard={} fallback_guard_after_lookup={} fallback_no_block={} fallback_failed_cache={} fallback_cold={} fallback_compile_budget={} ensure_calls={} ensure_compiled={} ensure_compile_failed={} ensure_cache_hit={} ensure_time_us={} ensure_time_max_us={} recompiler_cache_hits={} recompiler_failed_cache_hits={} recompiler_blocks_compiled={} recompiler_compile_failures={} recompiler_invalidated_blocks={} invalidate_calls={} invalidate_bytes={} invalidate_time_us={} invalidate_time_max_us={} block_cache_len={} failed_cache_len={} hot_entries={} hot_threshold={} max_block_insns={} min_block_insns={} native_gas={} chain_limit={} compile_budget_us_per_ms={} compile_budget_burst_ms={} compile_budget_cap_us={} compile_budget_credit_us={}",
             stats.runtime.native_blocks_executed,
             stats.runtime.native_instructions_executed,
             stats.runtime.native_interp_delegated_instructions,
@@ -340,15 +382,22 @@ impl DynarecEngine {
             stats.runtime.fallback_no_block,
             stats.runtime.fallback_failed_cache,
             stats.runtime.fallback_cold,
+            stats.runtime.fallback_compile_budget,
             stats.runtime.ensure_compiled_calls,
             stats.runtime.ensure_compiled_compiled,
             stats.runtime.ensure_compiled_compile_failed,
             stats.runtime.ensure_compiled_cache_hit,
+            stats.runtime.ensure_compiled_time_us,
+            stats.runtime.ensure_compiled_time_max_us,
             stats.recompiler.cache_hits,
             stats.recompiler.failed_cache_hits,
             stats.recompiler.blocks_compiled,
             stats.recompiler.compile_failures,
             stats.recompiler.invalidated_blocks,
+            stats.runtime.invalidate_calls,
+            stats.runtime.invalidate_bytes,
+            stats.runtime.invalidate_time_us,
+            stats.runtime.invalidate_time_max_us,
             stats.block_cache_len,
             stats.failed_cache_len,
             stats.hot_entries,
@@ -356,13 +405,19 @@ impl DynarecEngine {
             stats.max_block_instructions,
             stats.min_native_instructions,
             stats.native_gas_limit,
-            stats.chain_limit
+            stats.chain_limit,
+            stats.compile_budget_us_per_ms,
+            stats.compile_budget_burst_ms,
+            stats.compile_budget_cap_us,
+            stats.compile_budget_credit_us
         )
     }
 
     pub fn reset_stats(&mut self) {
         self.runtime = DynarecRuntimeStats::default();
         self.recompiler.reset_stats();
+        self.compile_budget_credit_us = self.compile_budget_cap_us;
+        self.compile_budget_last_refill = Instant::now();
     }
 
     fn run_fallback(
@@ -392,6 +447,9 @@ impl DynarecEngine {
             FallbackReason::Cold => {
                 self.runtime.fallback_cold += 1;
             }
+            FallbackReason::CompileBudget => {
+                self.runtime.fallback_compile_budget += 1;
+            }
         }
         retired
     }
@@ -400,6 +458,40 @@ impl DynarecEngine {
         let entry = self.hot_counts.entry(start_phys).or_insert(0);
         *entry = entry.saturating_add(1);
         *entry >= self.hot_threshold
+    }
+
+    fn refill_compile_budget(&mut self) {
+        if self.compile_budget_us_per_ms == 0 {
+            return;
+        }
+        let now = Instant::now();
+        let elapsed_ms = now
+            .saturating_duration_since(self.compile_budget_last_refill)
+            .as_millis();
+        if elapsed_ms == 0 {
+            return;
+        }
+        self.compile_budget_last_refill = now;
+        let added = elapsed_ms
+            .saturating_mul(u128::from(self.compile_budget_us_per_ms))
+            .min(i64::MAX as u128) as i64;
+        self.compile_budget_credit_us =
+            (self.compile_budget_credit_us.saturating_add(added)).min(self.compile_budget_cap_us);
+    }
+
+    fn compile_budget_allows_attempt(&self) -> bool {
+        self.compile_budget_us_per_ms == 0 || self.compile_budget_credit_us > 0
+    }
+
+    fn charge_compile_budget(&mut self, spent_us: u64) {
+        if self.compile_budget_us_per_ms == 0 {
+            return;
+        }
+        let spent = spent_us.min(i64::MAX as u64) as i64;
+        self.compile_budget_credit_us = self.compile_budget_credit_us.saturating_sub(spent);
+        if self.compile_budget_credit_us < -self.compile_budget_cap_us {
+            self.compile_budget_credit_us = -self.compile_budget_cap_us;
+        }
     }
 
     fn timer_interrupt_would_fire(cpu: &Vr4300, instructions: u32) -> bool {
@@ -591,6 +683,8 @@ impl DynarecEngine {
 
 impl ExecutionEngine for DynarecEngine {
     fn execute(&mut self, cpu: &mut Vr4300, bus: &mut impl Bus) -> u64 {
+        self.refill_compile_budget();
+
         let pc32 = cpu.pc as u32;
         if cpu.in_delay_slot
             || cpu.next_pc != cpu.pc.wrapping_add(4)
@@ -614,12 +708,29 @@ impl ExecutionEngine for DynarecEngine {
         if !self.should_attempt_compile(start_phys) {
             return self.run_fallback(cpu, bus, FallbackReason::Cold);
         }
+        if !self.compile_budget_allows_attempt() {
+            return self.run_fallback(cpu, bus, FallbackReason::CompileBudget);
+        }
 
         self.runtime.ensure_compiled_calls += 1;
+        let compile_start = Instant::now();
         let ensure_result = {
             let mut source = BusSource { bus };
             self.recompiler.ensure_compiled(start_phys, &mut source)
         };
+        let compile_elapsed_us = compile_start
+            .elapsed()
+            .as_micros()
+            .min(u128::from(u64::MAX)) as u64;
+        self.runtime.ensure_compiled_time_us = self
+            .runtime
+            .ensure_compiled_time_us
+            .wrapping_add(compile_elapsed_us);
+        self.runtime.ensure_compiled_time_max_us = self
+            .runtime
+            .ensure_compiled_time_max_us
+            .max(compile_elapsed_us);
+        self.charge_compile_budget(compile_elapsed_us);
 
         match ensure_result {
             EnsureResult::CacheHit => {
@@ -653,7 +764,19 @@ impl ExecutionEngine for DynarecEngine {
     }
 
     fn invalidate_range(&mut self, start: u32, len: u32) {
+        if len == 0 {
+            return;
+        }
+        let invalidate_start = Instant::now();
         self.recompiler.invalidate_range(start, len);
+        let elapsed_us = invalidate_start
+            .elapsed()
+            .as_micros()
+            .min(u128::from(u64::MAX)) as u64;
+        self.runtime.invalidate_calls = self.runtime.invalidate_calls.wrapping_add(1);
+        self.runtime.invalidate_bytes = self.runtime.invalidate_bytes.wrapping_add(u64::from(len));
+        self.runtime.invalidate_time_us = self.runtime.invalidate_time_us.wrapping_add(elapsed_us);
+        self.runtime.invalidate_time_max_us = self.runtime.invalidate_time_max_us.max(elapsed_us);
     }
 
     fn name(&self) -> &'static str {
