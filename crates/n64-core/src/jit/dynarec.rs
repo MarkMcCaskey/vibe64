@@ -1,5 +1,6 @@
 use crate::bus::Bus;
 use crate::cpu::cop0::Cop0;
+use crate::cpu::instruction::Instruction;
 use crate::cpu::Vr4300;
 use crate::jit::{ExecutionEngine, Interpreter};
 use std::collections::HashMap;
@@ -163,6 +164,16 @@ unsafe extern "C" fn cb_cop0_write<B: Bus>(user: *mut u8, reg: u64, value: u64) 
     // SAFETY: pointers come from live mutable references held by `run_native_block`.
     let cpu = unsafe { &mut *ctx.cpu };
     cpu.cop0.write_reg((reg as usize) & 0x1F, value);
+}
+
+unsafe extern "C" fn cb_interp_exec<B: Bus>(user: *mut u8, raw: u64, current_pc: u64) {
+    // SAFETY: user pointer is created from `CallbackContext<B>` in `run_native_block`.
+    let ctx = unsafe { &mut *(user as *mut CallbackContext<B>) };
+    // SAFETY: pointers come from live mutable references held by `run_native_block`.
+    let cpu = unsafe { &mut *ctx.cpu };
+    // SAFETY: pointers come from live mutable references held by `run_native_block`.
+    let bus = unsafe { &mut *ctx.bus };
+    cpu.execute(Instruction::decode(raw as u32), bus, current_pc);
 }
 
 unsafe extern "C" fn cb_hi_read<B: Bus>(user: *mut u8) -> u64 {
@@ -404,6 +415,7 @@ impl DynarecEngine {
             store_u64: cb_store_u64::<B>,
             cop0_read: cb_cop0_read::<B>,
             cop0_write: cb_cop0_write::<B>,
+            interp_exec: cb_interp_exec::<B>,
             hi_read: cb_hi_read::<B>,
             hi_write: cb_hi_write::<B>,
             lo_read: cb_lo_read::<B>,

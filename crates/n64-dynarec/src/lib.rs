@@ -40,6 +40,7 @@ pub struct RuntimeCallbacks {
     pub store_u64: unsafe extern "C" fn(*mut u8, u64, u64),
     pub cop0_read: unsafe extern "C" fn(*mut u8, u64) -> u64,
     pub cop0_write: unsafe extern "C" fn(*mut u8, u64, u64),
+    pub interp_exec: unsafe extern "C" fn(*mut u8, u64, u64),
     pub hi_read: unsafe extern "C" fn(*mut u8) -> u64,
     pub hi_write: unsafe extern "C" fn(*mut u8, u64),
     pub lo_read: unsafe extern "C" fn(*mut u8) -> u64,
@@ -114,6 +115,13 @@ unsafe extern "C" fn n64_jit_cop0_write(ctx: *mut u8, reg: u64, value: u64) {
     let cbs = unsafe { &mut *(ctx as *mut RuntimeCallbacks) };
     // SAFETY: callback function pointer is provided by caller.
     unsafe { (cbs.cop0_write)(cbs.user, reg, value) }
+}
+
+unsafe extern "C" fn n64_jit_interp_exec(ctx: *mut u8, raw: u64, current_pc: u64) {
+    // SAFETY: `ctx` is provided by the caller as a valid RuntimeCallbacks pointer.
+    let cbs = unsafe { &mut *(ctx as *mut RuntimeCallbacks) };
+    // SAFETY: callback function pointer is provided by caller.
+    unsafe { (cbs.interp_exec)(cbs.user, raw, current_pc) }
 }
 
 unsafe extern "C" fn n64_jit_hi_read(ctx: *mut u8) -> u64 {
@@ -451,6 +459,7 @@ enum Op {
     Dmfc0 { rt: u8, rd: u8 },
     Mtc0 { rt: u8, rd: u8 },
     Dmtc0 { rt: u8, rd: u8 },
+    Interp { raw: u32 },
     Sync,
     Cache,
 }
@@ -665,6 +674,8 @@ fn decode_supported_non_branch(raw: u32) -> Option<Op> {
             0x2F => Some(Op::Dsubu { rs, rt, rd }),
             _ => None,
         },
+        0x11 if rs != 0x08 => Some(Op::Interp { raw }),
+        0x31 | 0x35 | 0x39 | 0x3D => Some(Op::Interp { raw }),
         0x2F => Some(Op::Cache),
         0x01 | 0x02 | 0x03 | 0x04 | 0x05 | 0x06 | 0x07 | 0x14 | 0x15 | 0x16 | 0x17 => None,
         _ => None,
@@ -713,6 +724,7 @@ struct ImportedFuncRefs {
     store_u64: FuncRef,
     cop0_read: FuncRef,
     cop0_write: FuncRef,
+    interp_exec: FuncRef,
     hi_read: FuncRef,
     hi_write: FuncRef,
     lo_read: FuncRef,
@@ -765,6 +777,7 @@ fn emit_op(
     callbacks_ptr: Value,
     helpers: ImportedFuncRefs,
     flags: MemFlags,
+    current_pc: Value,
     op: Op,
 ) {
     match op {
@@ -1224,6 +1237,12 @@ fn emit_op(
                 .ins()
                 .call(helpers.cop0_write, &[callbacks_ptr, reg, value]);
         }
+        Op::Interp { raw } => {
+            let raw = iconst_u64(builder, u64::from(raw));
+            builder
+                .ins()
+                .call(helpers.interp_exec, &[callbacks_ptr, raw, current_pc]);
+        }
         Op::Sync => {
             // SYNC is a no-op for this emulator core.
         }
@@ -1248,6 +1267,7 @@ pub struct CraneliftCompiler {
     store_u64_id: FuncId,
     cop0_read_id: FuncId,
     cop0_write_id: FuncId,
+    interp_exec_id: FuncId,
     hi_read_id: FuncId,
     hi_write_id: FuncId,
     lo_read_id: FuncId,
@@ -1293,6 +1313,7 @@ impl Default for CraneliftCompiler {
         jit_builder.symbol("n64_jit_store_u64", n64_jit_store_u64 as *const u8);
         jit_builder.symbol("n64_jit_cop0_read", n64_jit_cop0_read as *const u8);
         jit_builder.symbol("n64_jit_cop0_write", n64_jit_cop0_write as *const u8);
+        jit_builder.symbol("n64_jit_interp_exec", n64_jit_interp_exec as *const u8);
         jit_builder.symbol("n64_jit_hi_read", n64_jit_hi_read as *const u8);
         jit_builder.symbol("n64_jit_hi_write", n64_jit_hi_write as *const u8);
         jit_builder.symbol("n64_jit_lo_read", n64_jit_lo_read as *const u8);
@@ -1348,6 +1369,9 @@ impl Default for CraneliftCompiler {
         let cop0_write_id = module
             .declare_function("n64_jit_cop0_write", Linkage::Import, &ternary_sig)
             .expect("declare n64_jit_cop0_write");
+        let interp_exec_id = module
+            .declare_function("n64_jit_interp_exec", Linkage::Import, &ternary_sig)
+            .expect("declare n64_jit_interp_exec");
         let hi_read_id = module
             .declare_function("n64_jit_hi_read", Linkage::Import, &ctx_unary_sig)
             .expect("declare n64_jit_hi_read");
@@ -1377,6 +1401,7 @@ impl Default for CraneliftCompiler {
             store_u64_id,
             cop0_read_id,
             cop0_write_id,
+            interp_exec_id,
             hi_read_id,
             hi_write_id,
             lo_read_id,
@@ -1560,6 +1585,9 @@ impl BlockCompiler for CraneliftCompiler {
             cop0_write: self
                 .module
                 .declare_func_in_func(self.cop0_write_id, builder.func),
+            interp_exec: self
+                .module
+                .declare_func_in_func(self.interp_exec_id, builder.func),
             hi_read: self
                 .module
                 .declare_func_in_func(self.hi_read_id, builder.func),
@@ -1591,7 +1619,15 @@ impl BlockCompiler for CraneliftCompiler {
             }
             match step {
                 TraceStep::Op(op) => {
-                    emit_op(&mut builder, gpr_ptr, callbacks_ptr, helpers, flags, op);
+                    emit_op(
+                        &mut builder,
+                        gpr_ptr,
+                        callbacks_ptr,
+                        helpers,
+                        flags,
+                        current_pc,
+                        op,
+                    );
                     retired_count = builder.ins().iadd_imm(retired_count, 1);
                     current_pc = builder.ins().iadd_imm(current_pc, 4);
                 }
@@ -1613,6 +1649,7 @@ impl BlockCompiler for CraneliftCompiler {
                                 callbacks_ptr,
                                 helpers,
                                 flags,
+                                next_of_branch,
                                 delay_op,
                             );
                             let target_pc = builder.ins().bor(upper_pc, low);
@@ -1633,6 +1670,7 @@ impl BlockCompiler for CraneliftCompiler {
                                 callbacks_ptr,
                                 helpers,
                                 flags,
+                                next_of_branch,
                                 delay_op,
                             );
                             let target_pc = builder.ins().bor(upper_pc, low);
@@ -1648,6 +1686,7 @@ impl BlockCompiler for CraneliftCompiler {
                                 callbacks_ptr,
                                 helpers,
                                 flags,
+                                next_of_branch,
                                 delay_op,
                             );
                             let target_pc = load_gpr(&mut builder, gpr_ptr, rs, flags);
@@ -1665,6 +1704,7 @@ impl BlockCompiler for CraneliftCompiler {
                                 callbacks_ptr,
                                 helpers,
                                 flags,
+                                next_of_branch,
                                 delay_op,
                             );
                             // Match interpreter ordering: target is read after link write.
@@ -1710,6 +1750,7 @@ impl BlockCompiler for CraneliftCompiler {
                                     callbacks_ptr,
                                     helpers,
                                     flags,
+                                    next_of_branch,
                                     delay_op,
                                 );
                                 let taken_retired = builder.ins().iadd_imm(retired_count, 2);
@@ -1726,6 +1767,7 @@ impl BlockCompiler for CraneliftCompiler {
                                     callbacks_ptr,
                                     helpers,
                                     flags,
+                                    next_of_branch,
                                     delay_op,
                                 );
                                 let retired_after = builder.ins().iadd_imm(retired_count, 2);
@@ -1803,6 +1845,7 @@ impl BlockCompiler for CraneliftCompiler {
                                     callbacks_ptr,
                                     helpers,
                                     flags,
+                                    next_of_branch,
                                     delay_op,
                                 );
                                 let taken_retired = builder.ins().iadd_imm(retired_count, 2);
@@ -1819,6 +1862,7 @@ impl BlockCompiler for CraneliftCompiler {
                                     callbacks_ptr,
                                     helpers,
                                     flags,
+                                    next_of_branch,
                                     delay_op,
                                 );
                                 let retired_after = builder.ins().iadd_imm(retired_count, 2);
@@ -1964,6 +2008,8 @@ mod tests {
 
     unsafe extern "C" fn test_cop0_write(_user: *mut u8, _reg: u64, _value: u64) {}
 
+    unsafe extern "C" fn test_interp_exec(_user: *mut u8, _raw: u64, _current_pc: u64) {}
+
     unsafe extern "C" fn test_hi_read(_user: *mut u8) -> u64 {
         0
     }
@@ -1989,6 +2035,7 @@ mod tests {
             store_u64: test_store_u64,
             cop0_read: test_cop0_read,
             cop0_write: test_cop0_write,
+            interp_exec: test_interp_exec,
             hi_read: test_hi_read,
             hi_write: test_hi_write,
             lo_read: test_lo_read,
@@ -2092,6 +2139,10 @@ mod tests {
         state.cop0[(reg as usize) & 0x1F] = value;
     }
 
+    unsafe extern "C" fn state_interp_exec(_user: *mut u8, _raw: u64, _current_pc: u64) {
+        // Test programs avoid interpreter-delegated opcodes.
+    }
+
     unsafe extern "C" fn state_hi_read(user: *mut u8) -> u64 {
         // SAFETY: callback user points to `CallbackState` for this test.
         let state = unsafe { &mut *(user as *mut CallbackState) };
@@ -2129,6 +2180,7 @@ mod tests {
             store_u64: state_store_u64,
             cop0_read: state_cop0_read,
             cop0_write: state_cop0_write,
+            interp_exec: state_interp_exec,
             hi_read: state_hi_read,
             hi_write: state_hi_write,
             lo_read: state_lo_read,
