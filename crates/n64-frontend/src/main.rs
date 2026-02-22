@@ -460,13 +460,14 @@ fn main() {
     let use_tui = args.iter().any(|a| a == "--tui");
     let use_test = args.iter().any(|a| a == "--test");
     let use_diag = args.iter().any(|a| a == "--diag");
+    let use_bench = args.iter().any(|a| a == "--bench");
     let rom_path = args
         .iter()
         .skip(1)
         .find(|a| !a.starts_with("--"))
         .map(PathBuf::from)
         .unwrap_or_else(|| {
-            eprintln!("Usage: n64-frontend [--tui|--test] <rom_path>");
+            eprintln!("Usage: n64-frontend [--tui|--test|--diag|--bench] <rom_path>");
             std::process::exit(1);
         });
 
@@ -2764,6 +2765,40 @@ fn main() {
 
         n64.cpu.dump_unimpl_summary();
         save_screenshot(&n64);
+        return;
+    } else if use_bench {
+        let warmup_steps = std::env::var("N64_BENCH_WARMUP")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(1_000_000);
+        let bench_steps = std::env::var("N64_BENCH_STEPS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(10_000_000);
+
+        for _ in 0..warmup_steps {
+            n64.step_one();
+        }
+
+        let start_cycles = n64.cycles;
+        let start = std::time::Instant::now();
+        for _ in 0..bench_steps {
+            n64.step_one();
+        }
+        let elapsed = start.elapsed().as_secs_f64();
+        let ran_cycles = n64.cycles.saturating_sub(start_cycles);
+        let msteps = bench_steps as f64 / elapsed / 1_000_000.0;
+        let mcycles = ran_cycles as f64 / elapsed / 1_000_000.0;
+
+        println!(
+            "BENCH engine={} warmup_steps={} steps={} elapsed_s={:.6} msteps_s={:.3} mcycles_s={:.3}",
+            n64.engine_name(),
+            warmup_steps,
+            bench_steps,
+            elapsed,
+            msteps,
+            mcycles
+        );
         return;
     } else if use_test {
         // Test mode: run until r30 is set (50M cycles max)

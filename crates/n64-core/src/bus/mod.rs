@@ -19,8 +19,8 @@ pub trait Bus {
     fn write_u32(&mut self, addr: u32, val: u32);
     fn write_u64(&mut self, addr: u32, val: u64);
 
-    /// Called when DMA writes to RDRAM. JIT listens here to
-    /// invalidate compiled blocks covering the written range.
+    /// Called when writes may have modified executable RDRAM.
+    /// Dynarec listens here to invalidate compiled blocks.
     fn notify_dma_write(&mut self, start: u32, len: u32);
 
     /// Check for pending unmasked interrupts (MI_INTR & MI_MASK).

@@ -3,6 +3,11 @@ name = "n64-core"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = []
+dynarec = ["dep:n64-dynarec"]
+
 [dependencies]
 log = "0.4"
 thiserror = "2"
+n64-dynarec = { path = "../n64-dynarec", optional = true }

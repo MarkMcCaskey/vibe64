@@ -49,6 +49,8 @@ pub struct Interconnect {
     pub audio_sample_count: u64,
     /// Debug counter: captured samples that are non-zero.
     pub audio_nonzero_sample_count: u64,
+    /// Guest physical ranges where code may have changed since the last CPU step.
+    code_invalidations: Vec<(u32, u32)>,
 }
 
 impl Interconnect {
@@ -76,7 +78,28 @@ impl Interconnect {
             audio_callback: None,
             audio_sample_count: 0,
             audio_nonzero_sample_count: 0,
+            code_invalidations: Vec::new(),
         }
+    }
+
+    /// Drain pending code invalidation ranges.
+    pub fn take_code_invalidations(&mut self) -> Vec<(u32, u32)> {
+        std::mem::take(&mut self.code_invalidations)
+    }
+
+    fn queue_code_invalidation(&mut self, start: u32, len: u32) {
+        if len == 0 {
+            return;
+        }
+        if let Some((last_start, last_len)) = self.code_invalidations.last_mut() {
+            let last_end = last_start.saturating_add(*last_len);
+            if start <= last_end {
+                let new_end = last_end.max(start.saturating_add(len));
+                *last_len = new_end.saturating_sub(*last_start);
+                return;
+            }
+        }
+        self.code_invalidations.push((start, len));
     }
 
     /// Perform PI DMA: copy data from cartridge ROM to RDRAM.
@@ -124,6 +147,7 @@ impl Interconnect {
 
             let delay = (len as u64 * 19).max(200);
             self.pi.dma_busy_cycles = delay;
+            self.notify_dma_write(dram_addr, len);
             self.pi.pending_dma_len = 0;
             self.pi.dma_count += 1;
             return;
@@ -477,18 +501,18 @@ impl Interconnect {
         let mut dram_addr = self.rsp.dma_dram_addr & 0x00FF_FFFF;
         let line_len = self.rsp.dma_len as usize;
 
-        let mem = if is_imem {
-            &self.rsp.imem
-        } else {
-            &self.rsp.dmem
-        };
-
         for _ in 0..self.rsp.dma_count {
+            let line_start = dram_addr;
             for i in 0..line_len {
-                let byte = mem[(mem_off + i) & 0xFFF];
+                let byte = if is_imem {
+                    self.rsp.imem[(mem_off + i) & 0xFFF]
+                } else {
+                    self.rsp.dmem[(mem_off + i) & 0xFFF]
+                };
                 let dst = (dram_addr as usize + i) & 0x7F_FFFF;
                 self.rdram.data_mut()[dst] = byte;
             }
+            self.notify_dma_write(line_start, line_len as u32);
             mem_off = (mem_off + line_len) & 0xFFF;
             dram_addr = dram_addr.wrapping_add(line_len as u32 + self.rsp.dma_skip);
         }
@@ -515,6 +539,7 @@ impl Interconnect {
             let byte = self.pif.ram[i as usize];
             self.rdram.write_u8(dram_addr + i, byte);
         }
+        self.notify_dma_write(dram_addr, 64);
         // Defer SI interrupt — tick_si_dma will fire it after the delay.
         self.si.dma_busy_cycles = 6000;
         self.si.dma_count += 1;
@@ -664,6 +689,7 @@ impl Bus for Interconnect {
         match addr {
             0x0000_0000..=0x03EF_FFFF => {
                 self.rdram.write_u32(addr, val);
+                self.notify_dma_write(addr, 4);
             }
             0x03F0_0000..=0x03FF_FFFF => {} // RDRAM registers (stubbed)
             0x0400_0000..=0x0400_0FFF => self.rsp.write_dmem_u32(addr & 0xFFF, val),
@@ -738,8 +764,8 @@ impl Bus for Interconnect {
         self.write_u32(addr.wrapping_add(4), val as u32);
     }
 
-    fn notify_dma_write(&mut self, _start: u32, _len: u32) {
-        // Future JIT: invalidate compiled blocks in this range
+    fn notify_dma_write(&mut self, start: u32, len: u32) {
+        self.queue_code_invalidation(start, len);
     }
 
     fn pending_interrupts(&self) -> bool {

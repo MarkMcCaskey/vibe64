@@ -1,0 +1,11 @@
+[package]
+name = "n64-dynarec"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+cranelift-codegen = "0.124"
+cranelift-frontend = "0.124"
+cranelift-jit = "0.124"
+cranelift-module = "0.124"
+cranelift-native = "0.124"

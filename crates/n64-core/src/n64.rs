@@ -4,7 +4,7 @@ use crate::bus::map::Interconnect;
 use crate::bus::Bus;
 use crate::cart::{self, Cartridge};
 use crate::cpu::Vr4300;
-use crate::jit::{ExecutionEngine, Interpreter};
+use crate::jit::Engine;
 
 #[derive(Debug, thiserror::Error)]
 pub enum N64Error {
@@ -18,7 +18,7 @@ pub enum N64Error {
 pub struct N64 {
     pub cpu: Vr4300,
     pub bus: Interconnect,
-    engine: Interpreter,
+    engine: Engine,
     pub cycles: u64,
     pub debug: crate::debug::DebugState,
     /// Path to the loaded ROM (used for deriving save file paths).
@@ -139,10 +139,13 @@ impl N64 {
         // COP0 state that the IPL3 would have left
         cpu.cop0.regs[crate::cpu::cop0::Cop0::STATUS] = 0x3400_0000; // CU0+CU1 enabled
 
+        let engine = Engine::from_env();
+        log::info!("CPU execution engine: {}", engine.name());
+
         let mut n64 = Self {
             cpu,
             bus,
-            engine: Interpreter,
+            engine,
             cycles: 0,
             debug: crate::debug::DebugState::new(),
             rom_path: rom_path.to_path_buf(),
@@ -168,6 +171,11 @@ impl N64 {
     }
     pub fn rdram_data(&self) -> &[u8] {
         self.bus.rdram.data()
+    }
+
+    /// Active CPU execution engine name.
+    pub fn engine_name(&self) -> &'static str {
+        self.engine.name()
     }
 
     /// Set a callback that receives audio samples immediately when AI DMA fires.
@@ -366,15 +374,12 @@ impl N64 {
         48_681_812 / (dacrate + 1)
     }
 
-    /// Execute a single CPU instruction and tick peripherals.
-    /// Returns cycles consumed (always 1 for interpreter).
+    /// Execute one engine step and tick peripherals.
+    /// Returns guest cycles consumed (1 for interpreter, >=1 for dynarec blocks).
     pub fn step_one(&mut self) -> u64 {
         let elapsed = self.engine.execute(&mut self.cpu, &mut self.bus);
         self.cycles += elapsed;
-        self.bus.vi.tick(elapsed, &mut self.bus.mi);
-        self.bus.tick_pi_dma();
-        self.bus.tick_si_dma();
-        self.bus.tick_ai_dma(elapsed);
+        self.tick_peripherals_and_invalidate(elapsed);
         elapsed
     }
 
@@ -391,11 +396,7 @@ impl N64 {
         while self.cycles < target {
             let elapsed = self.engine.execute(&mut self.cpu, &mut self.bus);
             self.cycles += elapsed;
-
-            self.bus.vi.tick(elapsed, &mut self.bus.mi);
-            self.bus.tick_pi_dma();
-            self.bus.tick_si_dma();
-            self.bus.tick_ai_dma(elapsed);
+            self.tick_peripherals_and_invalidate(elapsed);
         }
 
         // Harvest debug data from renderer
@@ -436,10 +437,7 @@ impl N64 {
 
             let elapsed = self.engine.execute(&mut self.cpu, &mut self.bus);
             self.cycles += elapsed;
-            self.bus.vi.tick(elapsed, &mut self.bus.mi);
-            self.bus.tick_pi_dma();
-            self.bus.tick_si_dma();
-            self.bus.tick_ai_dma(elapsed);
+            self.tick_peripherals_and_invalidate(elapsed);
 
             if !tracing && self.bus.pi.dma_count >= trigger_dma {
                 tracing = true;
@@ -461,10 +459,7 @@ impl N64 {
             }
             let elapsed = self.engine.execute(&mut self.cpu, &mut self.bus);
             self.cycles += elapsed;
-            self.bus.vi.tick(elapsed, &mut self.bus.mi);
-            self.bus.tick_pi_dma();
-            self.bus.tick_si_dma();
-            self.bus.tick_ai_dma(elapsed);
+            self.tick_peripherals_and_invalidate(elapsed);
         }
         None
     }
@@ -476,10 +471,7 @@ impl N64 {
         while self.cycles < end {
             let elapsed = self.engine.execute(&mut self.cpu, &mut self.bus);
             self.cycles += elapsed;
-            self.bus.vi.tick(elapsed, &mut self.bus.mi);
-            self.bus.tick_pi_dma();
-            self.bus.tick_si_dma();
-            self.bus.tick_ai_dma(elapsed);
+            self.tick_peripherals_and_invalidate(elapsed);
 
             if self.cpu.gpr[30] != 0 {
                 // Dump CPU state on failure for debugging
@@ -497,6 +489,19 @@ impl N64 {
             }
         }
         0 // timeout
+    }
+
+    fn tick_peripherals_and_invalidate(&mut self, elapsed: u64) {
+        self.bus.vi.tick(elapsed, &mut self.bus.mi);
+        for _ in 0..elapsed {
+            self.bus.tick_pi_dma();
+            self.bus.tick_si_dma();
+        }
+        self.bus.tick_ai_dma(elapsed);
+
+        for (start, len) in self.bus.take_code_invalidations() {
+            self.engine.invalidate_range(start, len);
+        }
     }
 }
 
