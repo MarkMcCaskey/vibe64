@@ -38,6 +38,8 @@ pub struct RuntimeCallbacks {
     pub store_u16: unsafe extern "C" fn(*mut u8, u64, u64),
     pub store_u32: unsafe extern "C" fn(*mut u8, u64, u64),
     pub store_u64: unsafe extern "C" fn(*mut u8, u64, u64),
+    /// Notify runtime that a fastmem store touched `phys..phys+len`.
+    pub store_invalidate: unsafe extern "C" fn(*mut u8, u64, u64),
     pub cop0_read: unsafe extern "C" fn(*mut u8, u64) -> u64,
     pub cop0_write: unsafe extern "C" fn(*mut u8, u64, u64),
     pub cop1_condition: unsafe extern "C" fn(*mut u8) -> u64,
@@ -114,6 +116,13 @@ unsafe extern "C" fn n64_jit_store_u64(ctx: *mut u8, vaddr: u64, value: u64) {
     let cbs = unsafe { &mut *(ctx as *mut RuntimeCallbacks) };
     // SAFETY: callback function pointer is provided by caller.
     unsafe { (cbs.store_u64)(cbs.user, vaddr, value) }
+}
+
+unsafe extern "C" fn n64_jit_store_invalidate(ctx: *mut u8, phys: u64, len: u64) {
+    // SAFETY: `ctx` is provided by the caller as a valid RuntimeCallbacks pointer.
+    let cbs = unsafe { &mut *(ctx as *mut RuntimeCallbacks) };
+    // SAFETY: callback function pointer is provided by caller.
+    unsafe { (cbs.store_invalidate)(cbs.user, phys, len) }
 }
 
 unsafe extern "C" fn n64_jit_cop0_read(ctx: *mut u8, reg: u64) -> u64 {
@@ -405,6 +414,11 @@ impl Recompiler {
 
     pub fn lookup(&self, start_phys: u32) -> Option<&CompiledBlock> {
         self.cache.get(&start_phys)
+    }
+
+    /// Returns true when any compiled block currently overlaps `page`.
+    pub fn has_cached_page(&self, page: u32) -> bool {
+        self.cache_pages.contains_key(&page)
     }
 
     pub fn is_failed_cached(&self, start_phys: u32) -> bool {
@@ -1170,6 +1184,7 @@ struct ImportedFuncRefs {
     store_u16: FuncRef,
     store_u32: FuncRef,
     store_u64: FuncRef,
+    store_invalidate: FuncRef,
     cop0_read: FuncRef,
     cop0_write: FuncRef,
     cop1_condition: FuncRef,
@@ -1208,7 +1223,7 @@ fn fastmem_guard_and_addr(
     builder: &mut FunctionBuilder<'_>,
     fastmem: FastmemValues,
     vaddr: Value,
-) -> (Value, Value) {
+) -> (Value, Value, Value) {
     let vaddr32 = builder.ins().ireduce(types::I32, vaddr);
     let seg_mask = builder
         .ins()
@@ -1230,7 +1245,7 @@ fn fastmem_guard_and_addr(
     let masked_phys = builder.ins().band(phys, fastmem.phys_mask);
     let offset = i64_to_ptr_sized(builder, fastmem.ptr_ty, masked_phys);
     let addr = builder.ins().iadd(fastmem.base, offset);
-    (fast_cond, addr)
+    (fast_cond, addr, masked_phys)
 }
 
 fn load_be_from_fastmem(
@@ -1300,7 +1315,7 @@ fn emit_load_via_fastmem(
     vaddr: Value,
     width: u8,
 ) -> Value {
-    let (fast_cond, fast_addr) = fastmem_guard_and_addr(builder, fastmem, vaddr);
+    let (fast_cond, fast_addr, _fast_phys) = fastmem_guard_and_addr(builder, fastmem, vaddr);
 
     let fast_block = builder.create_block();
     let slow_block = builder.create_block();
@@ -1331,12 +1346,13 @@ fn emit_store_via_fastmem(
     builder: &mut FunctionBuilder<'_>,
     callbacks_ptr: Value,
     helper: FuncRef,
+    invalidate_helper: FuncRef,
     fastmem: FastmemValues,
     vaddr: Value,
     value64: Value,
     width: u8,
 ) {
-    let (fast_cond, fast_addr) = fastmem_guard_and_addr(builder, fastmem, vaddr);
+    let (fast_cond, fast_addr, fast_phys) = fastmem_guard_and_addr(builder, fastmem, vaddr);
 
     let fast_block = builder.create_block();
     let slow_block = builder.create_block();
@@ -1349,6 +1365,10 @@ fn emit_store_via_fastmem(
     let mut fast_flags = MemFlags::new();
     fast_flags.set_notrap();
     store_be_to_fastmem(builder, fast_addr, value64, width, fast_flags);
+    let width_u64 = iconst_u64(builder, width as u64);
+    builder
+        .ins()
+        .call(invalidate_helper, &[callbacks_ptr, fast_phys, width_u64]);
     builder.ins().jump(done_block, &[]);
 
     builder.switch_to_block(slow_block);
@@ -1944,6 +1964,7 @@ fn emit_op(
                 builder,
                 callbacks_ptr,
                 helpers.store_u32,
+                helpers.store_invalidate,
                 fastmem,
                 vaddr,
                 value64,
@@ -1960,6 +1981,7 @@ fn emit_op(
                 builder,
                 callbacks_ptr,
                 helpers.store_u8,
+                helpers.store_invalidate,
                 fastmem,
                 vaddr,
                 value64,
@@ -1976,6 +1998,7 @@ fn emit_op(
                 builder,
                 callbacks_ptr,
                 helpers.store_u16,
+                helpers.store_invalidate,
                 fastmem,
                 vaddr,
                 value64,
@@ -1990,6 +2013,7 @@ fn emit_op(
                 builder,
                 callbacks_ptr,
                 helpers.store_u64,
+                helpers.store_invalidate,
                 fastmem,
                 vaddr,
                 value,
@@ -2013,6 +2037,7 @@ fn emit_op(
                 builder,
                 callbacks_ptr,
                 helpers.store_u32,
+                helpers.store_invalidate,
                 fastmem,
                 vaddr,
                 value64,
@@ -2034,6 +2059,7 @@ fn emit_op(
                 builder,
                 callbacks_ptr,
                 helpers.store_u64,
+                helpers.store_invalidate,
                 fastmem,
                 vaddr,
                 value,
@@ -2199,6 +2225,7 @@ pub struct CraneliftCompiler {
     store_u16_id: FuncId,
     store_u32_id: FuncId,
     store_u64_id: FuncId,
+    store_invalidate_id: FuncId,
     cop0_read_id: FuncId,
     cop0_write_id: FuncId,
     cop1_condition_id: FuncId,
@@ -2249,6 +2276,10 @@ impl CraneliftCompiler {
         jit_builder.symbol("n64_jit_store_u16", n64_jit_store_u16 as *const u8);
         jit_builder.symbol("n64_jit_store_u32", n64_jit_store_u32 as *const u8);
         jit_builder.symbol("n64_jit_store_u64", n64_jit_store_u64 as *const u8);
+        jit_builder.symbol(
+            "n64_jit_store_invalidate",
+            n64_jit_store_invalidate as *const u8,
+        );
         jit_builder.symbol("n64_jit_cop0_read", n64_jit_cop0_read as *const u8);
         jit_builder.symbol("n64_jit_cop0_write", n64_jit_cop0_write as *const u8);
         jit_builder.symbol(
@@ -2305,6 +2336,9 @@ impl CraneliftCompiler {
         let store_u64_id = module
             .declare_function("n64_jit_store_u64", Linkage::Import, &ternary_sig)
             .expect("declare n64_jit_store_u64");
+        let store_invalidate_id = module
+            .declare_function("n64_jit_store_invalidate", Linkage::Import, &ternary_sig)
+            .expect("declare n64_jit_store_invalidate");
         let cop0_read_id = module
             .declare_function("n64_jit_cop0_read", Linkage::Import, &unary_sig)
             .expect("declare n64_jit_cop0_read");
@@ -2344,6 +2378,7 @@ impl CraneliftCompiler {
             store_u16_id,
             store_u32_id,
             store_u64_id,
+            store_invalidate_id,
             cop0_read_id,
             cop0_write_id,
             cop1_condition_id,
@@ -2660,6 +2695,9 @@ impl BlockCompiler for CraneliftCompiler {
             store_u64: self
                 .module
                 .declare_func_in_func(self.store_u64_id, builder.func),
+            store_invalidate: self
+                .module
+                .declare_func_in_func(self.store_invalidate_id, builder.func),
             cop0_read: self
                 .module
                 .declare_func_in_func(self.cop0_read_id, builder.func),
@@ -3490,6 +3528,8 @@ mod tests {
 
     unsafe extern "C" fn test_store_u64(_user: *mut u8, _vaddr: u64, _value: u64) {}
 
+    unsafe extern "C" fn test_store_invalidate(_user: *mut u8, _phys: u64, _len: u64) {}
+
     unsafe extern "C" fn test_cop0_read(_user: *mut u8, _reg: u64) -> u64 {
         0
     }
@@ -3525,6 +3565,7 @@ mod tests {
             store_u16: test_store_u16,
             store_u32: test_store_u32,
             store_u64: test_store_u64,
+            store_invalidate: test_store_invalidate,
             cop0_read: test_cop0_read,
             cop0_write: test_cop0_write,
             cop1_condition: test_cop1_condition,
@@ -3549,6 +3590,7 @@ mod tests {
         cop1_condition: u64,
         hi: u64,
         lo: u64,
+        store_invalidate_calls: u64,
     }
 
     unsafe extern "C" fn state_load_u8(user: *mut u8, vaddr: u64) -> u64 {
@@ -3627,6 +3669,12 @@ mod tests {
         state.mem.insert(vaddr.wrapping_add(7), bytes[7]);
     }
 
+    unsafe extern "C" fn state_store_invalidate(user: *mut u8, _phys: u64, _len: u64) {
+        // SAFETY: callback user points to `CallbackState` for this test.
+        let state = unsafe { &mut *(user as *mut CallbackState) };
+        state.store_invalidate_calls = state.store_invalidate_calls.wrapping_add(1);
+    }
+
     unsafe extern "C" fn state_cop0_read(user: *mut u8, reg: u64) -> u64 {
         // SAFETY: callback user points to `CallbackState` for this test.
         let state = unsafe { &mut *(user as *mut CallbackState) };
@@ -3684,6 +3732,7 @@ mod tests {
             store_u16: state_store_u16,
             store_u32: state_store_u32,
             store_u64: state_store_u64,
+            store_invalidate: state_store_invalidate,
             cop0_read: state_cop0_read,
             cop0_write: state_cop0_write,
             cop1_condition: state_cop1_condition,
@@ -4242,6 +4291,7 @@ mod tests {
         assert_eq!(gpr[8], 0x1122_3344);
         assert_eq!(gpr[9], 0x44);
         assert_eq!(fastmem[7], 0x44);
+        assert_eq!(state.store_invalidate_calls, 1);
         assert!(state.mem.is_empty(), "slow callback path should not run");
     }
 
@@ -4305,6 +4355,7 @@ mod tests {
         );
         assert_eq!(fpr[8], 0x5566_7788);
         assert_eq!(fpr[9], 0x1122_3344);
+        assert_eq!(state.store_invalidate_calls, 2);
         assert!(state.mem.is_empty(), "slow callback path should not run");
     }
 

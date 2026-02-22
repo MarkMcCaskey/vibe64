@@ -777,6 +777,36 @@ impl Bus for Interconnect {
         self.write_u32(addr.wrapping_add(4), val as u32);
     }
 
+    fn write_u8_no_inval(&mut self, addr: u32, val: u8) {
+        let aligned = addr & !3;
+        let shift = (3 - (addr & 3)) * 8;
+        let mask = !(0xFFu32 << shift);
+        let current = self.read_u32(aligned);
+        self.write_u32_no_inval(aligned, (current & mask) | ((val as u32) << shift));
+    }
+
+    fn write_u16_no_inval(&mut self, addr: u32, val: u16) {
+        let aligned = addr & !3;
+        let shift = (2 - (addr & 2)) * 8;
+        let mask = !(0xFFFFu32 << shift);
+        let current = self.read_u32(aligned);
+        self.write_u32_no_inval(aligned, (current & mask) | ((val as u32) << shift));
+    }
+
+    fn write_u32_no_inval(&mut self, addr: u32, val: u32) {
+        match addr {
+            0x0000_0000..=0x03EF_FFFF => {
+                self.rdram.write_u32(addr, val);
+            }
+            _ => self.write_u32(addr, val),
+        }
+    }
+
+    fn write_u64_no_inval(&mut self, addr: u32, val: u64) {
+        self.write_u32_no_inval(addr, (val >> 32) as u32);
+        self.write_u32_no_inval(addr.wrapping_add(4), val as u32);
+    }
+
     fn notify_dma_write(&mut self, start: u32, len: u32) {
         self.queue_code_invalidation(start, len);
     }

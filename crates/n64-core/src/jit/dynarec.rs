@@ -255,6 +255,34 @@ fn async_compile_worker_loop(
 struct CallbackContext<B: Bus> {
     cpu: *mut Vr4300,
     bus: *mut B,
+    recompiler: *const Recompiler,
+    pending_code_writes: *mut Vec<(u32, u32)>,
+}
+
+unsafe fn queue_store_invalidation_if_compiled<B: Bus>(
+    ctx: &mut CallbackContext<B>,
+    phys: u32,
+    len: u32,
+) {
+    if len == 0 {
+        return;
+    }
+    let first_page = page_of(phys);
+    let last_page = page_of(phys.saturating_add(len.saturating_sub(1)));
+    // SAFETY: pointer initialized in `run_native_block` for this invocation.
+    let recompiler = unsafe { &*ctx.recompiler };
+    // SAFETY: pointer initialized in `run_native_block` for this invocation.
+    let pending = unsafe { &mut *ctx.pending_code_writes };
+    let mut touches_cached_page = false;
+    for page in first_page..=last_page {
+        if recompiler.has_cached_page(page) {
+            touches_cached_page = true;
+            break;
+        }
+    }
+    if touches_cached_page {
+        pending.push((phys, len));
+    }
 }
 
 unsafe extern "C" fn cb_load_u8<B: Bus>(user: *mut u8, vaddr: u64) -> u64 {
@@ -309,7 +337,9 @@ unsafe extern "C" fn cb_store_u8<B: Bus>(user: *mut u8, vaddr: u64, value: u64) 
     // SAFETY: pointers come from live mutable references held by `run_native_block`.
     let bus = unsafe { &mut *ctx.bus };
     let phys = cpu.translate_address(vaddr);
-    bus.write_u8(phys, value as u8);
+    bus.write_u8_no_inval(phys, value as u8);
+    // SAFETY: callback context pointers are valid for this block invocation.
+    unsafe { queue_store_invalidation_if_compiled(ctx, phys, 1) };
 }
 
 unsafe extern "C" fn cb_store_u16<B: Bus>(user: *mut u8, vaddr: u64, value: u64) {
@@ -320,7 +350,9 @@ unsafe extern "C" fn cb_store_u16<B: Bus>(user: *mut u8, vaddr: u64, value: u64)
     // SAFETY: pointers come from live mutable references held by `run_native_block`.
     let bus = unsafe { &mut *ctx.bus };
     let phys = cpu.translate_address(vaddr);
-    bus.write_u16(phys, value as u16);
+    bus.write_u16_no_inval(phys, value as u16);
+    // SAFETY: callback context pointers are valid for this block invocation.
+    unsafe { queue_store_invalidation_if_compiled(ctx, phys, 2) };
 }
 
 unsafe extern "C" fn cb_store_u32<B: Bus>(user: *mut u8, vaddr: u64, value: u64) {
@@ -331,7 +363,9 @@ unsafe extern "C" fn cb_store_u32<B: Bus>(user: *mut u8, vaddr: u64, value: u64)
     // SAFETY: pointers come from live mutable references held by `run_native_block`.
     let bus = unsafe { &mut *ctx.bus };
     let phys = cpu.translate_address(vaddr);
-    bus.write_u32(phys, value as u32);
+    bus.write_u32_no_inval(phys, value as u32);
+    // SAFETY: callback context pointers are valid for this block invocation.
+    unsafe { queue_store_invalidation_if_compiled(ctx, phys, 4) };
 }
 
 unsafe extern "C" fn cb_store_u64<B: Bus>(user: *mut u8, vaddr: u64, value: u64) {
@@ -342,7 +376,16 @@ unsafe extern "C" fn cb_store_u64<B: Bus>(user: *mut u8, vaddr: u64, value: u64)
     // SAFETY: pointers come from live mutable references held by `run_native_block`.
     let bus = unsafe { &mut *ctx.bus };
     let phys = cpu.translate_address(vaddr);
-    bus.write_u64(phys, value);
+    bus.write_u64_no_inval(phys, value);
+    // SAFETY: callback context pointers are valid for this block invocation.
+    unsafe { queue_store_invalidation_if_compiled(ctx, phys, 8) };
+}
+
+unsafe extern "C" fn cb_fast_store_invalidate<B: Bus>(user: *mut u8, phys: u64, len: u64) {
+    // SAFETY: user pointer is created from `CallbackContext<B>` in `run_native_block`.
+    let ctx = unsafe { &mut *(user as *mut CallbackContext<B>) };
+    // SAFETY: callback context pointers are valid for this block invocation.
+    unsafe { queue_store_invalidation_if_compiled(ctx, phys as u32, len as u32) };
 }
 
 unsafe extern "C" fn cb_cop0_read<B: Bus>(user: *mut u8, reg: u64) -> u64 {
@@ -1557,9 +1600,13 @@ impl DynarecEngine {
         }
         let start_pc = cpu.pc;
         let fastmem = bus.dynarec_fastmem().unwrap_or_default();
+        let mut pending_code_writes: Vec<(u32, u32)> = Vec::with_capacity(8);
+        let recompiler_ptr: *const Recompiler = &self.recompiler;
         let mut callback_ctx = CallbackContext {
             cpu: (cpu as *mut Vr4300),
             bus: (bus as *mut B),
+            recompiler: recompiler_ptr,
+            pending_code_writes: (&mut pending_code_writes as *mut Vec<(u32, u32)>),
         };
         let mut callbacks = RuntimeCallbacks {
             user: (&mut callback_ctx as *mut CallbackContext<B>).cast::<u8>(),
@@ -1571,6 +1618,7 @@ impl DynarecEngine {
             store_u16: cb_store_u16::<B>,
             store_u32: cb_store_u32::<B>,
             store_u64: cb_store_u64::<B>,
+            store_invalidate: cb_fast_store_invalidate::<B>,
             cop0_read: cb_cop0_read::<B>,
             cop0_write: cb_cop0_write::<B>,
             cop1_condition: cb_cop1_condition::<B>,
@@ -1595,6 +1643,24 @@ impl DynarecEngine {
         );
         let count = execution.retired_instructions;
         let next_pc = execution.next_pc;
+
+        if !pending_code_writes.is_empty() {
+            pending_code_writes.sort_unstable_by_key(|(start, _)| *start);
+            let mut iter = pending_code_writes.into_iter();
+            let (mut run_start, first_len) = iter.next().expect("non-empty");
+            let mut run_end = run_start.saturating_add(first_len);
+            for (start, len) in iter {
+                let end = start.saturating_add(len);
+                if start <= run_end {
+                    run_end = run_end.max(end);
+                    continue;
+                }
+                self.invalidate_range(run_start, run_end.saturating_sub(run_start));
+                run_start = start;
+                run_end = end;
+            }
+            self.invalidate_range(run_start, run_end.saturating_sub(run_start));
+        }
 
         // PC history ring stores only the most recent 64 entries; when native
         // chunks are larger, older entries would be overwritten anyway.

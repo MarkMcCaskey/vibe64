@@ -26,6 +26,23 @@ pub trait Bus {
     fn write_u32(&mut self, addr: u32, val: u32);
     fn write_u64(&mut self, addr: u32, val: u64);
 
+    /// Store helpers that skip eager code invalidation.
+    ///
+    /// Dynarec native stores can use these and issue targeted invalidations
+    /// separately, avoiding broad per-store invalidation overhead.
+    fn write_u8_no_inval(&mut self, addr: u32, val: u8) {
+        self.write_u8(addr, val);
+    }
+    fn write_u16_no_inval(&mut self, addr: u32, val: u16) {
+        self.write_u16(addr, val);
+    }
+    fn write_u32_no_inval(&mut self, addr: u32, val: u32) {
+        self.write_u32(addr, val);
+    }
+    fn write_u64_no_inval(&mut self, addr: u32, val: u64) {
+        self.write_u64(addr, val);
+    }
+
     /// Called when writes may have modified executable RDRAM.
     /// Dynarec listens here to invalidate compiled blocks.
     fn notify_dma_write(&mut self, start: u32, len: u32);
