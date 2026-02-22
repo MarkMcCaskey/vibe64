@@ -258,10 +258,17 @@ impl ApplicationHandler for App {
                 self.speed_frame_budget += self.speed_multiplier();
                 let frames_to_run = self.speed_frame_budget.floor() as u32;
                 self.speed_frame_budget -= frames_to_run as f32;
+                let old_frame_count = self.n64.debug.frame_count;
+                let replaying = self.replay_manager.is_replaying();
 
-                for _ in 0..frames_to_run {
+                for i in 0..frames_to_run {
+                    let input_frame = if replaying {
+                        old_frame_count.saturating_add(i as u64)
+                    } else {
+                        self.n64.debug.frame_count
+                    };
                     self.replay_manager
-                        .update_input(self.n64.debug.frame_count, &mut self.n64.bus.pif.controller);
+                        .update_input(input_frame, &mut self.n64.bus.pif.controller);
                     self.n64.run_frame();
                 }
 
@@ -275,8 +282,7 @@ impl ApplicationHandler for App {
                 let pos = self.n64.debug.fps_write_pos;
                 self.n64.debug.fps_samples[pos] = dt;
                 self.n64.debug.fps_write_pos = (pos + 1) % 60;
-                let old_frame_count = self.n64.debug.frame_count;
-                self.n64.debug.frame_count += frames_to_run as u64;
+                self.n64.debug.frame_count = old_frame_count.saturating_add(frames_to_run as u64);
 
                 // Periodic EEPROM save (every ~5 seconds)
                 if frames_to_run > 0 && (old_frame_count / 300 != self.n64.debug.frame_count / 300)
