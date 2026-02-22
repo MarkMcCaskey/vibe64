@@ -46,6 +46,12 @@ pub struct RuntimeCallbacks {
     pub hi_write: unsafe extern "C" fn(*mut u8, u64),
     pub lo_read: unsafe extern "C" fn(*mut u8) -> u64,
     pub lo_write: unsafe extern "C" fn(*mut u8, u64),
+    /// Optional direct pointer to CPU HI register for fast native access.
+    pub hi_ptr: *mut u64,
+    /// Optional direct pointer to CPU LO register for fast native access.
+    pub lo_ptr: *mut u64,
+    /// Optional direct pointer to COP1 FCR31 for BC1* condition checks.
+    pub cop1_fcr31_ptr: *mut u32,
     /// Optional fastmem base pointer (RDRAM backing). Null disables fastmem.
     pub fastmem_base: *mut u8,
     /// Exclusive physical range limit for fastmem loads/stores.
@@ -1092,6 +1098,14 @@ struct FastmemValues {
     phys_mask: Value,
 }
 
+#[derive(Clone, Copy)]
+struct RuntimeStatePtrs {
+    ptr_ty: Type,
+    hi_ptr: Value,
+    lo_ptr: Value,
+    cop1_fcr31_ptr: Value,
+}
+
 fn i64_to_ptr_sized(builder: &mut FunctionBuilder<'_>, ptr_ty: Type, value: Value) -> Value {
     if ptr_ty == types::I64 {
         value
@@ -1254,44 +1268,180 @@ fn emit_store_via_fastmem(
     builder.switch_to_block(done_block);
 }
 
+fn read_u64_ptr_or_call(
+    builder: &mut FunctionBuilder<'_>,
+    callbacks_ptr: Value,
+    ptr_ty: Type,
+    ptr: Value,
+    helper: FuncRef,
+) -> Value {
+    let zero = builder.ins().iconst(ptr_ty, 0);
+    let has_ptr = builder.ins().icmp(IntCC::NotEqual, ptr, zero);
+
+    let fast_block = builder.create_block();
+    let slow_block = builder.create_block();
+    let done_block = builder.create_block();
+    builder.append_block_param(done_block, types::I64);
+    builder
+        .ins()
+        .brif(has_ptr, fast_block, &[], slow_block, &[]);
+
+    builder.switch_to_block(fast_block);
+    let mut flags = MemFlags::new();
+    flags.set_notrap();
+    flags.set_aligned();
+    let loaded = builder.ins().load(types::I64, flags, ptr, 0);
+    let args = [loaded.into()];
+    builder.ins().jump(done_block, &args);
+
+    builder.switch_to_block(slow_block);
+    let call = builder.ins().call(helper, &[callbacks_ptr]);
+    let slow = builder.inst_results(call)[0];
+    let args = [slow.into()];
+    builder.ins().jump(done_block, &args);
+
+    builder.switch_to_block(done_block);
+    builder.block_params(done_block)[0]
+}
+
+fn write_u64_ptr_or_call(
+    builder: &mut FunctionBuilder<'_>,
+    callbacks_ptr: Value,
+    ptr_ty: Type,
+    ptr: Value,
+    helper: FuncRef,
+    value: Value,
+) {
+    let zero = builder.ins().iconst(ptr_ty, 0);
+    let has_ptr = builder.ins().icmp(IntCC::NotEqual, ptr, zero);
+
+    let fast_block = builder.create_block();
+    let slow_block = builder.create_block();
+    let done_block = builder.create_block();
+    builder
+        .ins()
+        .brif(has_ptr, fast_block, &[], slow_block, &[]);
+
+    builder.switch_to_block(fast_block);
+    let mut flags = MemFlags::new();
+    flags.set_notrap();
+    flags.set_aligned();
+    builder.ins().store(flags, value, ptr, 0);
+    builder.ins().jump(done_block, &[]);
+
+    builder.switch_to_block(slow_block);
+    builder.ins().call(helper, &[callbacks_ptr, value]);
+    builder.ins().jump(done_block, &[]);
+
+    builder.switch_to_block(done_block);
+}
+
 fn read_hi(
     builder: &mut FunctionBuilder<'_>,
     callbacks_ptr: Value,
     helpers: ImportedFuncRefs,
+    runtime_ptrs: RuntimeStatePtrs,
 ) -> Value {
-    let call = builder.ins().call(helpers.hi_read, &[callbacks_ptr]);
-    builder.inst_results(call)[0]
+    read_u64_ptr_or_call(
+        builder,
+        callbacks_ptr,
+        runtime_ptrs.ptr_ty,
+        runtime_ptrs.hi_ptr,
+        helpers.hi_read,
+    )
 }
 
 fn read_lo(
     builder: &mut FunctionBuilder<'_>,
     callbacks_ptr: Value,
     helpers: ImportedFuncRefs,
+    runtime_ptrs: RuntimeStatePtrs,
 ) -> Value {
-    let call = builder.ins().call(helpers.lo_read, &[callbacks_ptr]);
-    builder.inst_results(call)[0]
+    read_u64_ptr_or_call(
+        builder,
+        callbacks_ptr,
+        runtime_ptrs.ptr_ty,
+        runtime_ptrs.lo_ptr,
+        helpers.lo_read,
+    )
 }
 
 fn write_hi(
     builder: &mut FunctionBuilder<'_>,
     callbacks_ptr: Value,
     helpers: ImportedFuncRefs,
+    runtime_ptrs: RuntimeStatePtrs,
     value: Value,
 ) {
-    builder
-        .ins()
-        .call(helpers.hi_write, &[callbacks_ptr, value]);
+    write_u64_ptr_or_call(
+        builder,
+        callbacks_ptr,
+        runtime_ptrs.ptr_ty,
+        runtime_ptrs.hi_ptr,
+        helpers.hi_write,
+        value,
+    );
 }
 
 fn write_lo(
     builder: &mut FunctionBuilder<'_>,
     callbacks_ptr: Value,
     helpers: ImportedFuncRefs,
+    runtime_ptrs: RuntimeStatePtrs,
     value: Value,
 ) {
+    write_u64_ptr_or_call(
+        builder,
+        callbacks_ptr,
+        runtime_ptrs.ptr_ty,
+        runtime_ptrs.lo_ptr,
+        helpers.lo_write,
+        value,
+    );
+}
+
+fn read_cop1_condition_flag(
+    builder: &mut FunctionBuilder<'_>,
+    callbacks_ptr: Value,
+    helpers: ImportedFuncRefs,
+    runtime_ptrs: RuntimeStatePtrs,
+) -> Value {
+    let zero_ptr = builder.ins().iconst(runtime_ptrs.ptr_ty, 0);
+    let has_ptr = builder
+        .ins()
+        .icmp(IntCC::NotEqual, runtime_ptrs.cop1_fcr31_ptr, zero_ptr);
+
+    let fast_block = builder.create_block();
+    let slow_block = builder.create_block();
+    let done_block = builder.create_block();
+    builder.append_block_param(done_block, types::I64);
     builder
         .ins()
-        .call(helpers.lo_write, &[callbacks_ptr, value]);
+        .brif(has_ptr, fast_block, &[], slow_block, &[]);
+
+    builder.switch_to_block(fast_block);
+    let mut flags = MemFlags::new();
+    flags.set_notrap();
+    flags.set_aligned();
+    let fcr31 = builder
+        .ins()
+        .load(types::I32, flags, runtime_ptrs.cop1_fcr31_ptr, 0);
+    let cond_mask = builder.ins().iconst(types::I32, i64::from(1 << 23));
+    let cond_bits = builder.ins().band(fcr31, cond_mask);
+    let zero_i32 = builder.ins().iconst(types::I32, 0);
+    let cond = builder.ins().icmp(IntCC::NotEqual, cond_bits, zero_i32);
+    let cond64 = builder.ins().uextend(types::I64, cond);
+    let args = [cond64.into()];
+    builder.ins().jump(done_block, &args);
+
+    builder.switch_to_block(slow_block);
+    let call = builder.ins().call(helpers.cop1_condition, &[callbacks_ptr]);
+    let slow = builder.inst_results(call)[0];
+    let args = [slow.into()];
+    builder.ins().jump(done_block, &args);
+
+    builder.switch_to_block(done_block);
+    builder.block_params(done_block)[0]
 }
 
 fn emit_op(
@@ -1300,6 +1450,7 @@ fn emit_op(
     fpr_ptr: Value,
     callbacks_ptr: Value,
     helpers: ImportedFuncRefs,
+    runtime_ptrs: RuntimeStatePtrs,
     fastmem: FastmemValues,
     flags: MemFlags,
     current_pc: Value,
@@ -1483,20 +1634,20 @@ fn emit_op(
             store_gpr(builder, gpr_ptr, rd, result64, flags);
         }
         Op::Mfhi { rd } => {
-            let value = read_hi(builder, callbacks_ptr, helpers);
+            let value = read_hi(builder, callbacks_ptr, helpers, runtime_ptrs);
             store_gpr(builder, gpr_ptr, rd, value, flags);
         }
         Op::Mthi { rs } => {
             let value = load_gpr(builder, gpr_ptr, rs, flags);
-            write_hi(builder, callbacks_ptr, helpers, value);
+            write_hi(builder, callbacks_ptr, helpers, runtime_ptrs, value);
         }
         Op::Mflo { rd } => {
-            let value = read_lo(builder, callbacks_ptr, helpers);
+            let value = read_lo(builder, callbacks_ptr, helpers, runtime_ptrs);
             store_gpr(builder, gpr_ptr, rd, value, flags);
         }
         Op::Mtlo { rs } => {
             let value = load_gpr(builder, gpr_ptr, rs, flags);
-            write_lo(builder, callbacks_ptr, helpers, value);
+            write_lo(builder, callbacks_ptr, helpers, runtime_ptrs, value);
         }
         Op::Mult { rs, rt } => {
             let lhs = load_gpr(builder, gpr_ptr, rs, flags);
@@ -1512,8 +1663,8 @@ fn emit_op(
             let hi_shifted = builder.ins().sshr(product, sh);
             let hi32 = builder.ins().ireduce(types::I32, hi_shifted);
             let hi64 = builder.ins().sextend(types::I64, hi32);
-            write_lo(builder, callbacks_ptr, helpers, lo64);
-            write_hi(builder, callbacks_ptr, helpers, hi64);
+            write_lo(builder, callbacks_ptr, helpers, runtime_ptrs, lo64);
+            write_hi(builder, callbacks_ptr, helpers, runtime_ptrs, hi64);
         }
         Op::Multu { rs, rt } => {
             let lhs = load_gpr(builder, gpr_ptr, rs, flags);
@@ -1529,8 +1680,8 @@ fn emit_op(
             let hi_shifted = builder.ins().ushr(product, sh);
             let hi32 = builder.ins().ireduce(types::I32, hi_shifted);
             let hi64 = builder.ins().sextend(types::I64, hi32);
-            write_lo(builder, callbacks_ptr, helpers, lo64);
-            write_hi(builder, callbacks_ptr, helpers, hi64);
+            write_lo(builder, callbacks_ptr, helpers, runtime_ptrs, lo64);
+            write_hi(builder, callbacks_ptr, helpers, runtime_ptrs, hi64);
         }
         Op::Div { rs, rt } => {
             let lhs = load_gpr(builder, gpr_ptr, rs, flags);
@@ -1551,12 +1702,12 @@ fn emit_op(
             let rem32 = builder.ins().srem(lhs32, safe_rhs32);
             let quot64 = builder.ins().sextend(types::I64, quot32);
             let rem64 = builder.ins().sextend(types::I64, rem32);
-            let old_lo = read_lo(builder, callbacks_ptr, helpers);
-            let old_hi = read_hi(builder, callbacks_ptr, helpers);
+            let old_lo = read_lo(builder, callbacks_ptr, helpers, runtime_ptrs);
+            let old_hi = read_hi(builder, callbacks_ptr, helpers, runtime_ptrs);
             let lo = builder.ins().select(skip, old_lo, quot64);
             let hi = builder.ins().select(skip, old_hi, rem64);
-            write_lo(builder, callbacks_ptr, helpers, lo);
-            write_hi(builder, callbacks_ptr, helpers, hi);
+            write_lo(builder, callbacks_ptr, helpers, runtime_ptrs, lo);
+            write_hi(builder, callbacks_ptr, helpers, runtime_ptrs, hi);
         }
         Op::Divu { rs, rt } => {
             let lhs = load_gpr(builder, gpr_ptr, rs, flags);
@@ -1571,28 +1722,28 @@ fn emit_op(
             let rem32 = builder.ins().urem(lhs32, safe_rhs32);
             let quot64 = builder.ins().sextend(types::I64, quot32);
             let rem64 = builder.ins().sextend(types::I64, rem32);
-            let old_lo = read_lo(builder, callbacks_ptr, helpers);
-            let old_hi = read_hi(builder, callbacks_ptr, helpers);
+            let old_lo = read_lo(builder, callbacks_ptr, helpers, runtime_ptrs);
+            let old_hi = read_hi(builder, callbacks_ptr, helpers, runtime_ptrs);
             let lo = builder.ins().select(is_zero, old_lo, quot64);
             let hi = builder.ins().select(is_zero, old_hi, rem64);
-            write_lo(builder, callbacks_ptr, helpers, lo);
-            write_hi(builder, callbacks_ptr, helpers, hi);
+            write_lo(builder, callbacks_ptr, helpers, runtime_ptrs, lo);
+            write_hi(builder, callbacks_ptr, helpers, runtime_ptrs, hi);
         }
         Op::Dmult { rs, rt } => {
             let lhs = load_gpr(builder, gpr_ptr, rs, flags);
             let rhs = load_gpr(builder, gpr_ptr, rt, flags);
             let lo = builder.ins().imul(lhs, rhs);
             let hi = builder.ins().smulhi(lhs, rhs);
-            write_lo(builder, callbacks_ptr, helpers, lo);
-            write_hi(builder, callbacks_ptr, helpers, hi);
+            write_lo(builder, callbacks_ptr, helpers, runtime_ptrs, lo);
+            write_hi(builder, callbacks_ptr, helpers, runtime_ptrs, hi);
         }
         Op::Dmultu { rs, rt } => {
             let lhs = load_gpr(builder, gpr_ptr, rs, flags);
             let rhs = load_gpr(builder, gpr_ptr, rt, flags);
             let lo = builder.ins().imul(lhs, rhs);
             let hi = builder.ins().umulhi(lhs, rhs);
-            write_lo(builder, callbacks_ptr, helpers, lo);
-            write_hi(builder, callbacks_ptr, helpers, hi);
+            write_lo(builder, callbacks_ptr, helpers, runtime_ptrs, lo);
+            write_hi(builder, callbacks_ptr, helpers, runtime_ptrs, hi);
         }
         Op::Ddiv { rs, rt } => {
             let lhs = load_gpr(builder, gpr_ptr, rs, flags);
@@ -1609,12 +1760,12 @@ fn emit_op(
             let safe_rhs = builder.ins().select(skip, one, rhs);
             let quot = builder.ins().sdiv(lhs, safe_rhs);
             let rem = builder.ins().srem(lhs, safe_rhs);
-            let old_lo = read_lo(builder, callbacks_ptr, helpers);
-            let old_hi = read_hi(builder, callbacks_ptr, helpers);
+            let old_lo = read_lo(builder, callbacks_ptr, helpers, runtime_ptrs);
+            let old_hi = read_hi(builder, callbacks_ptr, helpers, runtime_ptrs);
             let lo = builder.ins().select(skip, old_lo, quot);
             let hi = builder.ins().select(skip, old_hi, rem);
-            write_lo(builder, callbacks_ptr, helpers, lo);
-            write_hi(builder, callbacks_ptr, helpers, hi);
+            write_lo(builder, callbacks_ptr, helpers, runtime_ptrs, lo);
+            write_hi(builder, callbacks_ptr, helpers, runtime_ptrs, hi);
         }
         Op::Ddivu { rs, rt } => {
             let lhs = load_gpr(builder, gpr_ptr, rs, flags);
@@ -1625,12 +1776,12 @@ fn emit_op(
             let safe_rhs = builder.ins().select(is_zero, one, rhs);
             let quot = builder.ins().udiv(lhs, safe_rhs);
             let rem = builder.ins().urem(lhs, safe_rhs);
-            let old_lo = read_lo(builder, callbacks_ptr, helpers);
-            let old_hi = read_hi(builder, callbacks_ptr, helpers);
+            let old_lo = read_lo(builder, callbacks_ptr, helpers, runtime_ptrs);
+            let old_hi = read_hi(builder, callbacks_ptr, helpers, runtime_ptrs);
             let lo = builder.ins().select(is_zero, old_lo, quot);
             let hi = builder.ins().select(is_zero, old_hi, rem);
-            write_lo(builder, callbacks_ptr, helpers, lo);
-            write_hi(builder, callbacks_ptr, helpers, hi);
+            write_lo(builder, callbacks_ptr, helpers, runtime_ptrs, lo);
+            write_hi(builder, callbacks_ptr, helpers, runtime_ptrs, hi);
         }
         Op::Lb { base, rt, imm } => {
             let base_addr = load_gpr(builder, gpr_ptr, base, flags);
@@ -2341,11 +2492,35 @@ impl BlockCompiler for CraneliftCompiler {
             callbacks_ptr,
             std::mem::offset_of!(RuntimeCallbacks, fastmem_phys_mask) as i32,
         );
+        let hi_ptr = builder.ins().load(
+            ptr_ty,
+            callback_flags,
+            callbacks_ptr,
+            std::mem::offset_of!(RuntimeCallbacks, hi_ptr) as i32,
+        );
+        let lo_ptr = builder.ins().load(
+            ptr_ty,
+            callback_flags,
+            callbacks_ptr,
+            std::mem::offset_of!(RuntimeCallbacks, lo_ptr) as i32,
+        );
+        let cop1_fcr31_ptr = builder.ins().load(
+            ptr_ty,
+            callback_flags,
+            callbacks_ptr,
+            std::mem::offset_of!(RuntimeCallbacks, cop1_fcr31_ptr) as i32,
+        );
         let fastmem = FastmemValues {
             ptr_ty,
             base: fastmem_base,
             phys_limit: fastmem_phys_limit,
             phys_mask: fastmem_phys_mask,
+        };
+        let runtime_ptrs = RuntimeStatePtrs {
+            ptr_ty,
+            hi_ptr,
+            lo_ptr,
+            cop1_fcr31_ptr,
         };
         let helpers = ImportedFuncRefs {
             load_u8: self
@@ -2406,6 +2581,40 @@ impl BlockCompiler for CraneliftCompiler {
             phys_to_index.insert(step.phys(), idx);
         }
 
+        let has_backedge = steps.iter().copied().enumerate().any(|(step_idx, step)| {
+            let TraceStep::Branch { phys, branch, .. } = step else {
+                return false;
+            };
+            let target_phys = match branch {
+                BranchTerminator::Beq { offset, .. }
+                | BranchTerminator::Bne { offset, .. }
+                | BranchTerminator::Beql { offset, .. }
+                | BranchTerminator::Bnel { offset, .. }
+                | BranchTerminator::Blez { offset, .. }
+                | BranchTerminator::Bgtz { offset, .. }
+                | BranchTerminator::Blezl { offset, .. }
+                | BranchTerminator::Bgtzl { offset, .. }
+                | BranchTerminator::Bltz { offset, .. }
+                | BranchTerminator::Bgez { offset, .. }
+                | BranchTerminator::Bltzl { offset, .. }
+                | BranchTerminator::Bgezl { offset, .. }
+                | BranchTerminator::Bc1f { offset }
+                | BranchTerminator::Bc1t { offset }
+                | BranchTerminator::Bc1fl { offset }
+                | BranchTerminator::Bc1tl { offset } => phys
+                    .wrapping_add(4)
+                    .wrapping_add(((offset as i32) << 2) as u32),
+                BranchTerminator::J { target } | BranchTerminator::Jal { target } => {
+                    jump_target_phys(phys, target)
+                }
+                BranchTerminator::Jr { .. } | BranchTerminator::Jalr { .. } => return false,
+            };
+            match phys_to_index.get(&target_phys).copied() {
+                Some(target_idx) => target_idx <= step_idx,
+                None => false,
+            }
+        });
+
         let exit_block = builder.create_block();
         builder.append_block_param(exit_block, types::I64);
         builder.append_block_param(exit_block, types::I32);
@@ -2417,10 +2626,16 @@ impl BlockCompiler for CraneliftCompiler {
                 b
             })
             .collect();
-        let retire_limit_value = request.max_instructions.max(1).min(i32::MAX as u32);
-        let retire_limit = builder
-            .ins()
-            .iconst(types::I32, i64::from(retire_limit_value));
+        let retire_limit = if has_backedge {
+            let retire_limit_value = request.max_instructions.max(1).min(i32::MAX as u32);
+            Some(
+                builder
+                    .ins()
+                    .iconst(types::I32, i64::from(retire_limit_value)),
+            )
+        } else {
+            None
+        };
 
         let zero_retired = builder.ins().iconst(types::I32, 0);
         let args = [zero_retired.into()];
@@ -2433,21 +2648,23 @@ impl BlockCompiler for CraneliftCompiler {
             let step_phys = step.phys();
             let step_delta = i64::from(step_phys.wrapping_sub(request.start_phys));
             let current_pc = builder.ins().iadd_imm(start_pc, step_delta);
-            let reached_budget = builder.ins().icmp(
-                IntCC::UnsignedGreaterThanOrEqual,
-                retired_count,
-                retire_limit,
-            );
-            let execute_step_block = builder.create_block();
-            let exit_args = [current_pc.into(), retired_count.into()];
-            builder.ins().brif(
-                reached_budget,
-                exit_block,
-                &exit_args,
-                execute_step_block,
-                &[],
-            );
-            builder.switch_to_block(execute_step_block);
+            if let Some(retire_limit) = retire_limit {
+                let reached_budget = builder.ins().icmp(
+                    IntCC::UnsignedGreaterThanOrEqual,
+                    retired_count,
+                    retire_limit,
+                );
+                let execute_step_block = builder.create_block();
+                let exit_args = [current_pc.into(), retired_count.into()];
+                builder.ins().brif(
+                    reached_budget,
+                    exit_block,
+                    &exit_args,
+                    execute_step_block,
+                    &[],
+                );
+                builder.switch_to_block(execute_step_block);
+            }
 
             match step {
                 TraceStep::Op { op, .. } => {
@@ -2457,6 +2674,7 @@ impl BlockCompiler for CraneliftCompiler {
                         fpr_ptr,
                         callbacks_ptr,
                         helpers,
+                        runtime_ptrs,
                         fastmem,
                         flags,
                         current_pc,
@@ -2499,6 +2717,7 @@ impl BlockCompiler for CraneliftCompiler {
                                 fpr_ptr,
                                 callbacks_ptr,
                                 helpers,
+                                runtime_ptrs,
                                 fastmem,
                                 flags,
                                 next_of_branch,
@@ -2531,6 +2750,7 @@ impl BlockCompiler for CraneliftCompiler {
                                 fpr_ptr,
                                 callbacks_ptr,
                                 helpers,
+                                runtime_ptrs,
                                 fastmem,
                                 flags,
                                 next_of_branch,
@@ -2556,6 +2776,7 @@ impl BlockCompiler for CraneliftCompiler {
                                 fpr_ptr,
                                 callbacks_ptr,
                                 helpers,
+                                runtime_ptrs,
                                 fastmem,
                                 flags,
                                 next_of_branch,
@@ -2575,6 +2796,7 @@ impl BlockCompiler for CraneliftCompiler {
                                 fpr_ptr,
                                 callbacks_ptr,
                                 helpers,
+                                runtime_ptrs,
                                 fastmem,
                                 flags,
                                 next_of_branch,
@@ -2647,6 +2869,7 @@ impl BlockCompiler for CraneliftCompiler {
                                     fpr_ptr,
                                     callbacks_ptr,
                                     helpers,
+                                    runtime_ptrs,
                                     fastmem,
                                     flags,
                                     next_of_branch,
@@ -2670,6 +2893,7 @@ impl BlockCompiler for CraneliftCompiler {
                                     fpr_ptr,
                                     callbacks_ptr,
                                     helpers,
+                                    runtime_ptrs,
                                     fastmem,
                                     flags,
                                     next_of_branch,
@@ -2719,8 +2943,12 @@ impl BlockCompiler for CraneliftCompiler {
                         | BranchTerminator::Bc1t { offset }
                         | BranchTerminator::Bc1fl { offset }
                         | BranchTerminator::Bc1tl { offset } => {
-                            let call = builder.ins().call(helpers.cop1_condition, &[callbacks_ptr]);
-                            let condition = builder.inst_results(call)[0];
+                            let condition = read_cop1_condition_flag(
+                                &mut builder,
+                                callbacks_ptr,
+                                helpers,
+                                runtime_ptrs,
+                            );
                             let zero = iconst_u64(&mut builder, 0);
                             let cond_taken = match branch {
                                 BranchTerminator::Bc1f { .. } | BranchTerminator::Bc1fl { .. } => {
@@ -2778,6 +3006,7 @@ impl BlockCompiler for CraneliftCompiler {
                                     fpr_ptr,
                                     callbacks_ptr,
                                     helpers,
+                                    runtime_ptrs,
                                     fastmem,
                                     flags,
                                     next_of_branch,
@@ -2801,6 +3030,7 @@ impl BlockCompiler for CraneliftCompiler {
                                     fpr_ptr,
                                     callbacks_ptr,
                                     helpers,
+                                    runtime_ptrs,
                                     fastmem,
                                     flags,
                                     next_of_branch,
@@ -2923,6 +3153,7 @@ impl BlockCompiler for CraneliftCompiler {
                                     fpr_ptr,
                                     callbacks_ptr,
                                     helpers,
+                                    runtime_ptrs,
                                     fastmem,
                                     flags,
                                     next_of_branch,
@@ -2946,6 +3177,7 @@ impl BlockCompiler for CraneliftCompiler {
                                     fpr_ptr,
                                     callbacks_ptr,
                                     helpers,
+                                    runtime_ptrs,
                                     fastmem,
                                     flags,
                                     next_of_branch,
@@ -3145,6 +3377,9 @@ mod tests {
             hi_write: test_hi_write,
             lo_read: test_lo_read,
             lo_write: test_lo_write,
+            hi_ptr: std::ptr::null_mut(),
+            lo_ptr: std::ptr::null_mut(),
+            cop1_fcr31_ptr: std::ptr::null_mut(),
             fastmem_base: std::ptr::null_mut(),
             fastmem_phys_limit: 0,
             fastmem_phys_mask: 0,
@@ -3301,6 +3536,9 @@ mod tests {
             hi_write: state_hi_write,
             lo_read: state_lo_read,
             lo_write: state_lo_write,
+            hi_ptr: (&mut state.hi as *mut u64),
+            lo_ptr: (&mut state.lo as *mut u64),
+            cop1_fcr31_ptr: std::ptr::null_mut(),
             fastmem_base: std::ptr::null_mut(),
             fastmem_phys_limit: 0,
             fastmem_phys_mask: 0,

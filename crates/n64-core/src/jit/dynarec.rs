@@ -463,7 +463,7 @@ impl DynarecEngine {
 
     pub fn new_cranelift() -> Self {
         let hot_threshold = Self::parse_env_u16("N64_DYNAREC_HOT_THRESHOLD", 32);
-        let max_block_instructions = Self::parse_env_u32("N64_DYNAREC_MAX_BLOCK_INSNS", 256);
+        let max_block_instructions = Self::parse_env_u32("N64_DYNAREC_MAX_BLOCK_INSNS", 512);
         let tier1_default = max_block_instructions.min(64).max(1);
         let tier1_max_block_instructions =
             Self::parse_env_u32("N64_DYNAREC_TIER1_MAX_BLOCK_INSNS", tier1_default)
@@ -1253,6 +1253,9 @@ impl DynarecEngine {
             hi_write: cb_hi_write::<B>,
             lo_read: cb_lo_read::<B>,
             lo_write: cb_lo_write::<B>,
+            hi_ptr: (&mut cpu.hi as *mut u64),
+            lo_ptr: (&mut cpu.lo as *mut u64),
+            cop1_fcr31_ptr: (&mut cpu.cop1.fcr31 as *mut u32),
             fastmem_base: fastmem.rdram_base,
             fastmem_phys_limit: fastmem.rdram_phys_limit,
             fastmem_phys_mask: fastmem.rdram_phys_mask,
