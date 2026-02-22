@@ -266,7 +266,7 @@ impl DynarecEngine {
         let hot_threshold = Self::parse_env_u16("N64_DYNAREC_HOT_THRESHOLD", 8192);
         let max_block_instructions = Self::parse_env_u32("N64_DYNAREC_MAX_BLOCK_INSNS", 256);
         let min_native_instructions = Self::parse_env_u32("N64_DYNAREC_MIN_BLOCK_INSNS", 2);
-        let native_gas_limit = Self::parse_env_u32("N64_DYNAREC_NATIVE_GAS", 2048);
+        let native_gas_limit = Self::parse_env_u32("N64_DYNAREC_NATIVE_GAS", 512);
         let chain_limit = Self::parse_env_u32_allow_zero("N64_DYNAREC_CHAIN_LIMIT", 2);
         let compiler = Box::<CraneliftCompiler>::default();
         let recompiler = Recompiler::new(
