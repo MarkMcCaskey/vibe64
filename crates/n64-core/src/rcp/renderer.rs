@@ -1256,13 +1256,15 @@ impl Renderer {
             let [cx, cy, cz, cw] = mat4_mul_vec(&self.mvp, [x, y, z, 1.0]);
 
             // When G_FOG (0x10000) is enabled, compute fog factor from
-            // normalized depth (clip Z / clip W, approximately -1..1) and
+            // clip depth mapped through the viewport transform. Fast3D fog
+            // params are effectively fixed-point, so apply the /256 scale.
             // replace vertex alpha with it. The blender then uses shade alpha
             // to lerp between pixel color and fog_color.
             let a = if self.geometry_mode & 0x10000 != 0 && cw.abs() > 0.0001 {
                 let ndc_z = (cz / cw).clamp(-1.0, 1.0);
-                let fog =
-                    (ndc_z * self.fog_multiplier as f32 + self.fog_offset as f32).clamp(0.0, 255.0);
+                let fog_z = ndc_z * self.viewport_scale[2] + self.viewport_trans[2];
+                let fog = ((fog_z * self.fog_multiplier as f32 + self.fog_offset as f32) / 256.0)
+                    .clamp(0.0, 255.0);
                 fog as u8
             } else {
                 a
