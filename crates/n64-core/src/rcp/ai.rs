@@ -45,7 +45,9 @@ pub enum AiRegWrite {
 pub enum AiTickResult {
     None,
     /// Current DMA finished; optional tuple is next DMA that auto-started.
-    BufferFinished { next_dma: Option<(u32, u32)> },
+    BufferFinished {
+        next_dma: Option<(u32, u32)>,
+    },
 }
 
 impl Ai {
@@ -67,7 +69,7 @@ impl Ai {
     fn calc_dma_cycles(&self, len: u32) -> u64 {
         let dacrate = self.dacrate.max(1) as u64;
         let samples = len as u64 / 4; // 16-bit stereo = 4 bytes per sample pair
-        // cycles = samples * cpu_freq * (dacrate+1) / vi_clock
+                                      // cycles = samples * cpu_freq * (dacrate+1) / vi_clock
         let cycles = samples * (dacrate + 1) * 93_750_000 / 48_681_812;
         cycles.max(1000) // minimum to avoid tight loops
     }
@@ -138,12 +140,14 @@ impl Ai {
                     }
 
                     self.dma_count += 1;
-                    if started_now {
-                        return AiRegWrite::DmaStarted {
-                            dram_addr: self.dram_addr,
-                            len: self.len,
-                        };
-                    }
+                    // Always capture samples immediately when the buffer is
+                    // queued, not just when it starts playing. Games may
+                    // overwrite the RDRAM source between queueing and actual
+                    // playback, so we must snapshot the data now.
+                    return AiRegWrite::DmaStarted {
+                        dram_addr: self.dram_addr,
+                        len: self.len,
+                    };
                 }
                 AiRegWrite::None
             }
@@ -220,7 +224,12 @@ mod tests {
         assert_eq!(status_one & (1 << 31), 0, "full should be clear");
 
         ai.write_u32(0x00, 0x0000_2000);
-        assert!(matches!(ai.write_u32(0x04, 0x0000_0200), AiRegWrite::None));
+        // Second buffer also returns DmaStarted so caller captures samples
+        // immediately (before RDRAM contents can be overwritten).
+        assert!(matches!(
+            ai.write_u32(0x04, 0x0000_0200),
+            AiRegWrite::DmaStarted { .. }
+        ));
         let status_two = ai.read_u32(0x0C);
         assert_ne!(status_two & (1 << 30), 0, "busy should stay set");
         assert_ne!(status_two & (1 << 31), 0, "full should be set");
@@ -269,7 +278,11 @@ mod tests {
         ));
 
         ai.write_u32(0x00, 0x0000_6000);
-        assert!(matches!(ai.write_u32(0x04, 0x0000_0300), AiRegWrite::None));
+        // Second buffer also returns DmaStarted for immediate sample capture.
+        assert!(matches!(
+            ai.write_u32(0x04, 0x0000_0300),
+            AiRegWrite::DmaStarted { .. }
+        ));
 
         let elapsed = ai.dma_cycles + 1;
         match ai.tick(elapsed) {

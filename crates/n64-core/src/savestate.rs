@@ -8,7 +8,6 @@
 ///   [16..]   State data (CPU, memory, peripherals, renderer)
 ///
 /// Total size: ~8.05 MB (dominated by 8 MB RDRAM).
-
 use std::io;
 use std::path::Path;
 
@@ -24,20 +23,42 @@ struct StateWriter {
 
 impl StateWriter {
     fn new() -> Self {
-        Self { buf: Vec::with_capacity(8 * 1024 * 1024 + 65536) }
+        Self {
+            buf: Vec::with_capacity(8 * 1024 * 1024 + 65536),
+        }
     }
 
-    fn write_u8(&mut self, v: u8) { self.buf.push(v); }
-    fn write_u16(&mut self, v: u16) { self.buf.extend_from_slice(&v.to_le_bytes()); }
-    fn write_i16(&mut self, v: i16) { self.buf.extend_from_slice(&v.to_le_bytes()); }
-    fn write_u32(&mut self, v: u32) { self.buf.extend_from_slice(&v.to_le_bytes()); }
-    fn write_u64(&mut self, v: u64) { self.buf.extend_from_slice(&v.to_le_bytes()); }
-    fn write_i8(&mut self, v: i8) { self.buf.push(v as u8); }
-    fn write_f32(&mut self, v: f32) { self.buf.extend_from_slice(&v.to_le_bytes()); }
-    fn write_bytes(&mut self, data: &[u8]) { self.buf.extend_from_slice(data); }
-    fn write_bool(&mut self, v: bool) { self.buf.push(if v { 1 } else { 0 }); }
+    fn write_u8(&mut self, v: u8) {
+        self.buf.push(v);
+    }
+    fn write_u16(&mut self, v: u16) {
+        self.buf.extend_from_slice(&v.to_le_bytes());
+    }
+    fn write_i16(&mut self, v: i16) {
+        self.buf.extend_from_slice(&v.to_le_bytes());
+    }
+    fn write_u32(&mut self, v: u32) {
+        self.buf.extend_from_slice(&v.to_le_bytes());
+    }
+    fn write_u64(&mut self, v: u64) {
+        self.buf.extend_from_slice(&v.to_le_bytes());
+    }
+    fn write_i8(&mut self, v: i8) {
+        self.buf.push(v as u8);
+    }
+    fn write_f32(&mut self, v: f32) {
+        self.buf.extend_from_slice(&v.to_le_bytes());
+    }
+    fn write_bytes(&mut self, data: &[u8]) {
+        self.buf.extend_from_slice(data);
+    }
+    fn write_bool(&mut self, v: bool) {
+        self.buf.push(if v { 1 } else { 0 });
+    }
 
-    fn into_bytes(self) -> Vec<u8> { self.buf }
+    fn into_bytes(self) -> Vec<u8> {
+        self.buf
+    }
 }
 
 // ─── Binary Reader ───────────────────────────────────────────
@@ -48,17 +69,23 @@ struct StateReader<'a> {
 }
 
 impl<'a> StateReader<'a> {
-    fn new(data: &'a [u8]) -> Self { Self { data, pos: 0 } }
+    fn new(data: &'a [u8]) -> Self {
+        Self { data, pos: 0 }
+    }
 
     fn read_u8(&mut self) -> io::Result<u8> {
-        if self.pos >= self.data.len() { return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated")); }
+        if self.pos >= self.data.len() {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated"));
+        }
         let v = self.data[self.pos];
         self.pos += 1;
         Ok(v)
     }
 
     fn read_u16(&mut self) -> io::Result<u16> {
-        if self.pos + 2 > self.data.len() { return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated")); }
+        if self.pos + 2 > self.data.len() {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated"));
+        }
         let v = u16::from_le_bytes([self.data[self.pos], self.data[self.pos + 1]]);
         self.pos += 2;
         Ok(v)
@@ -69,14 +96,18 @@ impl<'a> StateReader<'a> {
     }
 
     fn read_u32(&mut self) -> io::Result<u32> {
-        if self.pos + 4 > self.data.len() { return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated")); }
+        if self.pos + 4 > self.data.len() {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated"));
+        }
         let v = u32::from_le_bytes(self.data[self.pos..self.pos + 4].try_into().unwrap());
         self.pos += 4;
         Ok(v)
     }
 
     fn read_u64(&mut self) -> io::Result<u64> {
-        if self.pos + 8 > self.data.len() { return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated")); }
+        if self.pos + 8 > self.data.len() {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated"));
+        }
         let v = u64::from_le_bytes(self.data[self.pos..self.pos + 8].try_into().unwrap());
         self.pos += 8;
         Ok(v)
@@ -95,7 +126,9 @@ impl<'a> StateReader<'a> {
     }
 
     fn read_bytes(&mut self, len: usize) -> io::Result<&'a [u8]> {
-        if self.pos + len > self.data.len() { return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated")); }
+        if self.pos + len > self.data.len() {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated"));
+        }
         let slice = &self.data[self.pos..self.pos + len];
         self.pos += len;
         Ok(slice)
@@ -109,7 +142,9 @@ pub fn capture(n64: &crate::N64) -> Vec<u8> {
     let mut w = StateWriter::new();
 
     // ── CPU ──
-    for &r in &n64.cpu.gpr { w.write_u64(r); }
+    for &r in &n64.cpu.gpr {
+        w.write_u64(r);
+    }
     w.write_u64(n64.cpu.pc);
     w.write_u64(n64.cpu.next_pc);
     w.write_u64(n64.cpu.hi);
@@ -118,10 +153,14 @@ pub fn capture(n64: &crate::N64) -> Vec<u8> {
     w.write_bool(n64.cpu.ll_bit);
 
     // ── COP0 ──
-    for &r in &n64.cpu.cop0.regs { w.write_u64(r); }
+    for &r in &n64.cpu.cop0.regs {
+        w.write_u64(r);
+    }
 
     // ── COP1 ──
-    for &r in &n64.cpu.cop1.fpr { w.write_u64(r); }
+    for &r in &n64.cpu.cop1.fpr {
+        w.write_u64(r);
+    }
     w.write_u32(n64.cpu.cop1.fcr31);
 
     // ── TLB ──
@@ -267,13 +306,25 @@ fn write_renderer(w: &mut StateWriter, r: &crate::rcp::renderer::Renderer) {
     w.write_u8(r.prim_min_level);
     w.write_u32(r.combine_hi);
     w.write_u32(r.combine_lo);
-    for &seg in &r.segment_table { w.write_u32(seg); }
+    for &seg in &r.segment_table {
+        w.write_u32(seg);
+    }
     w.write_i16(r.fog_multiplier);
     w.write_i16(r.fog_offset);
     w.write_u8(r.num_dir_lights);
-    for color in &r.light_colors { w.write_bytes(color); }
-    for dir in &r.light_dirs { for &d in dir { w.write_i8(d); } }
-    for look in &r.lookat { for &f in look { w.write_f32(f); } }
+    for color in &r.light_colors {
+        w.write_bytes(color);
+    }
+    for dir in &r.light_dirs {
+        for &d in dir {
+            w.write_i8(d);
+        }
+    }
+    for look in &r.lookat {
+        for &f in look {
+            w.write_f32(f);
+        }
+    }
     w.write_bytes(&r.tmem);
     for tile in &r.tiles {
         w.write_u8(tile.format);
@@ -293,10 +344,20 @@ fn write_renderer(w: &mut StateWriter, r: &crate::rcp::renderer::Renderer) {
         w.write_u16(tile.th);
     }
     for vtx in &r.vertex_buffer {
-        w.write_f32(vtx.x); w.write_f32(vtx.y); w.write_f32(vtx.z); w.write_f32(vtx.w);
-        w.write_f32(vtx.clip_x); w.write_f32(vtx.clip_y); w.write_f32(vtx.clip_z); w.write_f32(vtx.clip_w);
-        w.write_f32(vtx.s); w.write_f32(vtx.t);
-        w.write_u8(vtx.r); w.write_u8(vtx.g); w.write_u8(vtx.b); w.write_u8(vtx.a);
+        w.write_f32(vtx.x);
+        w.write_f32(vtx.y);
+        w.write_f32(vtx.z);
+        w.write_f32(vtx.w);
+        w.write_f32(vtx.clip_x);
+        w.write_f32(vtx.clip_y);
+        w.write_f32(vtx.clip_z);
+        w.write_f32(vtx.clip_w);
+        w.write_f32(vtx.s);
+        w.write_f32(vtx.t);
+        w.write_u8(vtx.r);
+        w.write_u8(vtx.g);
+        w.write_u8(vtx.b);
+        w.write_u8(vtx.a);
     }
     w.write_u32(r.geometry_mode);
     w.write_bool(r.texture_on);
@@ -304,17 +365,39 @@ fn write_renderer(w: &mut StateWriter, r: &crate::rcp::renderer::Renderer) {
     w.write_u16(r.texture_scale_s);
     w.write_u16(r.texture_scale_t);
     // Matrices (4x4 f32)
-    for row in &r.modelview { for &f in row { w.write_f32(f); } }
-    for row in &r.projection { for &f in row { w.write_f32(f); } }
-    for row in &r.mvp { for &f in row { w.write_f32(f); } }
+    for row in &r.modelview {
+        for &f in row {
+            w.write_f32(f);
+        }
+    }
+    for row in &r.projection {
+        for &f in row {
+            w.write_f32(f);
+        }
+    }
+    for row in &r.mvp {
+        for &f in row {
+            w.write_f32(f);
+        }
+    }
     // Matrix stack: length-prefixed
     w.write_u32(r.matrix_stack.len() as u32);
     for mat in &r.matrix_stack {
-        for row in mat { for &f in row { w.write_f32(f); } }
+        for row in mat {
+            for &f in row {
+                w.write_f32(f);
+            }
+        }
     }
-    for &f in &r.viewport_scale { w.write_f32(f); }
-    for &f in &r.viewport_trans { w.write_f32(f); }
-    for &h in &r.rdp_half { w.write_u32(h); }
+    for &f in &r.viewport_scale {
+        w.write_f32(f);
+    }
+    for &f in &r.viewport_trans {
+        w.write_f32(f);
+    }
+    for &h in &r.rdp_half {
+        w.write_u32(h);
+    }
 }
 
 fn write_audio_hle(w: &mut StateWriter, a: &crate::rcp::audio_hle::AudioHle) {
@@ -325,12 +408,18 @@ fn write_audio_hle(w: &mut StateWriter, a: &crate::rcp::audio_hle::AudioHle) {
     // ADPCM table: length-prefixed
     let table = a.adpcm_table();
     w.write_u32(table.len() as u32);
-    for &s in table { w.write_i16(s); }
+    for &s in table {
+        w.write_i16(s);
+    }
     w.write_u32(a.adpcm_loop());
     let env = a.env_values();
-    for &v in env { w.write_u16(v); }
+    for &v in env {
+        w.write_u16(v);
+    }
     let steps = a.env_steps();
-    for &v in steps { w.write_u16(v); }
+    for &v in steps {
+        w.write_u16(v);
+    }
     w.write_u16(a.filter_count());
     w.write_u32(a.filter_lut_addr());
 }
@@ -348,13 +437,23 @@ fn validate_header(
     actual_len: usize,
 ) -> Result<(), String> {
     if file_version > VERSION {
-        return Err(format!("Save state version {} is newer than supported ({})", file_version, VERSION));
+        return Err(format!(
+            "Save state version {} is newer than supported ({})",
+            file_version, VERSION
+        ));
     }
     if (data_len as usize) > actual_len {
-        return Err(format!("Save state truncated: header says {} bytes, file has {}", data_len, actual_len));
+        return Err(format!(
+            "Save state truncated: header says {} bytes, file has {}",
+            data_len, actual_len
+        ));
     }
     if file_crc != current_crc {
-        log::warn!("Save state CRC mismatch: file={:#010X}, ROM={:#010X} — loading anyway", file_crc, current_crc);
+        log::warn!(
+            "Save state CRC mismatch: file={:#010X}, ROM={:#010X} — loading anyway",
+            file_crc,
+            current_crc
+        );
     }
     Ok(())
 }
@@ -376,12 +475,20 @@ pub fn restore(n64: &mut crate::N64, data: &[u8]) -> Result<(), String> {
     let current_crc = n64.bus.cart.crc();
     let actual_data = &data[HEADER_SIZE..];
 
-    validate_header(file_version, file_crc, current_crc, data_len, actual_data.len())?;
+    validate_header(
+        file_version,
+        file_crc,
+        current_crc,
+        data_len,
+        actual_data.len(),
+    )?;
 
     let mut r = StateReader::new(actual_data);
 
     // ── CPU ──
-    for reg in &mut n64.cpu.gpr { *reg = r.read_u64().map_err(|e| e.to_string())?; }
+    for reg in &mut n64.cpu.gpr {
+        *reg = r.read_u64().map_err(|e| e.to_string())?;
+    }
     n64.cpu.pc = r.read_u64().map_err(|e| e.to_string())?;
     n64.cpu.next_pc = r.read_u64().map_err(|e| e.to_string())?;
     n64.cpu.hi = r.read_u64().map_err(|e| e.to_string())?;
@@ -390,10 +497,14 @@ pub fn restore(n64: &mut crate::N64, data: &[u8]) -> Result<(), String> {
     n64.cpu.ll_bit = r.read_bool().map_err(|e| e.to_string())?;
 
     // ── COP0 ──
-    for reg in &mut n64.cpu.cop0.regs { *reg = r.read_u64().map_err(|e| e.to_string())?; }
+    for reg in &mut n64.cpu.cop0.regs {
+        *reg = r.read_u64().map_err(|e| e.to_string())?;
+    }
 
     // ── COP1 ──
-    for reg in &mut n64.cpu.cop1.fpr { *reg = r.read_u64().map_err(|e| e.to_string())?; }
+    for reg in &mut n64.cpu.cop1.fpr {
+        *reg = r.read_u64().map_err(|e| e.to_string())?;
+    }
     n64.cpu.cop1.fcr31 = r.read_u32().map_err(|e| e.to_string())?;
 
     // ── TLB ──
@@ -408,7 +519,9 @@ pub fn restore(n64: &mut crate::N64, data: &[u8]) -> Result<(), String> {
     n64.cycles = r.read_u64().map_err(|e| e.to_string())?;
 
     // ── RDRAM ──
-    let rdram_data = r.read_bytes(n64.bus.rdram.data().len()).map_err(|e| e.to_string())?;
+    let rdram_data = r
+        .read_bytes(n64.bus.rdram.data().len())
+        .map_err(|e| e.to_string())?;
     n64.bus.rdram.data_mut().copy_from_slice(rdram_data);
 
     // ── PIF ──
@@ -433,7 +546,10 @@ pub fn restore(n64: &mut crate::N64, data: &[u8]) -> Result<(), String> {
     n64.bus.rsp.imem.copy_from_slice(imem);
     n64.bus.rsp.status = r.read_u32().map_err(|e| e.to_string())?;
     n64.bus.rsp.pc = r.read_u32().map_err(|e| e.to_string())?;
-    n64.bus.rsp.semaphore.set(r.read_u32().map_err(|e| e.to_string())?);
+    n64.bus
+        .rsp
+        .semaphore
+        .set(r.read_u32().map_err(|e| e.to_string())?);
     n64.bus.rsp.dma_mem_addr = r.read_u32().map_err(|e| e.to_string())?;
     n64.bus.rsp.dma_dram_addr = r.read_u32().map_err(|e| e.to_string())?;
     n64.bus.rsp.dma_len = r.read_u32().map_err(|e| e.to_string())?;
@@ -509,7 +625,8 @@ pub fn restore(n64: &mut crate::N64, data: &[u8]) -> Result<(), String> {
     read_audio_hle(&mut r, &mut n64.bus.audio_hle).map_err(|e| e.to_string())?;
 
     // Clear transient state that shouldn't survive restore
-    n64.bus.audio_samples.clear();
+    n64.bus.audio_sample_count = 0;
+    n64.bus.audio_nonzero_sample_count = 0;
     n64.cpu.tlb_miss = None;
     n64.cpu.reserved_instr = false;
 
@@ -545,7 +662,9 @@ fn read_renderer(r: &mut StateReader, ren: &mut crate::rcp::renderer::Renderer) 
     ren.prim_min_level = r.read_u8()?;
     ren.combine_hi = r.read_u32()?;
     ren.combine_lo = r.read_u32()?;
-    for seg in &mut ren.segment_table { *seg = r.read_u32()?; }
+    for seg in &mut ren.segment_table {
+        *seg = r.read_u32()?;
+    }
     ren.fog_multiplier = r.read_i16()?;
     ren.fog_offset = r.read_i16()?;
     ren.num_dir_lights = r.read_u8()?;
@@ -554,10 +673,14 @@ fn read_renderer(r: &mut StateReader, ren: &mut crate::rcp::renderer::Renderer) 
         color.copy_from_slice(bytes);
     }
     for dir in &mut ren.light_dirs {
-        for d in dir { *d = r.read_i8()?; }
+        for d in dir {
+            *d = r.read_i8()?;
+        }
     }
     for look in &mut ren.lookat {
-        for f in look { *f = r.read_f32()?; }
+        for f in look {
+            *f = r.read_f32()?;
+        }
     }
     let tmem = r.read_bytes(4096)?;
     ren.tmem.copy_from_slice(tmem);
@@ -579,29 +702,61 @@ fn read_renderer(r: &mut StateReader, ren: &mut crate::rcp::renderer::Renderer) 
         tile.th = r.read_u16()?;
     }
     for vtx in &mut ren.vertex_buffer {
-        vtx.x = r.read_f32()?; vtx.y = r.read_f32()?; vtx.z = r.read_f32()?; vtx.w = r.read_f32()?;
-        vtx.clip_x = r.read_f32()?; vtx.clip_y = r.read_f32()?; vtx.clip_z = r.read_f32()?; vtx.clip_w = r.read_f32()?;
-        vtx.s = r.read_f32()?; vtx.t = r.read_f32()?;
-        vtx.r = r.read_u8()?; vtx.g = r.read_u8()?; vtx.b = r.read_u8()?; vtx.a = r.read_u8()?;
+        vtx.x = r.read_f32()?;
+        vtx.y = r.read_f32()?;
+        vtx.z = r.read_f32()?;
+        vtx.w = r.read_f32()?;
+        vtx.clip_x = r.read_f32()?;
+        vtx.clip_y = r.read_f32()?;
+        vtx.clip_z = r.read_f32()?;
+        vtx.clip_w = r.read_f32()?;
+        vtx.s = r.read_f32()?;
+        vtx.t = r.read_f32()?;
+        vtx.r = r.read_u8()?;
+        vtx.g = r.read_u8()?;
+        vtx.b = r.read_u8()?;
+        vtx.a = r.read_u8()?;
     }
     ren.geometry_mode = r.read_u32()?;
     ren.texture_on = r.read_bool()?;
     ren.texture_tile = r.read_u8()?;
     ren.texture_scale_s = r.read_u16()?;
     ren.texture_scale_t = r.read_u16()?;
-    for row in &mut ren.modelview { for f in row { *f = r.read_f32()?; } }
-    for row in &mut ren.projection { for f in row { *f = r.read_f32()?; } }
-    for row in &mut ren.mvp { for f in row { *f = r.read_f32()?; } }
+    for row in &mut ren.modelview {
+        for f in row {
+            *f = r.read_f32()?;
+        }
+    }
+    for row in &mut ren.projection {
+        for f in row {
+            *f = r.read_f32()?;
+        }
+    }
+    for row in &mut ren.mvp {
+        for f in row {
+            *f = r.read_f32()?;
+        }
+    }
     let stack_len = r.read_u32()? as usize;
     ren.matrix_stack.clear();
     for _ in 0..stack_len {
         let mut mat = [[0.0f32; 4]; 4];
-        for row in &mut mat { for f in row { *f = r.read_f32()?; } }
+        for row in &mut mat {
+            for f in row {
+                *f = r.read_f32()?;
+            }
+        }
         ren.matrix_stack.push(mat);
     }
-    for f in &mut ren.viewport_scale { *f = r.read_f32()?; }
-    for f in &mut ren.viewport_trans { *f = r.read_f32()?; }
-    for h in &mut ren.rdp_half { *h = r.read_u32()?; }
+    for f in &mut ren.viewport_scale {
+        *f = r.read_f32()?;
+    }
+    for f in &mut ren.viewport_trans {
+        *f = r.read_f32()?;
+    }
+    for h in &mut ren.rdp_half {
+        *h = r.read_u32()?;
+    }
     Ok(())
 }
 
@@ -613,14 +768,20 @@ fn read_audio_hle(r: &mut StateReader, a: &mut crate::rcp::audio_hle::AudioHle) 
     a.set_buf_count(r.read_u16()?);
     let table_len = r.read_u32()? as usize;
     let mut table = vec![0i16; table_len];
-    for s in &mut table { *s = r.read_i16()?; }
+    for s in &mut table {
+        *s = r.read_i16()?;
+    }
     a.set_adpcm_table(&table);
     a.set_adpcm_loop(r.read_u32()?);
     let mut env = [0u16; 3];
-    for v in &mut env { *v = r.read_u16()?; }
+    for v in &mut env {
+        *v = r.read_u16()?;
+    }
     a.set_env_values(&env);
     let mut steps = [0u16; 3];
-    for v in &mut steps { *v = r.read_u16()?; }
+    for v in &mut steps {
+        *v = r.read_u16()?;
+    }
     a.set_env_steps(&steps);
     a.set_filter_count(r.read_u16()?);
     a.set_filter_lut_addr(r.read_u32()?);
@@ -633,7 +794,11 @@ fn read_audio_hle(r: &mut StateReader, a: &mut crate::rcp::audio_hle::AudioHle) 
 pub fn save_to_file(n64: &crate::N64, path: &Path) -> io::Result<()> {
     let data = capture(n64);
     std::fs::write(path, &data)?;
-    log::info!("Saved state to {:?} ({:.2} MB)", path, data.len() as f64 / (1024.0 * 1024.0));
+    log::info!(
+        "Saved state to {:?} ({:.2} MB)",
+        path,
+        data.len() as f64 / (1024.0 * 1024.0)
+    );
     Ok(())
 }
 

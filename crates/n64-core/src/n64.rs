@@ -43,18 +43,27 @@ impl N64 {
         // Detect cartridge save backend and EEPROM type from game code
         let uses_flashram = is_flashram_game(&header.game_code);
         let eeprom_type = detect_eeprom(&header.game_code);
-        log::info!("Cart save backend: {}", if uses_flashram { "FlashRAM" } else { "SRAM" });
-        log::info!("EEPROM: {:?} (game code: {:?})",
+        log::info!(
+            "Cart save backend: {}",
+            if uses_flashram { "FlashRAM" } else { "SRAM" }
+        );
+        log::info!(
+            "EEPROM: {:?} (game code: {:?})",
             match eeprom_type {
                 crate::memory::pif::EepromType::None => "None",
                 crate::memory::pif::EepromType::Eeprom4K => "4Kbit (512 bytes)",
                 crate::memory::pif::EepromType::Eeprom16K => "16Kbit (2048 bytes)",
             },
-            std::str::from_utf8(&header.game_code).unwrap_or("????"));
+            std::str::from_utf8(&header.game_code).unwrap_or("????")
+        );
 
         // Detect GBI microcode variant from game code (before header is moved)
         let ucode = crate::rcp::gbi::detect_ucode(&header.game_code);
         log::info!("Microcode: {:?}", ucode);
+
+        // Detect audio HLE ABI variant
+        let audio_abi = crate::rcp::audio_hle::AudioHle::detect_abi(&header.game_code);
+        log::info!("Audio ABI: {:?}", audio_abi);
 
         let entry_point = header.entry_point;
         let game_code = header.game_code;
@@ -66,6 +75,7 @@ impl N64 {
         init_eeprom_for_game(&game_code, &mut bus.pif);
         bus.ucode = ucode;
         bus.renderer.ucode = ucode;
+        bus.audio_hle.abi = audio_abi;
 
         // HLE boot: instead of running the IPL3 bootloader (which is
         // encrypted for CIC-6105), do what it would have done:
@@ -94,24 +104,30 @@ impl N64 {
         }
         log::info!(
             "HLE boot: copied {:#X} bytes from ROM[{:#X}] to RDRAM[{:#X}]",
-            copy_len, game_start, rdram_dest
+            copy_len,
+            game_start,
+            rdram_dest
         );
 
         // OS boot parameters — the IPL3 writes these to low RDRAM.
         // The N64 OS reads them during initialization (__osInitialize).
-        bus.rdram.write_u32(0x300, 1);          // osTvType: 1=NTSC
-        bus.rdram.write_u32(0x304, 0);          // osRomType: 0=cartridge
+        bus.rdram.write_u32(0x300, 1); // osTvType: 1=NTSC
+        bus.rdram.write_u32(0x304, 0); // osRomType: 0=cartridge
         bus.rdram.write_u32(0x308, 0xB000_0000); // osRomBase: cart in kseg1
-        bus.rdram.write_u32(0x30C, 0);          // osResetType: 0=cold boot
-        bus.rdram.write_u32(0x310, match cic {   // osCicId
-            cart::cic::CicVariant::Cic6101 => 1,
-            cart::cic::CicVariant::Cic6102 => 2,
-            cart::cic::CicVariant::Cic6103 => 3,
-            cart::cic::CicVariant::Cic6105 => 5,
-            cart::cic::CicVariant::Cic6106 => 6,
-            cart::cic::CicVariant::Unknown => 2, // default to 6102
-        });
-        bus.rdram.write_u32(0x314, 0);          // osVersion
+        bus.rdram.write_u32(0x30C, 0); // osResetType: 0=cold boot
+        bus.rdram.write_u32(
+            0x310,
+            match cic {
+                // osCicId
+                cart::cic::CicVariant::Cic6101 => 1,
+                cart::cic::CicVariant::Cic6102 => 2,
+                cart::cic::CicVariant::Cic6103 => 3,
+                cart::cic::CicVariant::Cic6105 => 5,
+                cart::cic::CicVariant::Cic6106 => 6,
+                cart::cic::CicVariant::Unknown => 2, // default to 6102
+            },
+        );
+        bus.rdram.write_u32(0x314, 0); // osVersion
         bus.rdram.write_u32(0x318, 0x0080_0000); // osMemSize: 8MB (expansion pak)
 
         let mut cpu = Vr4300::new();
@@ -141,14 +157,25 @@ impl N64 {
     }
 
     /// Video info for the frontend: pixel format, framebuffer dimensions.
-    pub fn vi_pixel_format(&self) -> u32 { self.bus.vi.ctrl & 0x3 }
-    pub fn vi_origin(&self) -> u32 { self.bus.vi.origin }
-    pub fn vi_width(&self) -> u32 { self.bus.vi.width }
-    pub fn rdram_data(&self) -> &[u8] { self.bus.rdram.data() }
+    pub fn vi_pixel_format(&self) -> u32 {
+        self.bus.vi.ctrl & 0x3
+    }
+    pub fn vi_origin(&self) -> u32 {
+        self.bus.vi.origin
+    }
+    pub fn vi_width(&self) -> u32 {
+        self.bus.vi.width
+    }
+    pub fn rdram_data(&self) -> &[u8] {
+        self.bus.rdram.data()
+    }
 
-    /// Audio: drain buffered samples. Returns 16-bit signed stereo PCM (L,R,L,R...).
-    pub fn drain_audio_samples(&mut self) -> Vec<i16> {
-        std::mem::take(&mut self.bus.audio_samples)
+    /// Set a callback that receives audio samples immediately when AI DMA fires.
+    /// The callback receives (&[i16] stereo PCM, u32 N64 sample rate Hz).
+    /// This decouples audio output from the video frame loop, matching real
+    /// N64 hardware where the AI operates asynchronously from the VI.
+    pub fn set_audio_callback(&mut self, cb: Box<dyn FnMut(&[i16], u32)>) {
+        self.bus.audio_callback = Some(cb);
     }
 
     /// Path for EEPROM save file (same directory as ROM, .eeprom extension).
@@ -181,7 +208,9 @@ impl N64 {
                 } else {
                     log::warn!(
                         "EEPROM save {:?} has wrong size ({} bytes, expected {}), ignoring",
-                        path, data.len(), expected
+                        path,
+                        data.len(),
+                        expected
                     );
                 }
             }
@@ -212,7 +241,11 @@ impl N64 {
         match std::fs::read(&path) {
             Ok(data) => {
                 self.bus.flashram.load_data(&data);
-                log::info!("Loaded FlashRAM save from {:?} ({} bytes)", path, data.len());
+                log::info!(
+                    "Loaded FlashRAM save from {:?} ({} bytes)",
+                    path,
+                    data.len()
+                );
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 log::info!("No FlashRAM save file at {:?}, starting fresh", path);
@@ -294,7 +327,11 @@ impl N64 {
         match std::fs::write(&path, self.bus.pif.eeprom_data()) {
             Ok(()) => {
                 self.bus.pif.eeprom_dirty = false;
-                log::info!("Saved EEPROM to {:?} ({} bytes)", path, self.bus.pif.eeprom.len());
+                log::info!(
+                    "Saved EEPROM to {:?} ({} bytes)",
+                    path,
+                    self.bus.pif.eeprom.len()
+                );
             }
             Err(e) => {
                 log::error!("Failed to save EEPROM to {:?}: {}", path, e);
@@ -310,8 +347,7 @@ impl N64 {
     /// Save the emulator state to a numbered slot (0-9).
     pub fn save_state(&self, slot: u8) -> Result<(), String> {
         let path = self.save_state_path(slot);
-        crate::savestate::save_to_file(self, &path)
-            .map_err(|e| format!("Save state failed: {}", e))
+        crate::savestate::save_to_file(self, &path).map_err(|e| format!("Save state failed: {}", e))
     }
 
     /// Load emulator state from a numbered slot (0-9).
@@ -324,7 +360,9 @@ impl N64 {
     /// sample_rate = VI_NTSC_clock / (dacrate + 1)
     pub fn audio_sample_rate(&self) -> u32 {
         let dacrate = self.bus.ai.dacrate;
-        if dacrate == 0 { return 32000; } // sensible default
+        if dacrate == 0 {
+            return 32000;
+        } // sensible default
         48_681_812 / (dacrate + 1)
     }
 
@@ -362,7 +400,10 @@ impl N64 {
 
         // Harvest debug data from renderer
         if self.debug.flags.show_wireframe {
-            std::mem::swap(&mut self.debug.wire_edges, &mut self.bus.renderer.wire_edges);
+            std::mem::swap(
+                &mut self.debug.wire_edges,
+                &mut self.bus.renderer.wire_edges,
+            );
             self.bus.renderer.wire_edges.clear();
         }
         if self.debug.flags.show_dl_log {
@@ -397,8 +438,8 @@ impl N64 {
             self.cycles += elapsed;
             self.bus.vi.tick(elapsed, &mut self.bus.mi);
             self.bus.tick_pi_dma();
-        self.bus.tick_si_dma();
-        self.bus.tick_ai_dma(elapsed);
+            self.bus.tick_si_dma();
+            self.bus.tick_ai_dma(elapsed);
 
             if !tracing && self.bus.pi.dma_count >= trigger_dma {
                 tracing = true;
@@ -422,8 +463,8 @@ impl N64 {
             self.cycles += elapsed;
             self.bus.vi.tick(elapsed, &mut self.bus.mi);
             self.bus.tick_pi_dma();
-        self.bus.tick_si_dma();
-        self.bus.tick_ai_dma(elapsed);
+            self.bus.tick_si_dma();
+            self.bus.tick_ai_dma(elapsed);
         }
         None
     }
@@ -437,8 +478,8 @@ impl N64 {
             self.cycles += elapsed;
             self.bus.vi.tick(elapsed, &mut self.bus.mi);
             self.bus.tick_pi_dma();
-        self.bus.tick_si_dma();
-        self.bus.tick_ai_dma(elapsed);
+            self.bus.tick_si_dma();
+            self.bus.tick_ai_dma(elapsed);
 
             if self.cpu.gpr[30] != 0 {
                 // Dump CPU state on failure for debugging
@@ -482,23 +523,27 @@ fn detect_eeprom(game_code: &[u8; 4]) -> crate::memory::pif::EepromType {
     // 16Kbit EEPROM games (common ones)
     const EEPROM_16K: &[&str] = &[
         "NCLB", "NCLE", "NCLJ", // Cruis'n World
-        "NYBE",                   // Yoshi's Story
+        "NYBE", // Yoshi's Story
     ];
 
     // 4Kbit EEPROM games (most games that use EEPROM)
     const EEPROM_4K: &[&str] = &[
-        "NSME", "NSMJ",           // Super Mario 64
-        "NMKE", "NMKJ",           // Mario Kart 64
-        "NSSE",                    // Star Fox 64
-        "NFZE", "NFZJ",           // F-Zero X
-        "NWRE",                    // Wave Race 64
+        "NSME", "NSMJ", // Super Mario 64
+        "NMKE", "NMKJ", // Mario Kart 64
+        "NSSE", // Star Fox 64
+        "NFZE", "NFZJ", // F-Zero X
+        "NWRE", // Wave Race 64
     ];
 
     for &c in EEPROM_16K {
-        if code == c { return EepromType::Eeprom16K; }
+        if code == c {
+            return EepromType::Eeprom16K;
+        }
     }
     for &c in EEPROM_4K {
-        if code == c { return EepromType::Eeprom4K; }
+        if code == c {
+            return EepromType::Eeprom4K;
+        }
     }
 
     // Default: try 4K EEPROM for unrecognized games (most common save type)
@@ -508,11 +553,11 @@ fn detect_eeprom(game_code: &[u8; 4]) -> crate::memory::pif::EepromType {
 fn is_flashram_game(game_code: &[u8; 4]) -> bool {
     let code = std::str::from_utf8(game_code).unwrap_or("");
     const FLASHRAM_GAMES: &[&str] = &[
-        "NZSE", "NZSJ", "NZSP",  // Majora's Mask (US/JP/PAL)
-        "NZLE", "NZLJ", "NZLP",  // Majora's Mask (PAL alt codes)
-        "NPFE", "NPFJ", "NPFP",  // Pokemon Stadium 2
-        "NPOE", "NPOJ", "NPOP",  // Pokemon Stadium
-        "NPME",                    // Paper Mario
+        "NZSE", "NZSJ", "NZSP", // Majora's Mask (US/JP/PAL)
+        "NZLE", "NZLJ", "NZLP", // Majora's Mask (PAL alt codes)
+        "NPFE", "NPFJ", "NPFP", // Pokemon Stadium 2
+        "NPOE", "NPOJ", "NPOP", // Pokemon Stadium
+        "NPME", // Paper Mario
     ];
     FLASHRAM_GAMES.contains(&code)
 }

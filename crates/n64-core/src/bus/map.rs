@@ -39,9 +39,16 @@ pub struct Interconnect {
     pub ucode: crate::rcp::gbi::UcodeType,
     /// ISViewer debug output buffer (512 bytes at physical 0x13FF0020)
     is_viewer_buf: [u8; 512],
-    /// Audio sample buffer: 16-bit signed PCM, stereo interleaved (L,R,L,R...).
-    /// Populated from RDRAM when AI DMA starts. Frontend drains each frame.
-    pub audio_samples: Vec<i16>,
+    /// Callback invoked immediately when AI DMA captures audio samples.
+    /// Args: (&[i16] stereo PCM samples, u32 N64 sample rate in Hz).
+    /// Set by the frontend to push samples directly to the audio device,
+    /// decoupling audio from the video frame loop (matching real N64 hardware
+    /// where the AI operates asynchronously from the VI).
+    pub audio_callback: Option<Box<dyn FnMut(&[i16], u32)>>,
+    /// Debug counter: total audio samples captured from AI DMA.
+    pub audio_sample_count: u64,
+    /// Debug counter: captured samples that are non-zero.
+    pub audio_nonzero_sample_count: u64,
 }
 
 impl Interconnect {
@@ -66,7 +73,9 @@ impl Interconnect {
             use_flashram: false,
             ucode: crate::rcp::gbi::UcodeType::F3dex2,
             is_viewer_buf: [0u8; 512],
-            audio_samples: Vec::with_capacity(16384),
+            audio_callback: None,
+            audio_sample_count: 0,
+            audio_nonzero_sample_count: 0,
         }
     }
 
@@ -90,11 +99,14 @@ impl Interconnect {
                 let rdram = self.rdram.data_mut();
                 let dest_start = dram_addr as usize;
                 let dest_end = (dest_start + len as usize).min(rdram.len());
-                self.flashram.dma_read(flash_offset, &mut rdram[dest_start..dest_end]);
+                self.flashram
+                    .dma_read(flash_offset, &mut rdram[dest_start..dest_end]);
 
                 log::debug!(
                     "PI DMA (FlashRAM→RDRAM): Flash[{:#010X}] → RDRAM[{:#010X}], len={:#X}",
-                    flash_offset, dram_addr, len
+                    flash_offset,
+                    dram_addr,
+                    len
                 );
             } else {
                 let sram_base = (cart_addr - 0x0800_0000) as usize;
@@ -104,7 +116,9 @@ impl Interconnect {
                 }
                 log::debug!(
                     "PI DMA (SRAM→RDRAM): SRAM[{:#06X}] → RDRAM[{:#010X}], len={:#X}",
-                    sram_base, dram_addr, len
+                    sram_base,
+                    dram_addr,
+                    len
                 );
             }
 
@@ -122,7 +136,10 @@ impl Interconnect {
 
         log::debug!(
             "PI DMA #{}: ROM[{:#010X}] → RDRAM[{:#010X}], len={:#X}",
-            self.pi.dma_count + 1, cart_addr, dram_addr, len
+            self.pi.dma_count + 1,
+            cart_addr,
+            dram_addr,
+            len
         );
 
         // Delay the completion interrupt to match real PI DMA speed (~5MB/s).
@@ -156,7 +173,8 @@ impl Interconnect {
 
                 log::debug!(
                     "PI DMA (RDRAM→FlashRAM): RDRAM[{:#010X}] → Flash page buffer, len={:#X}",
-                    dram_addr, len
+                    dram_addr,
+                    len
                 );
             } else {
                 let sram_base = (cart_addr - 0x0800_0000) as usize;
@@ -167,13 +185,17 @@ impl Interconnect {
                 self.sram_dirty = true;
                 log::debug!(
                     "PI DMA (RDRAM→SRAM): RDRAM[{:#010X}] → SRAM[{:#06X}], len={:#X}",
-                    dram_addr, sram_base, len
+                    dram_addr,
+                    sram_base,
+                    len
                 );
             }
         } else {
             log::debug!(
                 "PI DMA (save): RDRAM[{:#010X}] → Cart[{:#010X}], len={:#X}",
-                dram_addr, cart_addr, len
+                dram_addr,
+                cart_addr,
+                len
             );
         }
 
@@ -195,10 +217,9 @@ impl Interconnect {
         use crate::rcp::ai::AiTickResult;
         match self.ai.tick(elapsed) {
             AiTickResult::None => {}
-            AiTickResult::BufferFinished { next_dma } => {
-                if let Some((dram_addr, len)) = next_dma {
-                    self.capture_ai_samples(dram_addr, len);
-                }
+            AiTickResult::BufferFinished { next_dma: _ } => {
+                // Samples were already captured at queue time (in the AI_LEN
+                // write handler), so we just raise the interrupt here.
                 self.mi.set_interrupt(crate::rcp::mi::MiInterrupt::AI);
             }
         }
@@ -209,12 +230,33 @@ impl Interconnect {
         let base = dram_addr as usize;
         let sample_count = len as usize / 2; // 2 bytes per i16
         let rdram = self.rdram.data();
+        let mut samples = Vec::with_capacity(sample_count);
+        let mut nonzero = 0u64;
         for i in 0..sample_count {
             let off = base + i * 2;
             if off + 1 < rdram.len() {
                 let sample = i16::from_be_bytes([rdram[off], rdram[off + 1]]);
-                self.audio_samples.push(sample);
+                if sample != 0 {
+                    nonzero += 1;
+                }
+                samples.push(sample);
             }
+        }
+
+        self.audio_sample_count += samples.len() as u64;
+        self.audio_nonzero_sample_count += nonzero;
+
+        // Push samples immediately to the audio device (asynchronous from
+        // the frame loop, matching real N64 AI behavior).
+        let dacrate = self.ai.dacrate;
+        let n64_rate = if dacrate == 0 {
+            32000
+        } else {
+            48_681_812 / (dacrate + 1)
+        };
+
+        if let Some(ref mut cb) = self.audio_callback {
+            cb(&samples, n64_rate);
         }
     }
 
@@ -227,10 +269,17 @@ impl Interconnect {
         let task_type = self.rsp.read_dmem_u32(gbi::TASK_TYPE);
         let data_ptr_raw = self.rsp.read_dmem_u32(gbi::TASK_DATA_PTR);
         // Keep task logging quiet by default; use debug for diagnostics.
-        if task_type != gbi::M_AUDTASK || self.rsp.start_count <= 5 || self.rsp.start_count % 200 == 0 {
-            log::debug!("RSP task #{}: type={} data_ptr={:#010X} flags={:#X}",
-                self.rsp.start_count, task_type, data_ptr_raw,
-                self.rsp.read_dmem_u32(gbi::TASK_FLAGS));
+        if task_type != gbi::M_AUDTASK
+            || self.rsp.start_count <= 5
+            || self.rsp.start_count % 200 == 0
+        {
+            log::debug!(
+                "RSP task #{}: type={} data_ptr={:#010X} flags={:#X}",
+                self.rsp.start_count,
+                task_type,
+                data_ptr_raw,
+                self.rsp.read_dmem_u32(gbi::TASK_FLAGS)
+            );
         }
 
         if task_type == gbi::M_AUDTASK {
@@ -261,25 +310,48 @@ impl Interconnect {
             // Optional display-list dump for targeted debugging.
             if std::env::var_os("N64_DUMP_GFX_DL").is_some() {
                 let rdram = self.rdram.data();
-                log::debug!("GFX DL at phys {:#010X}, ucode={:?}, first 60 cmds:", phys_addr, self.ucode);
+                log::debug!(
+                    "GFX DL at phys {:#010X}, ucode={:?}, first 60 cmds:",
+                    phys_addr,
+                    self.ucode
+                );
                 for i in 0..60 {
                     let off = phys_addr as usize + i * 8;
                     if off + 8 <= rdram.len() {
-                        let w0 = u32::from_be_bytes([rdram[off], rdram[off+1], rdram[off+2], rdram[off+3]]);
-                        let w1 = u32::from_be_bytes([rdram[off+4], rdram[off+5], rdram[off+6], rdram[off+7]]);
+                        let w0 = u32::from_be_bytes([
+                            rdram[off],
+                            rdram[off + 1],
+                            rdram[off + 2],
+                            rdram[off + 3],
+                        ]);
+                        let w1 = u32::from_be_bytes([
+                            rdram[off + 4],
+                            rdram[off + 5],
+                            rdram[off + 6],
+                            rdram[off + 7],
+                        ]);
                         let cmd = w0 >> 24;
-                        if cmd == 0xB8 { // G_ENDDL
+                        if cmd == 0xB8 {
+                            // G_ENDDL
                             log::debug!("  DL[{:2}]: {:#010X} {:#010X} (G_ENDDL)", i, w0, w1);
                             break;
                         }
-                        log::debug!("  DL[{:2}]: {:#010X} {:#010X} (cmd={:#04X})", i, w0, w1, cmd);
+                        log::debug!(
+                            "  DL[{:2}]: {:#010X} {:#010X} (cmd={:#04X})",
+                            i,
+                            w0,
+                            w1,
+                            cmd
+                        );
                     }
                 }
             }
 
             log::debug!(
                 "RSP GFX task #{}: display list at {:#010X} (phys {:#010X})",
-                self.rsp.start_count, data_ptr, phys_addr
+                self.rsp.start_count,
+                data_ptr,
+                phys_addr
             );
 
             // Walk display list, rendering into RDRAM
@@ -299,22 +371,31 @@ impl Interconnect {
             let tris_this_dl = self.renderer.tri_count - tris_before;
 
             if cmd_count >= gbi::MAX_COMMANDS {
-                log::warn!("GFX #{}: HIT COMMAND LIMIT ({} commands)!", self.rsp.start_count, cmd_count);
+                log::warn!(
+                    "GFX #{}: HIT COMMAND LIMIT ({} commands)!",
+                    self.rsp.start_count,
+                    cmd_count
+                );
             }
 
             // Log per-task info for diagnostics
             log::debug!(
                 "GFX #{}: {} cmds, {} tris, ci={:#X} w={} scissor=({},{})..({},{})",
-                self.rsp.start_count, cmd_count, tris_this_dl,
+                self.rsp.start_count,
+                cmd_count,
+                tris_this_dl,
                 self.renderer.color_image_addr,
                 self.renderer.color_image_width,
-                self.renderer.scissor_ulx >> 2, self.renderer.scissor_uly >> 2,
-                self.renderer.scissor_lrx >> 2, self.renderer.scissor_lry >> 2,
+                self.renderer.scissor_ulx >> 2,
+                self.renderer.scissor_uly >> 2,
+                self.renderer.scissor_lrx >> 2,
+                self.renderer.scissor_lry >> 2,
             );
 
             log::debug!(
                 "GFX #{}: {} tris, ci={:#X}",
-                self.rsp.start_count, tris_this_dl,
+                self.rsp.start_count,
+                tris_this_dl,
                 self.renderer.color_image_addr,
             );
 
@@ -328,21 +409,27 @@ impl Interconnect {
                     let mut nb = 0u32;
                     for i in (0..fb_bytes).step_by(2) {
                         let px = u16::from_be_bytes([rdram[ci + i], rdram[ci + i + 1]]);
-                        if px >> 1 != 0 { nb += 1; }
+                        if px >> 1 != 0 {
+                            nb += 1;
+                        }
                     }
                     if nb > self.renderer.best_frame_nonblack {
                         self.renderer.best_frame_snapshot = rdram[ci..ci + fb_bytes].to_vec();
                         self.renderer.best_frame_nonblack = nb;
                     }
                     nb
-                } else { 0 };
+                } else {
+                    0
+                };
                 // Record CI history (last 30 GFX tasks)
                 if self.renderer.ci_history.len() >= 30 {
                     self.renderer.ci_history.remove(0);
                 }
                 let tw = self.renderer.task_total_writes;
                 let tnb = self.renderer.task_nonblack_writes;
-                self.renderer.ci_history.push((ci as u32, tris_this_dl, nonblack, tw, tnb));
+                self.renderer
+                    .ci_history
+                    .push((ci as u32, tris_this_dl, nonblack, tw, tnb));
             }
 
             // DP interrupt: RDP finished rendering this display list.
@@ -358,7 +445,11 @@ impl Interconnect {
         let mut dram_addr = self.rsp.dma_dram_addr & 0x00FF_FFFF;
         let line_len = self.rsp.dma_len as usize;
 
-        let mem = if is_imem { &mut self.rsp.imem } else { &mut self.rsp.dmem };
+        let mem = if is_imem {
+            &mut self.rsp.imem
+        } else {
+            &mut self.rsp.dmem
+        };
 
         for _ in 0..self.rsp.dma_count {
             for i in 0..line_len {
@@ -371,8 +462,11 @@ impl Interconnect {
 
         log::trace!(
             "SP DMA read: RDRAM[{:#010X}] → {}[{:#05X}], len={:#X}, lines={}",
-            self.rsp.dma_dram_addr, if is_imem { "IMEM" } else { "DMEM" },
-            self.rsp.dma_mem_addr & 0xFFF, line_len, self.rsp.dma_count,
+            self.rsp.dma_dram_addr,
+            if is_imem { "IMEM" } else { "DMEM" },
+            self.rsp.dma_mem_addr & 0xFFF,
+            line_len,
+            self.rsp.dma_count,
         );
     }
 
@@ -383,7 +477,11 @@ impl Interconnect {
         let mut dram_addr = self.rsp.dma_dram_addr & 0x00FF_FFFF;
         let line_len = self.rsp.dma_len as usize;
 
-        let mem = if is_imem { &self.rsp.imem } else { &self.rsp.dmem };
+        let mem = if is_imem {
+            &self.rsp.imem
+        } else {
+            &self.rsp.dmem
+        };
 
         for _ in 0..self.rsp.dma_count {
             for i in 0..line_len {
@@ -397,8 +495,11 @@ impl Interconnect {
 
         log::trace!(
             "SP DMA write: {}[{:#05X}] → RDRAM[{:#010X}], len={:#X}, lines={}",
-            if is_imem { "IMEM" } else { "DMEM" }, self.rsp.dma_mem_addr & 0xFFF,
-            self.rsp.dma_dram_addr, line_len, self.rsp.dma_count,
+            if is_imem { "IMEM" } else { "DMEM" },
+            self.rsp.dma_mem_addr & 0xFFF,
+            self.rsp.dma_dram_addr,
+            line_len,
+            self.rsp.dma_count,
         );
     }
 
