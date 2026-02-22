@@ -1,6 +1,7 @@
 mod audio;
 mod debug_overlay;
 mod gamepad;
+mod replay;
 mod tui;
 
 use std::path::PathBuf;
@@ -50,6 +51,8 @@ struct App {
     speed_frame_budget: f32,
     /// If set and not expired, draw a temporary on-screen speed message.
     speed_message_until: Option<std::time::Instant>,
+    /// Record/replay manager for deterministic input.
+    replay_manager: replay::ReplayManager,
 }
 
 impl App {
@@ -257,6 +260,8 @@ impl ApplicationHandler for App {
                 self.speed_frame_budget -= frames_to_run as f32;
 
                 for _ in 0..frames_to_run {
+                    self.replay_manager
+                        .update_input(self.n64.debug.frame_count, &mut self.n64.bus.pif.controller);
                     self.n64.run_frame();
                 }
 
@@ -467,17 +472,61 @@ fn main() {
     let force_jit = args.iter().any(|a| a == "--jit");
     let force_no_tiering = args.iter().any(|a| a == "--no-tiering");
     let force_tiering = args.iter().any(|a| a == "--tiering");
-    let rom_path = args
-        .iter()
-        .skip(1)
-        .find(|a| !a.starts_with("--"))
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            eprintln!(
-                "Usage: n64-frontend [--tui|--test|--diag|--bench] [--jit|--no-jit|--interp] [--tiering|--no-tiering] <rom_path>"
-            );
-            std::process::exit(1);
-        });
+    let usage = "Usage: n64-frontend [--tui|--test|--diag|--bench] [--jit|--no-jit|--interp] [--tiering|--no-tiering] [--record <path>|--replay <path>] <rom_path>";
+
+    let mut record_path: Option<PathBuf> = None;
+    let mut replay_path: Option<PathBuf> = None;
+    let mut rom_path: Option<PathBuf> = None;
+    let mut i = 1usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--record" => {
+                i = i.saturating_add(1);
+                let Some(path) = args.get(i) else {
+                    eprintln!("Missing path after --record");
+                    eprintln!("{usage}");
+                    std::process::exit(1);
+                };
+                record_path = Some(PathBuf::from(path));
+            }
+            "--replay" => {
+                i = i.saturating_add(1);
+                let Some(path) = args.get(i) else {
+                    eprintln!("Missing path after --replay");
+                    eprintln!("{usage}");
+                    std::process::exit(1);
+                };
+                replay_path = Some(PathBuf::from(path));
+            }
+            arg if arg.starts_with("--") => {}
+            arg => {
+                if rom_path.is_none() {
+                    rom_path = Some(PathBuf::from(arg));
+                }
+            }
+        }
+        i = i.saturating_add(1);
+    }
+
+    if record_path.is_some() && replay_path.is_some() {
+        eprintln!("--record and --replay are mutually exclusive");
+        std::process::exit(1);
+    }
+
+    if record_path.is_some() && (use_bench || use_diag || use_test || use_tui) {
+        eprintln!("--record is only supported in normal windowed mode");
+        std::process::exit(1);
+    }
+
+    if replay_path.is_some() && (use_diag || use_test || use_tui) {
+        eprintln!("--replay is only supported in normal windowed mode or --bench mode");
+        std::process::exit(1);
+    }
+
+    let rom_path = rom_path.unwrap_or_else(|| {
+        eprintln!("{usage}");
+        std::process::exit(1);
+    });
 
     fn set_env_default(name: &str, value: &str) {
         if std::env::var_os(name).is_none() {
@@ -2826,6 +2875,63 @@ fn main() {
         save_screenshot(&n64);
         return;
     } else if use_bench {
+        if let Some(replay_path) = replay_path.as_deref() {
+            let mut replay_manager = replay::ReplayManager::new(None, Some(replay_path));
+            if !replay_manager.is_replaying() {
+                eprintln!("Replay mode failed to initialize from {:?}", replay_path);
+                std::process::exit(1);
+            }
+
+            let warmup_frames = std::env::var("N64_BENCH_REPLAY_WARMUP_FRAMES")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0);
+            let default_frames = replay_manager
+                .replay_frame_count_hint()
+                .unwrap_or(1_800)
+                .max(1);
+            let bench_frames = std::env::var("N64_BENCH_REPLAY_FRAMES")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(default_frames)
+                .max(1);
+
+            for frame in 0..warmup_frames {
+                replay_manager.update_input(frame, &mut n64.bus.pif.controller);
+                n64.run_frame();
+            }
+            n64.reset_engine_stats();
+
+            let bench_start = warmup_frames;
+            let bench_end = bench_start.saturating_add(bench_frames);
+            let start_cycles = n64.cycles;
+            let start = std::time::Instant::now();
+            for frame in bench_start..bench_end {
+                replay_manager.update_input(frame, &mut n64.bus.pif.controller);
+                n64.run_frame();
+            }
+            let elapsed = start.elapsed().as_secs_f64();
+            let ran_cycles = n64.cycles.saturating_sub(start_cycles);
+            let mcycles = ran_cycles as f64 / elapsed / 1_000_000.0;
+            let fps = bench_frames as f64 / elapsed;
+
+            println!(
+                "BENCH_REPLAY engine={} warmup_frames={} frames={} elapsed_s={:.6} fps={:.3} mcycles_s={:.3} replay_events={} replay_frame_hint={}",
+                n64.engine_name(),
+                warmup_frames,
+                bench_frames,
+                elapsed,
+                fps,
+                mcycles,
+                replay_manager.replay_event_count(),
+                replay_manager.replay_frame_count_hint().unwrap_or(0)
+            );
+            if let Some(stats) = n64.dynarec_stats_line() {
+                println!("BENCH_DYNAREC {}", stats);
+            }
+            return;
+        }
+
         let warmup_steps = std::env::var("N64_BENCH_WARMUP")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
@@ -2888,6 +2994,8 @@ fn main() {
         }
         let event_loop = EventLoop::new().expect("create event loop");
         let gamepad = gamepad::GamepadInput::new();
+        let replay_manager =
+            replay::ReplayManager::new(record_path.as_deref(), replay_path.as_deref());
         let mut app = App {
             n64,
             window: None,
@@ -2906,6 +3014,7 @@ fn main() {
             speed_percent: DEFAULT_SPEED_PERCENT,
             speed_frame_budget: 0.0,
             speed_message_until: None,
+            replay_manager,
         };
         event_loop.run_app(&mut app).expect("run event loop");
     }
