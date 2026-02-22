@@ -469,6 +469,16 @@ impl Recompiler {
         self.insert_cached(start_phys, block);
     }
 
+    /// Record an external async compile failure for `start_phys`.
+    ///
+    /// This mirrors `ensure_compiled_with_max` failure behavior so callers can
+    /// publish off-thread failures into the same failed-cache path.
+    pub fn record_compile_failure(&mut self, start_phys: u32, err: CompileError) {
+        self.stats.compile_failures += 1;
+        self.insert_failed(start_phys);
+        self.last_error = Some(err);
+    }
+
     pub fn ensure_compiled(
         &mut self,
         start_phys: u32,

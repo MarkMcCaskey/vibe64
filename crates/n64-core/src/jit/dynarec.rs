@@ -83,6 +83,12 @@ pub struct DynarecRuntimeStats {
     pub ensure_compiled_cache_hit: u64,
     pub ensure_compiled_time_us: u64,
     pub ensure_compiled_time_max_us: u64,
+    pub ensure_async_enqueued: u64,
+    pub ensure_async_completed: u64,
+    pub ensure_async_dropped_stale: u64,
+    pub ensure_async_queue_full: u64,
+    pub ensure_async_snapshot_miss: u64,
+    pub ensure_async_worker_down: u64,
     pub invalidate_calls: u64,
     pub invalidate_bytes: u64,
     pub invalidate_time_us: u64,
@@ -188,7 +194,18 @@ impl InstructionSource for SnapshotSource {
 
 #[derive(Debug, Clone, Copy)]
 enum AsyncCompileKind {
+    Tier1,
     Promote,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AsyncEnqueueStatus {
+    Disabled,
+    AlreadyPending,
+    QueueFull,
+    SnapshotMiss,
+    WorkerDown,
+    Enqueued,
 }
 
 #[derive(Debug)]
@@ -218,9 +235,11 @@ enum AsyncCompileMessage {
 fn async_compile_worker_loop(
     rx: Receiver<AsyncCompileMessage>,
     tx: Sender<AsyncCompileResult>,
-    opt_level: CraneliftOptLevel,
+    tier1_opt_level: CraneliftOptLevel,
+    tier2_opt_level: CraneliftOptLevel,
 ) {
-    let mut compiler = CraneliftCompiler::with_opt_level(opt_level);
+    let mut tier1_compiler = CraneliftCompiler::with_opt_level(tier1_opt_level);
+    let mut tier2_compiler = CraneliftCompiler::with_opt_level(tier2_opt_level);
     while let Ok(message) = rx.recv() {
         match message {
             AsyncCompileMessage::Shutdown => break,
@@ -230,13 +249,14 @@ fn async_compile_worker_loop(
                     words: job.snapshot_words,
                 };
                 let started = Instant::now();
-                let result = compiler.compile(
-                    &CompileRequest {
-                        start_phys: job.start_phys,
-                        max_instructions: job.max_block_instructions,
-                    },
-                    &mut source,
-                );
+                let request = CompileRequest {
+                    start_phys: job.start_phys,
+                    max_instructions: job.max_block_instructions,
+                };
+                let result = match job.kind {
+                    AsyncCompileKind::Tier1 => tier1_compiler.compile(&request, &mut source),
+                    AsyncCompileKind::Promote => tier2_compiler.compile(&request, &mut source),
+                };
                 let compile_time_us =
                     started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
                 let response = AsyncCompileResult {
@@ -600,9 +620,10 @@ impl DynarecEngine {
             let (job_tx, job_rx) = mpsc::channel::<AsyncCompileMessage>();
             let (result_tx, result_rx) = mpsc::channel::<AsyncCompileResult>();
             match thread::Builder::new()
-                .name("n64-jit-promote".to_string())
-                .spawn(move || async_compile_worker_loop(job_rx, result_tx, tier2_opt_level))
-            {
+                .name("n64-jit-async".to_string())
+                .spawn(move || {
+                    async_compile_worker_loop(job_rx, result_tx, tier1_opt_level, tier2_opt_level)
+                }) {
                 Ok(handle) => (Some(job_tx), Some(result_rx), Some(handle)),
                 Err(err) => {
                     log::warn!("Failed to start async dynarec worker: {}", err);
@@ -730,7 +751,7 @@ impl DynarecEngine {
     pub fn stats_line(&self) -> String {
         let stats = self.stats();
         format!(
-            "native_blocks={} native_instr={} native_interp_instr={} native_gas_exits={} native_link_hits={} native_link_misses={} native_link_inserts={} promote_calls={} promote_compiled={} promote_compile_failed={} promote_cache_hit={} promote_skipped_budget={} promote_time_us={} promote_time_max_us={} promote_async_enqueued={} promote_async_completed={} promote_async_dropped_stale={} promote_async_queue_full={} promote_async_snapshot_miss={} promote_async_worker_down={} fallback_instr={} fallback_early_guard={} fallback_guard_after_lookup={} fallback_no_block={} fallback_failed_cache={} fallback_cold={} fallback_compile_budget={} guard_reject_zero_insn={} guard_reject_min_block={} guard_reject_interp_dominated={} guard_reject_delay_or_nonlinear={} guard_reject_non_kseg={} guard_reject_start_phys_mismatch={} guard_reject_pending_interrupt={} guard_reject_pending_cop0={} guard_reject_pending_external={} guard_reject_pending_write_state={} guard_reject_timer_interrupt={} ensure_calls={} ensure_compiled={} ensure_compile_failed={} ensure_cache_hit={} ensure_time_us={} ensure_time_max_us={} recompiler_cache_hits={} recompiler_failed_cache_hits={} recompiler_blocks_compiled={} recompiler_compile_failures={} recompiler_invalidated_blocks={} invalidate_calls={} invalidate_bytes={} invalidate_time_us={} invalidate_time_max_us={} block_cache_len={} native_link_cache_len={} native_link_fanout={} failed_cache_len={} hot_entries={} hot_threshold={} max_block_insns={} tier1_max_block_insns={} promote_hot_threshold={} async_promote_enabled={} async_snapshot_insns={} async_queue_limit={} min_block_insns={} native_gas={} chain_limit={} compile_budget_us_per_ms={} compile_budget_burst_ms={} compile_budget_cap_us={} compile_budget_credit_us={}",
+            "native_blocks={} native_instr={} native_interp_instr={} native_gas_exits={} native_link_hits={} native_link_misses={} native_link_inserts={} promote_calls={} promote_compiled={} promote_compile_failed={} promote_cache_hit={} promote_skipped_budget={} promote_time_us={} promote_time_max_us={} promote_async_enqueued={} promote_async_completed={} promote_async_dropped_stale={} promote_async_queue_full={} promote_async_snapshot_miss={} promote_async_worker_down={} fallback_instr={} fallback_early_guard={} fallback_guard_after_lookup={} fallback_no_block={} fallback_failed_cache={} fallback_cold={} fallback_compile_budget={} guard_reject_zero_insn={} guard_reject_min_block={} guard_reject_interp_dominated={} guard_reject_delay_or_nonlinear={} guard_reject_non_kseg={} guard_reject_start_phys_mismatch={} guard_reject_pending_interrupt={} guard_reject_pending_cop0={} guard_reject_pending_external={} guard_reject_pending_write_state={} guard_reject_timer_interrupt={} ensure_calls={} ensure_compiled={} ensure_compile_failed={} ensure_cache_hit={} ensure_time_us={} ensure_time_max_us={} ensure_async_enqueued={} ensure_async_completed={} ensure_async_dropped_stale={} ensure_async_queue_full={} ensure_async_snapshot_miss={} ensure_async_worker_down={} recompiler_cache_hits={} recompiler_failed_cache_hits={} recompiler_blocks_compiled={} recompiler_compile_failures={} recompiler_invalidated_blocks={} invalidate_calls={} invalidate_bytes={} invalidate_time_us={} invalidate_time_max_us={} block_cache_len={} native_link_cache_len={} native_link_fanout={} failed_cache_len={} hot_entries={} hot_threshold={} max_block_insns={} tier1_max_block_insns={} promote_hot_threshold={} async_promote_enabled={} async_snapshot_insns={} async_queue_limit={} min_block_insns={} native_gas={} chain_limit={} compile_budget_us_per_ms={} compile_budget_burst_ms={} compile_budget_cap_us={} compile_budget_credit_us={}",
             stats.runtime.native_blocks_executed,
             stats.runtime.native_instructions_executed,
             stats.runtime.native_interp_delegated_instructions,
@@ -775,6 +796,12 @@ impl DynarecEngine {
             stats.runtime.ensure_compiled_cache_hit,
             stats.runtime.ensure_compiled_time_us,
             stats.runtime.ensure_compiled_time_max_us,
+            stats.runtime.ensure_async_enqueued,
+            stats.runtime.ensure_async_completed,
+            stats.runtime.ensure_async_dropped_stale,
+            stats.runtime.ensure_async_queue_full,
+            stats.runtime.ensure_async_snapshot_miss,
+            stats.runtime.ensure_async_worker_down,
             stats.recompiler.cache_hits,
             stats.recompiler.failed_cache_hits,
             stats.recompiler.blocks_compiled,
@@ -1257,38 +1284,52 @@ impl DynarecEngine {
         Some((start_phys, words, span, page_generations))
     }
 
-    fn enqueue_async_promotion<B: Bus>(
+    fn cool_down_hot_counter(&mut self, start_phys: u32) {
+        self.hot_counts.insert(start_phys, 0);
+    }
+
+    fn enqueue_async_compile<B: Bus>(
         &mut self,
+        kind: AsyncCompileKind,
         start_phys: u32,
         max_block_instructions: u32,
         bus: &mut B,
-    ) -> bool {
+    ) -> AsyncEnqueueStatus {
         if !self.async_promote_enabled {
-            return false;
+            return AsyncEnqueueStatus::Disabled;
         }
         if self.pending_promotions.contains(&start_phys) {
-            return true;
+            return AsyncEnqueueStatus::AlreadyPending;
         }
         if self.pending_promotions.len() >= self.async_queue_limit {
-            self.runtime.promote_async_queue_full += 1;
-            return false;
+            match kind {
+                AsyncCompileKind::Tier1 => self.runtime.ensure_async_queue_full += 1,
+                AsyncCompileKind::Promote => self.runtime.promote_async_queue_full += 1,
+            }
+            return AsyncEnqueueStatus::QueueFull;
         }
 
         let Some(tx) = self.async_tx.clone() else {
-            self.runtime.promote_async_worker_down += 1;
+            match kind {
+                AsyncCompileKind::Tier1 => self.runtime.ensure_async_worker_down += 1,
+                AsyncCompileKind::Promote => self.runtime.promote_async_worker_down += 1,
+            }
             self.async_promote_enabled = false;
-            return false;
+            return AsyncEnqueueStatus::WorkerDown;
         };
 
         let Some((snapshot_start_phys, snapshot_words, span, page_generations)) =
             self.capture_snapshot_words(bus, start_phys, max_block_instructions)
         else {
-            self.runtime.promote_async_snapshot_miss += 1;
-            return false;
+            match kind {
+                AsyncCompileKind::Tier1 => self.runtime.ensure_async_snapshot_miss += 1,
+                AsyncCompileKind::Promote => self.runtime.promote_async_snapshot_miss += 1,
+            }
+            return AsyncEnqueueStatus::SnapshotMiss;
         };
 
         let job = AsyncCompileJob {
-            kind: AsyncCompileKind::Promote,
+            kind,
             start_phys,
             max_block_instructions,
             snapshot_start_phys,
@@ -1296,63 +1337,117 @@ impl DynarecEngine {
             page_generations,
         };
         if tx.send(AsyncCompileMessage::Compile(job)).is_err() {
-            self.runtime.promote_async_worker_down += 1;
+            match kind {
+                AsyncCompileKind::Tier1 => self.runtime.ensure_async_worker_down += 1,
+                AsyncCompileKind::Promote => self.runtime.promote_async_worker_down += 1,
+            }
             self.async_promote_enabled = false;
-            return false;
+            return AsyncEnqueueStatus::WorkerDown;
         }
 
-        self.promote_attempted.insert(start_phys);
         self.index_pending_promotion(start_phys, span);
-        self.runtime.promote_calls += 1;
-        self.runtime.promote_async_enqueued += 1;
-        true
+        match kind {
+            AsyncCompileKind::Tier1 => {
+                self.runtime.ensure_async_enqueued += 1;
+            }
+            AsyncCompileKind::Promote => {
+                self.promote_attempted.insert(start_phys);
+                self.runtime.promote_calls += 1;
+                self.runtime.promote_async_enqueued += 1;
+            }
+        }
+        AsyncEnqueueStatus::Enqueued
     }
 
     fn handle_async_compile_result(&mut self, result: AsyncCompileResult) {
-        self.runtime.promote_async_completed += 1;
-        self.runtime.promote_time_us = self
-            .runtime
-            .promote_time_us
-            .wrapping_add(result.compile_time_us);
-        self.runtime.promote_time_max_us =
-            self.runtime.promote_time_max_us.max(result.compile_time_us);
+        self.remove_pending_promotion(result.start_phys);
 
-        if matches!(result.kind, AsyncCompileKind::Promote) {
-            self.remove_pending_promotion(result.start_phys);
-        }
+        match result.kind {
+            AsyncCompileKind::Tier1 => {
+                self.runtime.ensure_async_completed += 1;
 
-        if !self.page_generations_match(&result.page_generations) {
-            self.runtime.promote_async_dropped_stale += 1;
-            self.promote_attempted.remove(&result.start_phys);
-            return;
-        }
-
-        match result.result {
-            Ok(block) => {
-                let existing_max = self
-                    .recompiler
-                    .lookup(result.start_phys)
-                    .map(|b| b.max_retired_instructions)
-                    .unwrap_or(0);
-                if existing_max >= block.max_retired_instructions {
-                    self.runtime.promote_cache_hit += 1;
+                if !self.page_generations_match(&result.page_generations) {
+                    self.runtime.ensure_async_dropped_stale += 1;
                     return;
                 }
-                self.clear_native_links();
-                self.recompiler
-                    .install_compiled_block(result.start_phys, block);
-                self.runtime.promote_compiled += 1;
-                self.raise_tier_floor(result.start_phys, block.max_retired_instructions);
-                self.remove_promote_tracking(result.start_phys);
+
+                match result.result {
+                    Ok(block) => {
+                        let existing_max = self
+                            .recompiler
+                            .lookup(result.start_phys)
+                            .map(|b| b.max_retired_instructions)
+                            .unwrap_or(0);
+                        if existing_max >= block.max_retired_instructions {
+                            self.runtime.ensure_compiled_cache_hit += 1;
+                            return;
+                        }
+                        self.clear_native_links();
+                        self.recompiler
+                            .install_compiled_block(result.start_phys, block);
+                        self.runtime.ensure_compiled_compiled += 1;
+                        self.raise_tier_floor(result.start_phys, block.max_retired_instructions);
+                        self.hot_counts.remove(&result.start_phys);
+                        self.remove_promote_tracking(result.start_phys);
+                    }
+                    Err(err) => {
+                        self.runtime.ensure_compiled_compile_failed += 1;
+                        if self.recompiler.lookup(result.start_phys).is_none() {
+                            self.recompiler
+                                .record_compile_failure(result.start_phys, err.clone());
+                        }
+                        log::debug!(
+                            "Dynarec async tier1 compile failed at {:#010X} (backend={}): {:?}",
+                            result.start_phys,
+                            self.recompiler.backend_name(),
+                            err
+                        );
+                    }
+                }
             }
-            Err(err) => {
-                self.runtime.promote_compile_failed += 1;
-                log::debug!(
-                    "Dynarec async promote failed at {:#010X} (backend={}): {:?}",
-                    result.start_phys,
-                    self.recompiler.backend_name(),
-                    err
-                );
+            AsyncCompileKind::Promote => {
+                self.runtime.promote_async_completed += 1;
+                self.runtime.promote_time_us = self
+                    .runtime
+                    .promote_time_us
+                    .wrapping_add(result.compile_time_us);
+                self.runtime.promote_time_max_us =
+                    self.runtime.promote_time_max_us.max(result.compile_time_us);
+
+                if !self.page_generations_match(&result.page_generations) {
+                    self.runtime.promote_async_dropped_stale += 1;
+                    self.promote_attempted.remove(&result.start_phys);
+                    return;
+                }
+
+                match result.result {
+                    Ok(block) => {
+                        let existing_max = self
+                            .recompiler
+                            .lookup(result.start_phys)
+                            .map(|b| b.max_retired_instructions)
+                            .unwrap_or(0);
+                        if existing_max >= block.max_retired_instructions {
+                            self.runtime.promote_cache_hit += 1;
+                            return;
+                        }
+                        self.clear_native_links();
+                        self.recompiler
+                            .install_compiled_block(result.start_phys, block);
+                        self.runtime.promote_compiled += 1;
+                        self.raise_tier_floor(result.start_phys, block.max_retired_instructions);
+                        self.remove_promote_tracking(result.start_phys);
+                    }
+                    Err(err) => {
+                        self.runtime.promote_compile_failed += 1;
+                        log::debug!(
+                            "Dynarec async promote failed at {:#010X} (backend={}): {:?}",
+                            result.start_phys,
+                            self.recompiler.backend_name(),
+                            err
+                        );
+                    }
+                }
             }
         }
     }
@@ -1392,8 +1487,15 @@ impl DynarecEngine {
         if !self.should_attempt_promotion(start_phys) {
             return;
         }
-        if self.enqueue_async_promotion(start_phys, self.max_block_instructions, bus) {
-            return;
+        match self.enqueue_async_compile(
+            AsyncCompileKind::Promote,
+            start_phys,
+            self.max_block_instructions,
+            bus,
+        ) {
+            AsyncEnqueueStatus::Enqueued | AsyncEnqueueStatus::AlreadyPending => return,
+            AsyncEnqueueStatus::QueueFull | AsyncEnqueueStatus::SnapshotMiss => return,
+            AsyncEnqueueStatus::WorkerDown | AsyncEnqueueStatus::Disabled => {}
         }
         if !self.compile_budget_allows_attempt() {
             self.runtime.promote_skipped_budget += 1;
@@ -1826,15 +1928,31 @@ impl ExecutionEngine for DynarecEngine {
             return self.run_fallback(cpu, bus, FallbackReason::FailedCache);
         }
 
+        if self.pending_promotions.contains(&start_phys) {
+            return self.run_fallback(cpu, bus, FallbackReason::Cold);
+        }
+
         if !self.should_attempt_compile(start_phys) {
             return self.run_fallback(cpu, bus, FallbackReason::Cold);
         }
+
+        let compile_max = self.desired_compile_max(start_phys);
+        match self.enqueue_async_compile(AsyncCompileKind::Tier1, start_phys, compile_max, bus) {
+            AsyncEnqueueStatus::Enqueued | AsyncEnqueueStatus::AlreadyPending => {
+                return self.run_fallback(cpu, bus, FallbackReason::Cold);
+            }
+            AsyncEnqueueStatus::QueueFull | AsyncEnqueueStatus::SnapshotMiss => {
+                self.cool_down_hot_counter(start_phys);
+                return self.run_fallback(cpu, bus, FallbackReason::Cold);
+            }
+            AsyncEnqueueStatus::WorkerDown | AsyncEnqueueStatus::Disabled => {}
+        }
+
         if !self.compile_budget_allows_attempt() {
             return self.run_fallback(cpu, bus, FallbackReason::CompileBudget);
         }
 
         self.runtime.ensure_compiled_calls += 1;
-        let compile_max = self.desired_compile_max(start_phys);
         let compile_start = Instant::now();
         let ensure_result = {
             let mut source = BusSource { bus };
@@ -1940,6 +2058,7 @@ impl Drop for DynarecEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bus::DynarecFastmem;
 
     struct InterruptBudgetBus {
         mem: Vec<u8>,
@@ -2009,6 +2128,14 @@ mod tests {
 
         fn notify_dma_write(&mut self, _start: u32, _len: u32) {}
 
+        fn dynarec_fastmem(&mut self) -> Option<DynarecFastmem> {
+            Some(DynarecFastmem {
+                rdram_base: self.mem.as_mut_ptr(),
+                rdram_phys_limit: self.mem.len() as u64,
+                rdram_phys_mask: (self.mem.len() as u64).saturating_sub(1),
+            })
+        }
+
         fn pending_interrupts(&self) -> bool {
             false
         }
@@ -2023,6 +2150,27 @@ mod tests {
         cpu.pc = 0xFFFF_FFFF_8000_0000;
         cpu.next_pc = cpu.pc.wrapping_add(4);
         cpu
+    }
+
+    fn enable_async_worker_for_tests(engine: &mut DynarecEngine) {
+        let (job_tx, job_rx) = mpsc::channel::<AsyncCompileMessage>();
+        let (result_tx, result_rx) = mpsc::channel::<AsyncCompileResult>();
+        let handle = thread::Builder::new()
+            .name("n64-jit-test-async".to_string())
+            .spawn(move || {
+                async_compile_worker_loop(
+                    job_rx,
+                    result_tx,
+                    CraneliftOptLevel::None,
+                    CraneliftOptLevel::Speed,
+                )
+            })
+            .expect("spawn async dynarec worker for tests");
+        engine.async_promote_enabled = true;
+        engine.async_queue_limit = 8;
+        engine.async_tx = Some(job_tx);
+        engine.async_rx = Some(result_rx);
+        engine.async_thread = Some(handle);
     }
 
     #[test]
@@ -2069,5 +2217,33 @@ mod tests {
         );
         assert!(cpu.gpr[8] > 5);
         assert_eq!(engine.runtime.native_blocks_executed, 1);
+    }
+
+    #[test]
+    fn tier1_async_enqueue_avoids_sync_compile_on_cold_miss() {
+        let mut bus = InterruptBudgetBus::new(0x2000);
+        let program = [
+            0x2508_0001u32, // addiu t0, t0, 1
+            0x0800_0000u32, // j 0x80000000
+            0x0000_0000u32, // nop
+        ];
+        bus.load_program(0, &program);
+
+        let mut cpu = init_cpu();
+        let mut engine = DynarecEngine::new_cranelift_for_tests();
+        engine.hot_threshold = 1;
+        engine.tier1_max_block_instructions = 64;
+        engine.max_block_instructions = 64;
+        engine.min_native_instructions = 1;
+        enable_async_worker_for_tests(&mut engine);
+
+        let retired = engine.execute(&mut cpu, &mut bus);
+        assert_eq!(retired, 1);
+        assert_eq!(
+            engine.runtime.ensure_compiled_calls, 0,
+            "cold miss should not sync-compile when async tier1 is available"
+        );
+        assert_eq!(engine.runtime.ensure_async_enqueued, 1);
+        assert!(engine.pending_promotions.contains(&0));
     }
 }
