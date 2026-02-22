@@ -165,6 +165,38 @@ unsafe extern "C" fn cb_cop0_write<B: Bus>(user: *mut u8, reg: u64, value: u64) 
     cpu.cop0.write_reg((reg as usize) & 0x1F, value);
 }
 
+unsafe extern "C" fn cb_hi_read<B: Bus>(user: *mut u8) -> u64 {
+    // SAFETY: user pointer is created from `CallbackContext<B>` in `run_native_block`.
+    let ctx = unsafe { &mut *(user as *mut CallbackContext<B>) };
+    // SAFETY: pointers come from live mutable references held by `run_native_block`.
+    let cpu = unsafe { &mut *ctx.cpu };
+    cpu.hi
+}
+
+unsafe extern "C" fn cb_hi_write<B: Bus>(user: *mut u8, value: u64) {
+    // SAFETY: user pointer is created from `CallbackContext<B>` in `run_native_block`.
+    let ctx = unsafe { &mut *(user as *mut CallbackContext<B>) };
+    // SAFETY: pointers come from live mutable references held by `run_native_block`.
+    let cpu = unsafe { &mut *ctx.cpu };
+    cpu.hi = value;
+}
+
+unsafe extern "C" fn cb_lo_read<B: Bus>(user: *mut u8) -> u64 {
+    // SAFETY: user pointer is created from `CallbackContext<B>` in `run_native_block`.
+    let ctx = unsafe { &mut *(user as *mut CallbackContext<B>) };
+    // SAFETY: pointers come from live mutable references held by `run_native_block`.
+    let cpu = unsafe { &mut *ctx.cpu };
+    cpu.lo
+}
+
+unsafe extern "C" fn cb_lo_write<B: Bus>(user: *mut u8, value: u64) {
+    // SAFETY: user pointer is created from `CallbackContext<B>` in `run_native_block`.
+    let ctx = unsafe { &mut *(user as *mut CallbackContext<B>) };
+    // SAFETY: pointers come from live mutable references held by `run_native_block`.
+    let cpu = unsafe { &mut *ctx.cpu };
+    cpu.lo = value;
+}
+
 /// Dynarec engine with interpreter fallback.
 ///
 /// This first stage compiles block metadata/caching through the dynarec
@@ -372,6 +404,10 @@ impl DynarecEngine {
             store_u64: cb_store_u64::<B>,
             cop0_read: cb_cop0_read::<B>,
             cop0_write: cb_cop0_write::<B>,
+            hi_read: cb_hi_read::<B>,
+            hi_write: cb_hi_write::<B>,
+            lo_read: cb_lo_read::<B>,
+            lo_write: cb_lo_write::<B>,
         };
         let execution = block.execute(&mut cpu.gpr, start_pc, &mut callbacks);
         let count = execution.retired_instructions;
