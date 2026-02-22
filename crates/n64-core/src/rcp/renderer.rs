@@ -1896,18 +1896,8 @@ impl Renderer {
                 let mut z_offset = 0usize;
                 let mut z_value = 0u16;
                 if z_enabled {
-                    // Perspective-correct depth interpolation. Linear interpolation
-                    // of post-divide Z causes camera-angle dependent overlap errors.
-                    let inv_w = w0 * v0.w + w1 * v1.w + w2 * v2.w;
-                    let zf = if inv_w.abs() > 1e-10 {
-                        let z_over_w =
-                            w0 * v0.clip_z * v0.w + w1 * v1.clip_z * v1.w + w2 * v2.clip_z * v2.w;
-                        let z_ndc = z_over_w / inv_w;
-                        z_ndc * self.viewport_scale[2] + self.viewport_trans[2]
-                    } else {
-                        // Degenerate fallback (avoid NaN/Inf on bad triangles).
-                        w0 * v0.z + w1 * v1.z + w2 * v2.z
-                    };
+                    // RDP depth uses affine interpolation in screen space.
+                    let zf = w0 * v0.z + w1 * v1.z + w2 * v2.z;
                     let z = zf.clamp(0.0, 0xFFFF as f32).round() as u16;
                     z_offset = z_addr + ((y * width + x) as usize) * 2;
                     z_value = z;
