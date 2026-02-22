@@ -303,7 +303,7 @@ mod tests {
             0xAD8A_0100, // sw t2, 0x100(t4)
             0x8D8B_0100, // lw t3, 0x100(t4)
             0x3562_1234, // ori v0, t3, 0x1234
-            0x1000_0000, // beq r0, r0, 0 (sentinel: unsupported by dynarec)
+            0x4200_0018, // eret (sentinel: unsupported by dynarec)
         ];
 
         let mut bus_interp = TestBus::new(0x2000);
@@ -344,7 +344,7 @@ mod tests {
             0x2409_0007, // addiu t1, r0, 7 (delay slot)
             0x2409_0063, // addiu t1, r0, 99 (skipped)
             0x3522_0000, // ori v0, t1, 0
-            0x1000_0000, // beq r0, r0, 0 (sentinel: unsupported by dynarec)
+            0x4200_0018, // eret (sentinel: unsupported by dynarec)
         ];
 
         let mut bus_interp = TestBus::new(0x2000);

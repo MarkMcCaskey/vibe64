@@ -6,11 +6,11 @@
 use std::collections::{HashMap, HashSet};
 
 use cranelift_codegen::ir::condcodes::IntCC;
-use cranelift_codegen::ir::{types, AbiParam, InstBuilder, MemFlags, Value};
+use cranelift_codegen::ir::{types, AbiParam, FuncRef, InstBuilder, MemFlags, Value};
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_jit::{JITBuilder, JITModule};
-use cranelift_module::{default_libcall_names, Linkage, Module};
+use cranelift_module::{default_libcall_names, FuncId, Linkage, Module};
 
 /// Input needed to compile a guest basic block.
 #[derive(Debug, Clone, Copy)]
@@ -26,7 +26,93 @@ pub trait InstructionSource {
     fn read_u32(&mut self, phys_addr: u32) -> Result<u32, CompileError>;
 }
 
-type JitBlockFn = unsafe extern "C" fn(*mut u64, u64) -> u64;
+/// Runtime callbacks used by generated code for memory/COP0 operations.
+#[repr(C)]
+pub struct RuntimeCallbacks {
+    pub user: *mut u8,
+    pub load_u8: unsafe extern "C" fn(*mut u8, u64) -> u64,
+    pub load_u16: unsafe extern "C" fn(*mut u8, u64) -> u64,
+    pub load_u32: unsafe extern "C" fn(*mut u8, u64) -> u64,
+    pub load_u64: unsafe extern "C" fn(*mut u8, u64) -> u64,
+    pub store_u8: unsafe extern "C" fn(*mut u8, u64, u64),
+    pub store_u16: unsafe extern "C" fn(*mut u8, u64, u64),
+    pub store_u32: unsafe extern "C" fn(*mut u8, u64, u64),
+    pub store_u64: unsafe extern "C" fn(*mut u8, u64, u64),
+    pub cop0_read: unsafe extern "C" fn(*mut u8, u64) -> u64,
+    pub cop0_write: unsafe extern "C" fn(*mut u8, u64, u64),
+}
+
+unsafe extern "C" fn n64_jit_load_u8(ctx: *mut u8, vaddr: u64) -> u64 {
+    // SAFETY: `ctx` is provided by the caller as a valid RuntimeCallbacks pointer.
+    let cbs = unsafe { &mut *(ctx as *mut RuntimeCallbacks) };
+    // SAFETY: callback function pointer is provided by caller.
+    unsafe { (cbs.load_u8)(cbs.user, vaddr) }
+}
+
+unsafe extern "C" fn n64_jit_load_u16(ctx: *mut u8, vaddr: u64) -> u64 {
+    // SAFETY: `ctx` is provided by the caller as a valid RuntimeCallbacks pointer.
+    let cbs = unsafe { &mut *(ctx as *mut RuntimeCallbacks) };
+    // SAFETY: callback function pointer is provided by caller.
+    unsafe { (cbs.load_u16)(cbs.user, vaddr) }
+}
+
+unsafe extern "C" fn n64_jit_load_u32(ctx: *mut u8, vaddr: u64) -> u64 {
+    // SAFETY: `ctx` is provided by the caller as a valid RuntimeCallbacks pointer.
+    let cbs = unsafe { &mut *(ctx as *mut RuntimeCallbacks) };
+    // SAFETY: callback function pointer is provided by caller.
+    unsafe { (cbs.load_u32)(cbs.user, vaddr) }
+}
+
+unsafe extern "C" fn n64_jit_load_u64(ctx: *mut u8, vaddr: u64) -> u64 {
+    // SAFETY: `ctx` is provided by the caller as a valid RuntimeCallbacks pointer.
+    let cbs = unsafe { &mut *(ctx as *mut RuntimeCallbacks) };
+    // SAFETY: callback function pointer is provided by caller.
+    unsafe { (cbs.load_u64)(cbs.user, vaddr) }
+}
+
+unsafe extern "C" fn n64_jit_store_u8(ctx: *mut u8, vaddr: u64, value: u64) {
+    // SAFETY: `ctx` is provided by the caller as a valid RuntimeCallbacks pointer.
+    let cbs = unsafe { &mut *(ctx as *mut RuntimeCallbacks) };
+    // SAFETY: callback function pointer is provided by caller.
+    unsafe { (cbs.store_u8)(cbs.user, vaddr, value) }
+}
+
+unsafe extern "C" fn n64_jit_store_u16(ctx: *mut u8, vaddr: u64, value: u64) {
+    // SAFETY: `ctx` is provided by the caller as a valid RuntimeCallbacks pointer.
+    let cbs = unsafe { &mut *(ctx as *mut RuntimeCallbacks) };
+    // SAFETY: callback function pointer is provided by caller.
+    unsafe { (cbs.store_u16)(cbs.user, vaddr, value) }
+}
+
+unsafe extern "C" fn n64_jit_store_u32(ctx: *mut u8, vaddr: u64, value: u64) {
+    // SAFETY: `ctx` is provided by the caller as a valid RuntimeCallbacks pointer.
+    let cbs = unsafe { &mut *(ctx as *mut RuntimeCallbacks) };
+    // SAFETY: callback function pointer is provided by caller.
+    unsafe { (cbs.store_u32)(cbs.user, vaddr, value) }
+}
+
+unsafe extern "C" fn n64_jit_store_u64(ctx: *mut u8, vaddr: u64, value: u64) {
+    // SAFETY: `ctx` is provided by the caller as a valid RuntimeCallbacks pointer.
+    let cbs = unsafe { &mut *(ctx as *mut RuntimeCallbacks) };
+    // SAFETY: callback function pointer is provided by caller.
+    unsafe { (cbs.store_u64)(cbs.user, vaddr, value) }
+}
+
+unsafe extern "C" fn n64_jit_cop0_read(ctx: *mut u8, reg: u64) -> u64 {
+    // SAFETY: `ctx` is provided by the caller as a valid RuntimeCallbacks pointer.
+    let cbs = unsafe { &mut *(ctx as *mut RuntimeCallbacks) };
+    // SAFETY: callback function pointer is provided by caller.
+    unsafe { (cbs.cop0_read)(cbs.user, reg) }
+}
+
+unsafe extern "C" fn n64_jit_cop0_write(ctx: *mut u8, reg: u64, value: u64) {
+    // SAFETY: `ctx` is provided by the caller as a valid RuntimeCallbacks pointer.
+    let cbs = unsafe { &mut *(ctx as *mut RuntimeCallbacks) };
+    // SAFETY: callback function pointer is provided by caller.
+    unsafe { (cbs.cop0_write)(cbs.user, reg, value) }
+}
+
+type JitBlockFn = unsafe extern "C" fn(*mut u64, u64, *mut u8, *mut u32) -> u64;
 
 /// Pointer to compiled native entry point.
 #[derive(Clone, Copy)]
@@ -60,13 +146,37 @@ pub struct CompiledBlock {
     entry: BlockEntry,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockExecution {
+    pub next_pc: u64,
+    pub retired_instructions: u32,
+}
+
 impl CompiledBlock {
     /// Execute this compiled block against the GPR file.
-    pub fn execute(&self, gpr: &mut [u64; 32], start_pc: u64) -> u64 {
+    pub fn execute(
+        &self,
+        gpr: &mut [u64; 32],
+        start_pc: u64,
+        callbacks: *mut RuntimeCallbacks,
+    ) -> BlockExecution {
+        let mut retired = 0u32;
         // SAFETY: compiled blocks are generated with signature
-        // `extern "C" fn(*mut u64, u64) -> u64` and `gpr` points to
-        // 32 contiguous u64s.
-        unsafe { (self.entry.as_fn())(gpr.as_mut_ptr(), start_pc) }
+        // `extern "C" fn(*mut u64, u64, *mut u8, *mut u32) -> u64`,
+        // `gpr` points to 32 contiguous u64s, and callback pointer comes from
+        // the caller.
+        let next_pc = unsafe {
+            (self.entry.as_fn())(
+                gpr.as_mut_ptr(),
+                start_pc,
+                callbacks.cast::<u8>(),
+                (&mut retired as *mut u32).cast::<u32>(),
+            )
+        };
+        BlockExecution {
+            next_pc,
+            retired_instructions: retired,
+        }
     }
 }
 
@@ -257,6 +367,7 @@ impl Recompiler {
 
 #[derive(Debug, Clone, Copy)]
 enum Op {
+    Addi { rs: u8, rt: u8, imm: i16 },
     Addiu { rs: u8, rt: u8, imm: i16 },
     Daddiu { rs: u8, rt: u8, imm: i16 },
     Slti { rs: u8, rt: u8, imm: i16 },
@@ -281,6 +392,21 @@ enum Op {
     Sllv { rs: u8, rt: u8, rd: u8 },
     Srlv { rs: u8, rt: u8, rd: u8 },
     Srav { rs: u8, rt: u8, rd: u8 },
+    Lb { base: u8, rt: u8, imm: i16 },
+    Lh { base: u8, rt: u8, imm: i16 },
+    Lhu { base: u8, rt: u8, imm: i16 },
+    Lw { base: u8, rt: u8, imm: i16 },
+    Lwu { base: u8, rt: u8, imm: i16 },
+    Ld { base: u8, rt: u8, imm: i16 },
+    Lbu { base: u8, rt: u8, imm: i16 },
+    Sw { base: u8, rt: u8, imm: i16 },
+    Sb { base: u8, rt: u8, imm: i16 },
+    Sh { base: u8, rt: u8, imm: i16 },
+    Sd { base: u8, rt: u8, imm: i16 },
+    Mfc0 { rt: u8, rd: u8 },
+    Dmfc0 { rt: u8, rd: u8 },
+    Mtc0 { rt: u8, rd: u8 },
+    Dmtc0 { rt: u8, rd: u8 },
     Cache,
 }
 
@@ -290,10 +416,16 @@ enum BranchTerminator {
     Bne { rs: u8, rt: u8, offset: i16 },
     Beql { rs: u8, rt: u8, offset: i16 },
     Bnel { rs: u8, rt: u8, offset: i16 },
+    Blez { rs: u8, offset: i16 },
+    Bgtz { rs: u8, offset: i16 },
+    Blezl { rs: u8, offset: i16 },
+    Bgtzl { rs: u8, offset: i16 },
     Bltz { rs: u8, offset: i16 },
     Bgez { rs: u8, offset: i16 },
     Bltzl { rs: u8, offset: i16 },
     Bgezl { rs: u8, offset: i16 },
+    J { target: u32 },
+    Jal { target: u32 },
     Jr { rs: u8 },
 }
 
@@ -303,11 +435,18 @@ fn decode_branch(raw: u32) -> Option<BranchTerminator> {
     let rt = ((raw >> 16) & 0x1F) as u8;
     let funct = (raw & 0x3F) as u8;
     let offset = raw as u16 as i16;
+    let target = raw & 0x03FF_FFFF;
     match opcode {
+        0x02 => Some(BranchTerminator::J { target }),
+        0x03 => Some(BranchTerminator::Jal { target }),
         0x04 => Some(BranchTerminator::Beq { rs, rt, offset }),
         0x05 => Some(BranchTerminator::Bne { rs, rt, offset }),
+        0x06 => Some(BranchTerminator::Blez { rs, offset }),
+        0x07 => Some(BranchTerminator::Bgtz { rs, offset }),
         0x14 => Some(BranchTerminator::Beql { rs, rt, offset }),
         0x15 => Some(BranchTerminator::Bnel { rs, rt, offset }),
+        0x16 => Some(BranchTerminator::Blezl { rs, offset }),
+        0x17 => Some(BranchTerminator::Bgtzl { rs, offset }),
         0x01 => match rt {
             0x00 => Some(BranchTerminator::Bltz { rs, offset }),
             0x01 => Some(BranchTerminator::Bgez { rs, offset }),
@@ -331,6 +470,11 @@ fn decode_supported_non_branch(raw: u32) -> Option<Op> {
     let imm_i16 = imm_u16 as i16;
 
     match opcode {
+        0x08 => Some(Op::Addi {
+            rs,
+            rt,
+            imm: imm_i16,
+        }),
         0x09 => Some(Op::Addiu {
             rs,
             rt,
@@ -367,6 +511,68 @@ fn decode_supported_non_branch(raw: u32) -> Option<Op> {
             rt,
             imm: imm_i16,
         }),
+        0x20 => Some(Op::Lb {
+            base: rs,
+            rt,
+            imm: imm_i16,
+        }),
+        0x21 => Some(Op::Lh {
+            base: rs,
+            rt,
+            imm: imm_i16,
+        }),
+        0x23 => Some(Op::Lw {
+            base: rs,
+            rt,
+            imm: imm_i16,
+        }),
+        0x24 => Some(Op::Lbu {
+            base: rs,
+            rt,
+            imm: imm_i16,
+        }),
+        0x25 => Some(Op::Lhu {
+            base: rs,
+            rt,
+            imm: imm_i16,
+        }),
+        0x27 => Some(Op::Lwu {
+            base: rs,
+            rt,
+            imm: imm_i16,
+        }),
+        0x28 => Some(Op::Sb {
+            base: rs,
+            rt,
+            imm: imm_i16,
+        }),
+        0x29 => Some(Op::Sh {
+            base: rs,
+            rt,
+            imm: imm_i16,
+        }),
+        0x2B => Some(Op::Sw {
+            base: rs,
+            rt,
+            imm: imm_i16,
+        }),
+        0x37 => Some(Op::Ld {
+            base: rs,
+            rt,
+            imm: imm_i16,
+        }),
+        0x3F => Some(Op::Sd {
+            base: rs,
+            rt,
+            imm: imm_i16,
+        }),
+        0x10 => match rs {
+            0x00 => Some(Op::Mfc0 { rt, rd }),
+            0x01 => Some(Op::Dmfc0 { rt, rd }),
+            0x04 => Some(Op::Mtc0 { rt, rd }),
+            0x05 => Some(Op::Dmtc0 { rt, rd }),
+            _ => None,
+        },
         0x00 => match funct {
             0x00 => Some(Op::Sll { rt, rd, sa }),
             0x02 => Some(Op::Srl { rt, rd, sa }),
@@ -387,7 +593,7 @@ fn decode_supported_non_branch(raw: u32) -> Option<Op> {
             _ => None,
         },
         0x2F => Some(Op::Cache),
-        0x01 | 0x04 | 0x05 | 0x14 | 0x15 => None,
+        0x01 | 0x02 | 0x03 | 0x04 | 0x05 | 0x06 | 0x07 | 0x14 | 0x15 | 0x16 | 0x17 => None,
         _ => None,
     }
 }
@@ -422,9 +628,30 @@ fn store_gpr(
     }
 }
 
-fn emit_op(builder: &mut FunctionBuilder<'_>, gpr_ptr: Value, flags: MemFlags, op: Op) {
+#[derive(Clone, Copy)]
+struct ImportedFuncRefs {
+    load_u8: FuncRef,
+    load_u16: FuncRef,
+    load_u32: FuncRef,
+    load_u64: FuncRef,
+    store_u8: FuncRef,
+    store_u16: FuncRef,
+    store_u32: FuncRef,
+    store_u64: FuncRef,
+    cop0_read: FuncRef,
+    cop0_write: FuncRef,
+}
+
+fn emit_op(
+    builder: &mut FunctionBuilder<'_>,
+    gpr_ptr: Value,
+    callbacks_ptr: Value,
+    helpers: ImportedFuncRefs,
+    flags: MemFlags,
+    op: Op,
+) {
     match op {
-        Op::Addiu { rs, rt, imm } => {
+        Op::Addi { rs, rt, imm } | Op::Addiu { rs, rt, imm } => {
             let rs64 = load_gpr(builder, gpr_ptr, rs, flags);
             let rs32 = builder.ins().ireduce(types::I32, rs64);
             let imm32 = builder.ins().iconst(types::I32, i64::from(imm));
@@ -600,6 +827,136 @@ fn emit_op(builder: &mut FunctionBuilder<'_>, gpr_ptr: Value, flags: MemFlags, o
             let result64 = builder.ins().sextend(types::I64, result32);
             store_gpr(builder, gpr_ptr, rd, result64, flags);
         }
+        Op::Lb { base, rt, imm } => {
+            let base_addr = load_gpr(builder, gpr_ptr, base, flags);
+            let vaddr = builder.ins().iadd_imm(base_addr, i64::from(imm));
+            let call = builder.ins().call(helpers.load_u8, &[callbacks_ptr, vaddr]);
+            let loaded = builder.inst_results(call)[0];
+            let loaded8 = builder.ins().ireduce(types::I8, loaded);
+            let loaded64 = builder.ins().sextend(types::I64, loaded8);
+            store_gpr(builder, gpr_ptr, rt, loaded64, flags);
+        }
+        Op::Lh { base, rt, imm } => {
+            let base_addr = load_gpr(builder, gpr_ptr, base, flags);
+            let vaddr = builder.ins().iadd_imm(base_addr, i64::from(imm));
+            let call = builder
+                .ins()
+                .call(helpers.load_u16, &[callbacks_ptr, vaddr]);
+            let loaded = builder.inst_results(call)[0];
+            let loaded16 = builder.ins().ireduce(types::I16, loaded);
+            let loaded64 = builder.ins().sextend(types::I64, loaded16);
+            store_gpr(builder, gpr_ptr, rt, loaded64, flags);
+        }
+        Op::Lhu { base, rt, imm } => {
+            let base_addr = load_gpr(builder, gpr_ptr, base, flags);
+            let vaddr = builder.ins().iadd_imm(base_addr, i64::from(imm));
+            let call = builder
+                .ins()
+                .call(helpers.load_u16, &[callbacks_ptr, vaddr]);
+            let loaded = builder.inst_results(call)[0];
+            let loaded16 = builder.ins().ireduce(types::I16, loaded);
+            let loaded64 = builder.ins().uextend(types::I64, loaded16);
+            store_gpr(builder, gpr_ptr, rt, loaded64, flags);
+        }
+        Op::Lw { base, rt, imm } => {
+            let base_addr = load_gpr(builder, gpr_ptr, base, flags);
+            let vaddr = builder.ins().iadd_imm(base_addr, i64::from(imm));
+            let call = builder
+                .ins()
+                .call(helpers.load_u32, &[callbacks_ptr, vaddr]);
+            let loaded = builder.inst_results(call)[0];
+            let loaded32 = builder.ins().ireduce(types::I32, loaded);
+            let loaded64 = builder.ins().sextend(types::I64, loaded32);
+            store_gpr(builder, gpr_ptr, rt, loaded64, flags);
+        }
+        Op::Lwu { base, rt, imm } => {
+            let base_addr = load_gpr(builder, gpr_ptr, base, flags);
+            let vaddr = builder.ins().iadd_imm(base_addr, i64::from(imm));
+            let call = builder
+                .ins()
+                .call(helpers.load_u32, &[callbacks_ptr, vaddr]);
+            let loaded = builder.inst_results(call)[0];
+            let loaded32 = builder.ins().ireduce(types::I32, loaded);
+            let loaded64 = builder.ins().uextend(types::I64, loaded32);
+            store_gpr(builder, gpr_ptr, rt, loaded64, flags);
+        }
+        Op::Ld { base, rt, imm } => {
+            let base_addr = load_gpr(builder, gpr_ptr, base, flags);
+            let vaddr = builder.ins().iadd_imm(base_addr, i64::from(imm));
+            let call = builder
+                .ins()
+                .call(helpers.load_u64, &[callbacks_ptr, vaddr]);
+            let loaded64 = builder.inst_results(call)[0];
+            store_gpr(builder, gpr_ptr, rt, loaded64, flags);
+        }
+        Op::Lbu { base, rt, imm } => {
+            let base_addr = load_gpr(builder, gpr_ptr, base, flags);
+            let vaddr = builder.ins().iadd_imm(base_addr, i64::from(imm));
+            let call = builder.ins().call(helpers.load_u8, &[callbacks_ptr, vaddr]);
+            let loaded = builder.inst_results(call)[0];
+            let loaded8 = builder.ins().ireduce(types::I8, loaded);
+            let loaded64 = builder.ins().uextend(types::I64, loaded8);
+            store_gpr(builder, gpr_ptr, rt, loaded64, flags);
+        }
+        Op::Sw { base, rt, imm } => {
+            let base_addr = load_gpr(builder, gpr_ptr, base, flags);
+            let vaddr = builder.ins().iadd_imm(base_addr, i64::from(imm));
+            let value = load_gpr(builder, gpr_ptr, rt, flags);
+            let value32 = builder.ins().ireduce(types::I32, value);
+            let value64 = builder.ins().uextend(types::I64, value32);
+            builder
+                .ins()
+                .call(helpers.store_u32, &[callbacks_ptr, vaddr, value64]);
+        }
+        Op::Sb { base, rt, imm } => {
+            let base_addr = load_gpr(builder, gpr_ptr, base, flags);
+            let vaddr = builder.ins().iadd_imm(base_addr, i64::from(imm));
+            let value = load_gpr(builder, gpr_ptr, rt, flags);
+            let value8 = builder.ins().ireduce(types::I8, value);
+            let value64 = builder.ins().uextend(types::I64, value8);
+            builder
+                .ins()
+                .call(helpers.store_u8, &[callbacks_ptr, vaddr, value64]);
+        }
+        Op::Sh { base, rt, imm } => {
+            let base_addr = load_gpr(builder, gpr_ptr, base, flags);
+            let vaddr = builder.ins().iadd_imm(base_addr, i64::from(imm));
+            let value = load_gpr(builder, gpr_ptr, rt, flags);
+            let value16 = builder.ins().ireduce(types::I16, value);
+            let value64 = builder.ins().uextend(types::I64, value16);
+            builder
+                .ins()
+                .call(helpers.store_u16, &[callbacks_ptr, vaddr, value64]);
+        }
+        Op::Sd { base, rt, imm } => {
+            let base_addr = load_gpr(builder, gpr_ptr, base, flags);
+            let vaddr = builder.ins().iadd_imm(base_addr, i64::from(imm));
+            let value = load_gpr(builder, gpr_ptr, rt, flags);
+            builder
+                .ins()
+                .call(helpers.store_u64, &[callbacks_ptr, vaddr, value]);
+        }
+        Op::Mfc0 { rt, rd } => {
+            let reg = iconst_u64(builder, u64::from(rd));
+            let call = builder.ins().call(helpers.cop0_read, &[callbacks_ptr, reg]);
+            let value = builder.inst_results(call)[0];
+            let value32 = builder.ins().ireduce(types::I32, value);
+            let value64 = builder.ins().sextend(types::I64, value32);
+            store_gpr(builder, gpr_ptr, rt, value64, flags);
+        }
+        Op::Dmfc0 { rt, rd } => {
+            let reg = iconst_u64(builder, u64::from(rd));
+            let call = builder.ins().call(helpers.cop0_read, &[callbacks_ptr, reg]);
+            let value = builder.inst_results(call)[0];
+            store_gpr(builder, gpr_ptr, rt, value, flags);
+        }
+        Op::Mtc0 { rt, rd } | Op::Dmtc0 { rt, rd } => {
+            let reg = iconst_u64(builder, u64::from(rd));
+            let value = load_gpr(builder, gpr_ptr, rt, flags);
+            builder
+                .ins()
+                .call(helpers.cop0_write, &[callbacks_ptr, reg, value]);
+        }
         Op::Cache => {
             // CACHE is treated as a no-op by the interpreter.
         }
@@ -611,6 +968,16 @@ pub struct CraneliftCompiler {
     module: JITModule,
     context: cranelift_codegen::Context,
     builder_context: FunctionBuilderContext,
+    load_u8_id: FuncId,
+    load_u16_id: FuncId,
+    load_u32_id: FuncId,
+    load_u64_id: FuncId,
+    store_u8_id: FuncId,
+    store_u16_id: FuncId,
+    store_u32_id: FuncId,
+    store_u64_id: FuncId,
+    cop0_read_id: FuncId,
+    cop0_write_id: FuncId,
     next_symbol_id: u64,
 }
 
@@ -641,14 +1008,77 @@ impl Default for CraneliftCompiler {
 
         let isa_builder = cranelift_native::builder().expect("create host ISA builder");
         let isa = isa_builder.finish(flags).expect("finish host ISA");
-        let jit_builder = JITBuilder::with_isa(isa, default_libcall_names());
-        let module = JITModule::new(jit_builder);
+        let mut jit_builder = JITBuilder::with_isa(isa, default_libcall_names());
+        jit_builder.symbol("n64_jit_load_u8", n64_jit_load_u8 as *const u8);
+        jit_builder.symbol("n64_jit_load_u16", n64_jit_load_u16 as *const u8);
+        jit_builder.symbol("n64_jit_load_u32", n64_jit_load_u32 as *const u8);
+        jit_builder.symbol("n64_jit_load_u64", n64_jit_load_u64 as *const u8);
+        jit_builder.symbol("n64_jit_store_u8", n64_jit_store_u8 as *const u8);
+        jit_builder.symbol("n64_jit_store_u16", n64_jit_store_u16 as *const u8);
+        jit_builder.symbol("n64_jit_store_u32", n64_jit_store_u32 as *const u8);
+        jit_builder.symbol("n64_jit_store_u64", n64_jit_store_u64 as *const u8);
+        jit_builder.symbol("n64_jit_cop0_read", n64_jit_cop0_read as *const u8);
+        jit_builder.symbol("n64_jit_cop0_write", n64_jit_cop0_write as *const u8);
+        let mut module = JITModule::new(jit_builder);
+        let ptr_ty = module.target_config().pointer_type();
+
+        let mut unary_sig = module.make_signature();
+        unary_sig.params.push(AbiParam::new(ptr_ty));
+        unary_sig.params.push(AbiParam::new(types::I64));
+        unary_sig.returns.push(AbiParam::new(types::I64));
+
+        let mut ternary_sig = module.make_signature();
+        ternary_sig.params.push(AbiParam::new(ptr_ty));
+        ternary_sig.params.push(AbiParam::new(types::I64));
+        ternary_sig.params.push(AbiParam::new(types::I64));
+
+        let load_u8_id = module
+            .declare_function("n64_jit_load_u8", Linkage::Import, &unary_sig)
+            .expect("declare n64_jit_load_u8");
+        let load_u16_id = module
+            .declare_function("n64_jit_load_u16", Linkage::Import, &unary_sig)
+            .expect("declare n64_jit_load_u16");
+        let load_u32_id = module
+            .declare_function("n64_jit_load_u32", Linkage::Import, &unary_sig)
+            .expect("declare n64_jit_load_u32");
+        let load_u64_id = module
+            .declare_function("n64_jit_load_u64", Linkage::Import, &unary_sig)
+            .expect("declare n64_jit_load_u64");
+        let store_u8_id = module
+            .declare_function("n64_jit_store_u8", Linkage::Import, &ternary_sig)
+            .expect("declare n64_jit_store_u8");
+        let store_u16_id = module
+            .declare_function("n64_jit_store_u16", Linkage::Import, &ternary_sig)
+            .expect("declare n64_jit_store_u16");
+        let store_u32_id = module
+            .declare_function("n64_jit_store_u32", Linkage::Import, &ternary_sig)
+            .expect("declare n64_jit_store_u32");
+        let store_u64_id = module
+            .declare_function("n64_jit_store_u64", Linkage::Import, &ternary_sig)
+            .expect("declare n64_jit_store_u64");
+        let cop0_read_id = module
+            .declare_function("n64_jit_cop0_read", Linkage::Import, &unary_sig)
+            .expect("declare n64_jit_cop0_read");
+        let cop0_write_id = module
+            .declare_function("n64_jit_cop0_write", Linkage::Import, &ternary_sig)
+            .expect("declare n64_jit_cop0_write");
+
         let context = module.make_context();
 
         Self {
             module,
             context,
             builder_context: FunctionBuilderContext::new(),
+            load_u8_id,
+            load_u16_id,
+            load_u32_id,
+            load_u64_id,
+            store_u8_id,
+            store_u16_id,
+            store_u32_id,
+            store_u64_id,
+            cop0_read_id,
+            cop0_write_id,
             next_symbol_id: 0,
         }
     }
@@ -718,16 +1148,27 @@ impl BlockCompiler for CraneliftCompiler {
         self.context.clear();
         self.context.func.signature.params.clear();
         self.context.func.signature.returns.clear();
+        let ptr_ty = self.module.target_config().pointer_type();
         self.context
             .func
             .signature
             .params
-            .push(AbiParam::new(self.module.target_config().pointer_type()));
+            .push(AbiParam::new(ptr_ty));
         self.context
             .func
             .signature
             .params
             .push(AbiParam::new(types::I64));
+        self.context
+            .func
+            .signature
+            .params
+            .push(AbiParam::new(ptr_ty));
+        self.context
+            .func
+            .signature
+            .params
+            .push(AbiParam::new(ptr_ty));
         self.context
             .func
             .signature
@@ -742,15 +1183,50 @@ impl BlockCompiler for CraneliftCompiler {
 
         let gpr_ptr = builder.block_params(entry_block)[0];
         let start_pc = builder.block_params(entry_block)[1];
+        let callbacks_ptr = builder.block_params(entry_block)[2];
+        let retired_out_ptr = builder.block_params(entry_block)[3];
+        let helpers = ImportedFuncRefs {
+            load_u8: self
+                .module
+                .declare_func_in_func(self.load_u8_id, builder.func),
+            load_u16: self
+                .module
+                .declare_func_in_func(self.load_u16_id, builder.func),
+            load_u32: self
+                .module
+                .declare_func_in_func(self.load_u32_id, builder.func),
+            load_u64: self
+                .module
+                .declare_func_in_func(self.load_u64_id, builder.func),
+            store_u8: self
+                .module
+                .declare_func_in_func(self.store_u8_id, builder.func),
+            store_u16: self
+                .module
+                .declare_func_in_func(self.store_u16_id, builder.func),
+            store_u32: self
+                .module
+                .declare_func_in_func(self.store_u32_id, builder.func),
+            store_u64: self
+                .module
+                .declare_func_in_func(self.store_u64_id, builder.func),
+            cop0_read: self
+                .module
+                .declare_func_in_func(self.cop0_read_id, builder.func),
+            cop0_write: self
+                .module
+                .declare_func_in_func(self.cop0_write_id, builder.func),
+        };
         let mut flags = MemFlags::new();
         flags.set_notrap();
         flags.set_aligned();
 
         for op in ops.iter().copied() {
-            emit_op(&mut builder, gpr_ptr, flags, op);
+            emit_op(&mut builder, gpr_ptr, callbacks_ptr, helpers, flags, op);
         }
 
-        let ret_pc = if let Some((branch, delay_op)) = terminator {
+        let retired_base = ops.len() as u32;
+        let (ret_pc, retired_count) = if let Some((branch, delay_op)) = terminator {
             let branch_pc = builder
                 .ins()
                 .iadd_imm(start_pc, i64::from(ops.len() as u32) * 4);
@@ -758,38 +1234,160 @@ impl BlockCompiler for CraneliftCompiler {
             let next_of_branch = builder.ins().iadd_imm(branch_pc, 4);
 
             let offset_to_taken = |builder: &mut FunctionBuilder<'_>, offset: i16| {
-                let offset_val = builder.ins().iconst(types::I64, ((offset as i32) as i64) << 2);
+                let offset_val = builder
+                    .ins()
+                    .iconst(types::I64, ((offset as i32) as i64) << 2);
                 builder.ins().iadd(next_of_branch, offset_val)
             };
 
             match branch {
+                BranchTerminator::J { target } => {
+                    let upper = iconst_u64(&mut builder, 0xFFFF_FFFF_F000_0000);
+                    let upper_pc = builder.ins().band(branch_pc, upper);
+                    let low = iconst_u64(&mut builder, u64::from(target) << 2);
+                    emit_op(
+                        &mut builder,
+                        gpr_ptr,
+                        callbacks_ptr,
+                        helpers,
+                        flags,
+                        delay_op,
+                    );
+                    let ret_pc = builder.ins().bor(upper_pc, low);
+                    let retired = builder
+                        .ins()
+                        .iconst(types::I32, i64::from(retired_base.saturating_add(2)));
+                    (ret_pc, retired)
+                }
+                BranchTerminator::Jal { target } => {
+                    let upper = iconst_u64(&mut builder, 0xFFFF_FFFF_F000_0000);
+                    let upper_pc = builder.ins().band(branch_pc, upper);
+                    let low = iconst_u64(&mut builder, u64::from(target) << 2);
+                    let link = builder.ins().iadd_imm(branch_pc, 8);
+                    store_gpr(&mut builder, gpr_ptr, 31, link, flags);
+                    emit_op(
+                        &mut builder,
+                        gpr_ptr,
+                        callbacks_ptr,
+                        helpers,
+                        flags,
+                        delay_op,
+                    );
+                    let ret_pc = builder.ins().bor(upper_pc, low);
+                    let retired = builder
+                        .ins()
+                        .iconst(types::I32, i64::from(retired_base.saturating_add(2)));
+                    (ret_pc, retired)
+                }
                 BranchTerminator::Jr { rs } => {
-                    emit_op(&mut builder, gpr_ptr, flags, delay_op);
-                    load_gpr(&mut builder, gpr_ptr, rs, flags)
+                    emit_op(
+                        &mut builder,
+                        gpr_ptr,
+                        callbacks_ptr,
+                        helpers,
+                        flags,
+                        delay_op,
+                    );
+                    let ret_pc = load_gpr(&mut builder, gpr_ptr, rs, flags);
+                    let retired = builder
+                        .ins()
+                        .iconst(types::I32, i64::from(retired_base.saturating_add(2)));
+                    (ret_pc, retired)
                 }
                 BranchTerminator::Beq { rs, rt, offset } => {
                     let lhs = load_gpr(&mut builder, gpr_ptr, rs, flags);
                     let rhs = load_gpr(&mut builder, gpr_ptr, rt, flags);
                     let cond = builder.ins().icmp(IntCC::Equal, lhs, rhs);
-                    emit_op(&mut builder, gpr_ptr, flags, delay_op);
+                    emit_op(
+                        &mut builder,
+                        gpr_ptr,
+                        callbacks_ptr,
+                        helpers,
+                        flags,
+                        delay_op,
+                    );
                     let taken_pc = offset_to_taken(&mut builder, offset);
-                    builder.ins().select(cond, taken_pc, fallthrough_pc)
+                    let ret_pc = builder.ins().select(cond, taken_pc, fallthrough_pc);
+                    let retired = builder
+                        .ins()
+                        .iconst(types::I32, i64::from(retired_base.saturating_add(2)));
+                    (ret_pc, retired)
                 }
                 BranchTerminator::Bne { rs, rt, offset } => {
                     let lhs = load_gpr(&mut builder, gpr_ptr, rs, flags);
                     let rhs = load_gpr(&mut builder, gpr_ptr, rt, flags);
                     let cond = builder.ins().icmp(IntCC::NotEqual, lhs, rhs);
-                    emit_op(&mut builder, gpr_ptr, flags, delay_op);
+                    emit_op(
+                        &mut builder,
+                        gpr_ptr,
+                        callbacks_ptr,
+                        helpers,
+                        flags,
+                        delay_op,
+                    );
                     let taken_pc = offset_to_taken(&mut builder, offset);
-                    builder.ins().select(cond, taken_pc, fallthrough_pc)
+                    let ret_pc = builder.ins().select(cond, taken_pc, fallthrough_pc);
+                    let retired = builder
+                        .ins()
+                        .iconst(types::I32, i64::from(retired_base.saturating_add(2)));
+                    (ret_pc, retired)
+                }
+                BranchTerminator::Blez { rs, offset } => {
+                    let lhs = load_gpr(&mut builder, gpr_ptr, rs, flags);
+                    let zero = iconst_u64(&mut builder, 0);
+                    let cond = builder.ins().icmp(IntCC::SignedLessThanOrEqual, lhs, zero);
+                    emit_op(
+                        &mut builder,
+                        gpr_ptr,
+                        callbacks_ptr,
+                        helpers,
+                        flags,
+                        delay_op,
+                    );
+                    let taken_pc = offset_to_taken(&mut builder, offset);
+                    let ret_pc = builder.ins().select(cond, taken_pc, fallthrough_pc);
+                    let retired = builder
+                        .ins()
+                        .iconst(types::I32, i64::from(retired_base.saturating_add(2)));
+                    (ret_pc, retired)
+                }
+                BranchTerminator::Bgtz { rs, offset } => {
+                    let lhs = load_gpr(&mut builder, gpr_ptr, rs, flags);
+                    let zero = iconst_u64(&mut builder, 0);
+                    let cond = builder.ins().icmp(IntCC::SignedGreaterThan, lhs, zero);
+                    emit_op(
+                        &mut builder,
+                        gpr_ptr,
+                        callbacks_ptr,
+                        helpers,
+                        flags,
+                        delay_op,
+                    );
+                    let taken_pc = offset_to_taken(&mut builder, offset);
+                    let ret_pc = builder.ins().select(cond, taken_pc, fallthrough_pc);
+                    let retired = builder
+                        .ins()
+                        .iconst(types::I32, i64::from(retired_base.saturating_add(2)));
+                    (ret_pc, retired)
                 }
                 BranchTerminator::Bltz { rs, offset } => {
                     let lhs = load_gpr(&mut builder, gpr_ptr, rs, flags);
                     let zero = iconst_u64(&mut builder, 0);
                     let cond = builder.ins().icmp(IntCC::SignedLessThan, lhs, zero);
-                    emit_op(&mut builder, gpr_ptr, flags, delay_op);
+                    emit_op(
+                        &mut builder,
+                        gpr_ptr,
+                        callbacks_ptr,
+                        helpers,
+                        flags,
+                        delay_op,
+                    );
                     let taken_pc = offset_to_taken(&mut builder, offset);
-                    builder.ins().select(cond, taken_pc, fallthrough_pc)
+                    let ret_pc = builder.ins().select(cond, taken_pc, fallthrough_pc);
+                    let retired = builder
+                        .ins()
+                        .iconst(types::I32, i64::from(retired_base.saturating_add(2)));
+                    (ret_pc, retired)
                 }
                 BranchTerminator::Bgez { rs, offset } => {
                     let lhs = load_gpr(&mut builder, gpr_ptr, rs, flags);
@@ -797,9 +1395,20 @@ impl BlockCompiler for CraneliftCompiler {
                     let cond = builder
                         .ins()
                         .icmp(IntCC::SignedGreaterThanOrEqual, lhs, zero);
-                    emit_op(&mut builder, gpr_ptr, flags, delay_op);
+                    emit_op(
+                        &mut builder,
+                        gpr_ptr,
+                        callbacks_ptr,
+                        helpers,
+                        flags,
+                        delay_op,
+                    );
                     let taken_pc = offset_to_taken(&mut builder, offset);
-                    builder.ins().select(cond, taken_pc, fallthrough_pc)
+                    let ret_pc = builder.ins().select(cond, taken_pc, fallthrough_pc);
+                    let retired = builder
+                        .ins()
+                        .iconst(types::I32, i64::from(retired_base.saturating_add(2)));
+                    (ret_pc, retired)
                 }
                 BranchTerminator::Beql { rs, rt, offset } => {
                     let lhs = load_gpr(&mut builder, gpr_ptr, rs, flags);
@@ -808,24 +1417,41 @@ impl BlockCompiler for CraneliftCompiler {
                     let taken_block = builder.create_block();
                     let not_taken_block = builder.create_block();
                     let exit_block = builder.create_block();
-                    let ret_var = builder.declare_var(types::I64);
-                    builder.ins().brif(cond, taken_block, &[], not_taken_block, &[]);
+                    builder.append_block_param(exit_block, types::I64);
+                    builder.append_block_param(exit_block, types::I32);
+                    builder
+                        .ins()
+                        .brif(cond, taken_block, &[], not_taken_block, &[]);
                     builder.seal_block(taken_block);
                     builder.seal_block(not_taken_block);
 
                     builder.switch_to_block(taken_block);
-                    emit_op(&mut builder, gpr_ptr, flags, delay_op);
+                    emit_op(
+                        &mut builder,
+                        gpr_ptr,
+                        callbacks_ptr,
+                        helpers,
+                        flags,
+                        delay_op,
+                    );
                     let taken_pc = offset_to_taken(&mut builder, offset);
-                    builder.def_var(ret_var, taken_pc);
-                    builder.ins().jump(exit_block, &[]);
+                    let taken_retired = builder
+                        .ins()
+                        .iconst(types::I32, i64::from(retired_base.saturating_add(2)));
+                    let args = [taken_pc.into(), taken_retired.into()];
+                    builder.ins().jump(exit_block, &args);
 
                     builder.switch_to_block(not_taken_block);
-                    builder.def_var(ret_var, fallthrough_pc);
-                    builder.ins().jump(exit_block, &[]);
+                    let not_taken_retired = builder
+                        .ins()
+                        .iconst(types::I32, i64::from(retired_base.saturating_add(1)));
+                    let args = [fallthrough_pc.into(), not_taken_retired.into()];
+                    builder.ins().jump(exit_block, &args);
 
                     builder.switch_to_block(exit_block);
                     builder.seal_block(exit_block);
-                    builder.use_var(ret_var)
+                    let params = builder.block_params(exit_block);
+                    (params[0], params[1])
                 }
                 BranchTerminator::Bnel { rs, rt, offset } => {
                     let lhs = load_gpr(&mut builder, gpr_ptr, rs, flags);
@@ -834,24 +1460,127 @@ impl BlockCompiler for CraneliftCompiler {
                     let taken_block = builder.create_block();
                     let not_taken_block = builder.create_block();
                     let exit_block = builder.create_block();
-                    let ret_var = builder.declare_var(types::I64);
-                    builder.ins().brif(cond, taken_block, &[], not_taken_block, &[]);
+                    builder.append_block_param(exit_block, types::I64);
+                    builder.append_block_param(exit_block, types::I32);
+                    builder
+                        .ins()
+                        .brif(cond, taken_block, &[], not_taken_block, &[]);
                     builder.seal_block(taken_block);
                     builder.seal_block(not_taken_block);
 
                     builder.switch_to_block(taken_block);
-                    emit_op(&mut builder, gpr_ptr, flags, delay_op);
+                    emit_op(
+                        &mut builder,
+                        gpr_ptr,
+                        callbacks_ptr,
+                        helpers,
+                        flags,
+                        delay_op,
+                    );
                     let taken_pc = offset_to_taken(&mut builder, offset);
-                    builder.def_var(ret_var, taken_pc);
-                    builder.ins().jump(exit_block, &[]);
+                    let taken_retired = builder
+                        .ins()
+                        .iconst(types::I32, i64::from(retired_base.saturating_add(2)));
+                    let args = [taken_pc.into(), taken_retired.into()];
+                    builder.ins().jump(exit_block, &args);
 
                     builder.switch_to_block(not_taken_block);
-                    builder.def_var(ret_var, fallthrough_pc);
-                    builder.ins().jump(exit_block, &[]);
+                    let not_taken_retired = builder
+                        .ins()
+                        .iconst(types::I32, i64::from(retired_base.saturating_add(1)));
+                    let args = [fallthrough_pc.into(), not_taken_retired.into()];
+                    builder.ins().jump(exit_block, &args);
 
                     builder.switch_to_block(exit_block);
                     builder.seal_block(exit_block);
-                    builder.use_var(ret_var)
+                    let params = builder.block_params(exit_block);
+                    (params[0], params[1])
+                }
+                BranchTerminator::Blezl { rs, offset } => {
+                    let lhs = load_gpr(&mut builder, gpr_ptr, rs, flags);
+                    let zero = iconst_u64(&mut builder, 0);
+                    let cond = builder.ins().icmp(IntCC::SignedLessThanOrEqual, lhs, zero);
+                    let taken_block = builder.create_block();
+                    let not_taken_block = builder.create_block();
+                    let exit_block = builder.create_block();
+                    builder.append_block_param(exit_block, types::I64);
+                    builder.append_block_param(exit_block, types::I32);
+                    builder
+                        .ins()
+                        .brif(cond, taken_block, &[], not_taken_block, &[]);
+                    builder.seal_block(taken_block);
+                    builder.seal_block(not_taken_block);
+
+                    builder.switch_to_block(taken_block);
+                    emit_op(
+                        &mut builder,
+                        gpr_ptr,
+                        callbacks_ptr,
+                        helpers,
+                        flags,
+                        delay_op,
+                    );
+                    let taken_pc = offset_to_taken(&mut builder, offset);
+                    let taken_retired = builder
+                        .ins()
+                        .iconst(types::I32, i64::from(retired_base.saturating_add(2)));
+                    let args = [taken_pc.into(), taken_retired.into()];
+                    builder.ins().jump(exit_block, &args);
+
+                    builder.switch_to_block(not_taken_block);
+                    let not_taken_retired = builder
+                        .ins()
+                        .iconst(types::I32, i64::from(retired_base.saturating_add(1)));
+                    let args = [fallthrough_pc.into(), not_taken_retired.into()];
+                    builder.ins().jump(exit_block, &args);
+
+                    builder.switch_to_block(exit_block);
+                    builder.seal_block(exit_block);
+                    let params = builder.block_params(exit_block);
+                    (params[0], params[1])
+                }
+                BranchTerminator::Bgtzl { rs, offset } => {
+                    let lhs = load_gpr(&mut builder, gpr_ptr, rs, flags);
+                    let zero = iconst_u64(&mut builder, 0);
+                    let cond = builder.ins().icmp(IntCC::SignedGreaterThan, lhs, zero);
+                    let taken_block = builder.create_block();
+                    let not_taken_block = builder.create_block();
+                    let exit_block = builder.create_block();
+                    builder.append_block_param(exit_block, types::I64);
+                    builder.append_block_param(exit_block, types::I32);
+                    builder
+                        .ins()
+                        .brif(cond, taken_block, &[], not_taken_block, &[]);
+                    builder.seal_block(taken_block);
+                    builder.seal_block(not_taken_block);
+
+                    builder.switch_to_block(taken_block);
+                    emit_op(
+                        &mut builder,
+                        gpr_ptr,
+                        callbacks_ptr,
+                        helpers,
+                        flags,
+                        delay_op,
+                    );
+                    let taken_pc = offset_to_taken(&mut builder, offset);
+                    let taken_retired = builder
+                        .ins()
+                        .iconst(types::I32, i64::from(retired_base.saturating_add(2)));
+                    let args = [taken_pc.into(), taken_retired.into()];
+                    builder.ins().jump(exit_block, &args);
+
+                    builder.switch_to_block(not_taken_block);
+                    let not_taken_retired = builder
+                        .ins()
+                        .iconst(types::I32, i64::from(retired_base.saturating_add(1)));
+                    let args = [fallthrough_pc.into(), not_taken_retired.into()];
+                    builder.ins().jump(exit_block, &args);
+
+                    builder.switch_to_block(exit_block);
+                    builder.seal_block(exit_block);
+                    let params = builder.block_params(exit_block);
+                    (params[0], params[1])
                 }
                 BranchTerminator::Bltzl { rs, offset } => {
                     let lhs = load_gpr(&mut builder, gpr_ptr, rs, flags);
@@ -860,24 +1589,41 @@ impl BlockCompiler for CraneliftCompiler {
                     let taken_block = builder.create_block();
                     let not_taken_block = builder.create_block();
                     let exit_block = builder.create_block();
-                    let ret_var = builder.declare_var(types::I64);
-                    builder.ins().brif(cond, taken_block, &[], not_taken_block, &[]);
+                    builder.append_block_param(exit_block, types::I64);
+                    builder.append_block_param(exit_block, types::I32);
+                    builder
+                        .ins()
+                        .brif(cond, taken_block, &[], not_taken_block, &[]);
                     builder.seal_block(taken_block);
                     builder.seal_block(not_taken_block);
 
                     builder.switch_to_block(taken_block);
-                    emit_op(&mut builder, gpr_ptr, flags, delay_op);
+                    emit_op(
+                        &mut builder,
+                        gpr_ptr,
+                        callbacks_ptr,
+                        helpers,
+                        flags,
+                        delay_op,
+                    );
                     let taken_pc = offset_to_taken(&mut builder, offset);
-                    builder.def_var(ret_var, taken_pc);
-                    builder.ins().jump(exit_block, &[]);
+                    let taken_retired = builder
+                        .ins()
+                        .iconst(types::I32, i64::from(retired_base.saturating_add(2)));
+                    let args = [taken_pc.into(), taken_retired.into()];
+                    builder.ins().jump(exit_block, &args);
 
                     builder.switch_to_block(not_taken_block);
-                    builder.def_var(ret_var, fallthrough_pc);
-                    builder.ins().jump(exit_block, &[]);
+                    let not_taken_retired = builder
+                        .ins()
+                        .iconst(types::I32, i64::from(retired_base.saturating_add(1)));
+                    let args = [fallthrough_pc.into(), not_taken_retired.into()];
+                    builder.ins().jump(exit_block, &args);
 
                     builder.switch_to_block(exit_block);
                     builder.seal_block(exit_block);
-                    builder.use_var(ret_var)
+                    let params = builder.block_params(exit_block);
+                    (params[0], params[1])
                 }
                 BranchTerminator::Bgezl { rs, offset } => {
                     let lhs = load_gpr(&mut builder, gpr_ptr, rs, flags);
@@ -888,33 +1634,55 @@ impl BlockCompiler for CraneliftCompiler {
                     let taken_block = builder.create_block();
                     let not_taken_block = builder.create_block();
                     let exit_block = builder.create_block();
-                    let ret_var = builder.declare_var(types::I64);
-                    builder.ins().brif(cond, taken_block, &[], not_taken_block, &[]);
+                    builder.append_block_param(exit_block, types::I64);
+                    builder.append_block_param(exit_block, types::I32);
+                    builder
+                        .ins()
+                        .brif(cond, taken_block, &[], not_taken_block, &[]);
                     builder.seal_block(taken_block);
                     builder.seal_block(not_taken_block);
 
                     builder.switch_to_block(taken_block);
-                    emit_op(&mut builder, gpr_ptr, flags, delay_op);
+                    emit_op(
+                        &mut builder,
+                        gpr_ptr,
+                        callbacks_ptr,
+                        helpers,
+                        flags,
+                        delay_op,
+                    );
                     let taken_pc = offset_to_taken(&mut builder, offset);
-                    builder.def_var(ret_var, taken_pc);
-                    builder.ins().jump(exit_block, &[]);
+                    let taken_retired = builder
+                        .ins()
+                        .iconst(types::I32, i64::from(retired_base.saturating_add(2)));
+                    let args = [taken_pc.into(), taken_retired.into()];
+                    builder.ins().jump(exit_block, &args);
 
                     builder.switch_to_block(not_taken_block);
-                    builder.def_var(ret_var, fallthrough_pc);
-                    builder.ins().jump(exit_block, &[]);
+                    let not_taken_retired = builder
+                        .ins()
+                        .iconst(types::I32, i64::from(retired_base.saturating_add(1)));
+                    let args = [fallthrough_pc.into(), not_taken_retired.into()];
+                    builder.ins().jump(exit_block, &args);
 
                     builder.switch_to_block(exit_block);
                     builder.seal_block(exit_block);
-                    builder.use_var(ret_var)
+                    let params = builder.block_params(exit_block);
+                    (params[0], params[1])
                 }
             }
         } else {
             let delta = builder
                 .ins()
                 .iconst(types::I64, i64::from(ops.len() as u32) * 4);
-            builder.ins().iadd(start_pc, delta)
+            let ret_pc = builder.ins().iadd(start_pc, delta);
+            let retired = builder.ins().iconst(types::I32, i64::from(retired_base));
+            (ret_pc, retired)
         };
 
+        builder
+            .ins()
+            .store(flags, retired_count, retired_out_ptr, 0);
         builder.ins().return_(&[ret_pc]);
         builder.finalize();
 
@@ -985,13 +1753,169 @@ mod tests {
         }
     }
 
+    unsafe extern "C" fn test_load_u8(_user: *mut u8, _vaddr: u64) -> u64 {
+        0
+    }
+
+    unsafe extern "C" fn test_load_u16(_user: *mut u8, _vaddr: u64) -> u64 {
+        0
+    }
+
+    unsafe extern "C" fn test_load_u32(_user: *mut u8, _vaddr: u64) -> u64 {
+        0
+    }
+
+    unsafe extern "C" fn test_load_u64(_user: *mut u8, _vaddr: u64) -> u64 {
+        0
+    }
+
+    unsafe extern "C" fn test_store_u8(_user: *mut u8, _vaddr: u64, _value: u64) {}
+
+    unsafe extern "C" fn test_store_u16(_user: *mut u8, _vaddr: u64, _value: u64) {}
+
+    unsafe extern "C" fn test_store_u32(_user: *mut u8, _vaddr: u64, _value: u64) {}
+
+    unsafe extern "C" fn test_store_u64(_user: *mut u8, _vaddr: u64, _value: u64) {}
+
+    unsafe extern "C" fn test_cop0_read(_user: *mut u8, _reg: u64) -> u64 {
+        0
+    }
+
+    unsafe extern "C" fn test_cop0_write(_user: *mut u8, _reg: u64, _value: u64) {}
+
+    fn default_callbacks() -> RuntimeCallbacks {
+        RuntimeCallbacks {
+            user: std::ptr::null_mut(),
+            load_u8: test_load_u8,
+            load_u16: test_load_u16,
+            load_u32: test_load_u32,
+            load_u64: test_load_u64,
+            store_u8: test_store_u8,
+            store_u16: test_store_u16,
+            store_u32: test_store_u32,
+            store_u64: test_store_u64,
+            cop0_read: test_cop0_read,
+            cop0_write: test_cop0_write,
+        }
+    }
+
+    #[derive(Default)]
+    struct CallbackState {
+        mem: HashMap<u64, u8>,
+        cop0: [u64; 32],
+    }
+
+    unsafe extern "C" fn state_load_u8(user: *mut u8, vaddr: u64) -> u64 {
+        // SAFETY: callback user points to `CallbackState` for this test.
+        let state = unsafe { &mut *(user as *mut CallbackState) };
+        u64::from(*state.mem.get(&vaddr).unwrap_or(&0))
+    }
+
+    unsafe extern "C" fn state_load_u32(user: *mut u8, vaddr: u64) -> u64 {
+        // SAFETY: callback user points to `CallbackState` for this test.
+        let state = unsafe { &mut *(user as *mut CallbackState) };
+        let b0 = *state.mem.get(&vaddr).unwrap_or(&0);
+        let b1 = *state.mem.get(&vaddr.wrapping_add(1)).unwrap_or(&0);
+        let b2 = *state.mem.get(&vaddr.wrapping_add(2)).unwrap_or(&0);
+        let b3 = *state.mem.get(&vaddr.wrapping_add(3)).unwrap_or(&0);
+        u64::from(u32::from_be_bytes([b0, b1, b2, b3]))
+    }
+
+    unsafe extern "C" fn state_load_u16(user: *mut u8, vaddr: u64) -> u64 {
+        // SAFETY: callback user points to `CallbackState` for this test.
+        let state = unsafe { &mut *(user as *mut CallbackState) };
+        let b0 = *state.mem.get(&vaddr).unwrap_or(&0);
+        let b1 = *state.mem.get(&vaddr.wrapping_add(1)).unwrap_or(&0);
+        u64::from(u16::from_be_bytes([b0, b1]))
+    }
+
+    unsafe extern "C" fn state_load_u64(user: *mut u8, vaddr: u64) -> u64 {
+        // SAFETY: callback user points to `CallbackState` for this test.
+        let state = unsafe { &mut *(user as *mut CallbackState) };
+        let b0 = *state.mem.get(&vaddr).unwrap_or(&0);
+        let b1 = *state.mem.get(&vaddr.wrapping_add(1)).unwrap_or(&0);
+        let b2 = *state.mem.get(&vaddr.wrapping_add(2)).unwrap_or(&0);
+        let b3 = *state.mem.get(&vaddr.wrapping_add(3)).unwrap_or(&0);
+        let b4 = *state.mem.get(&vaddr.wrapping_add(4)).unwrap_or(&0);
+        let b5 = *state.mem.get(&vaddr.wrapping_add(5)).unwrap_or(&0);
+        let b6 = *state.mem.get(&vaddr.wrapping_add(6)).unwrap_or(&0);
+        let b7 = *state.mem.get(&vaddr.wrapping_add(7)).unwrap_or(&0);
+        u64::from_be_bytes([b0, b1, b2, b3, b4, b5, b6, b7])
+    }
+
+    unsafe extern "C" fn state_store_u8(user: *mut u8, vaddr: u64, value: u64) {
+        // SAFETY: callback user points to `CallbackState` for this test.
+        let state = unsafe { &mut *(user as *mut CallbackState) };
+        state.mem.insert(vaddr, value as u8);
+    }
+
+    unsafe extern "C" fn state_store_u32(user: *mut u8, vaddr: u64, value: u64) {
+        // SAFETY: callback user points to `CallbackState` for this test.
+        let state = unsafe { &mut *(user as *mut CallbackState) };
+        let bytes = (value as u32).to_be_bytes();
+        state.mem.insert(vaddr, bytes[0]);
+        state.mem.insert(vaddr.wrapping_add(1), bytes[1]);
+        state.mem.insert(vaddr.wrapping_add(2), bytes[2]);
+        state.mem.insert(vaddr.wrapping_add(3), bytes[3]);
+    }
+
+    unsafe extern "C" fn state_store_u16(user: *mut u8, vaddr: u64, value: u64) {
+        // SAFETY: callback user points to `CallbackState` for this test.
+        let state = unsafe { &mut *(user as *mut CallbackState) };
+        let bytes = (value as u16).to_be_bytes();
+        state.mem.insert(vaddr, bytes[0]);
+        state.mem.insert(vaddr.wrapping_add(1), bytes[1]);
+    }
+
+    unsafe extern "C" fn state_store_u64(user: *mut u8, vaddr: u64, value: u64) {
+        // SAFETY: callback user points to `CallbackState` for this test.
+        let state = unsafe { &mut *(user as *mut CallbackState) };
+        let bytes = value.to_be_bytes();
+        state.mem.insert(vaddr, bytes[0]);
+        state.mem.insert(vaddr.wrapping_add(1), bytes[1]);
+        state.mem.insert(vaddr.wrapping_add(2), bytes[2]);
+        state.mem.insert(vaddr.wrapping_add(3), bytes[3]);
+        state.mem.insert(vaddr.wrapping_add(4), bytes[4]);
+        state.mem.insert(vaddr.wrapping_add(5), bytes[5]);
+        state.mem.insert(vaddr.wrapping_add(6), bytes[6]);
+        state.mem.insert(vaddr.wrapping_add(7), bytes[7]);
+    }
+
+    unsafe extern "C" fn state_cop0_read(user: *mut u8, reg: u64) -> u64 {
+        // SAFETY: callback user points to `CallbackState` for this test.
+        let state = unsafe { &mut *(user as *mut CallbackState) };
+        state.cop0[(reg as usize) & 0x1F]
+    }
+
+    unsafe extern "C" fn state_cop0_write(user: *mut u8, reg: u64, value: u64) {
+        // SAFETY: callback user points to `CallbackState` for this test.
+        let state = unsafe { &mut *(user as *mut CallbackState) };
+        state.cop0[(reg as usize) & 0x1F] = value;
+    }
+
+    fn state_callbacks(state: &mut CallbackState) -> RuntimeCallbacks {
+        RuntimeCallbacks {
+            user: (state as *mut CallbackState).cast::<u8>(),
+            load_u8: state_load_u8,
+            load_u16: state_load_u16,
+            load_u32: state_load_u32,
+            load_u64: state_load_u64,
+            store_u8: state_store_u8,
+            store_u16: state_store_u16,
+            store_u32: state_store_u32,
+            store_u64: state_store_u64,
+            cop0_read: state_cop0_read,
+            cop0_write: state_cop0_write,
+        }
+    }
+
     #[test]
     fn compiler_stops_before_unsupported_opcode() {
         let start = 0x1000u32;
         let mut src = TestSource::with_words(&[
             (start, 0x2408_0001),     // addiu t0, r0, 1
             (start + 4, 0x2409_0002), // addiu t1, r0, 2
-            (start + 8, 0x8D8A_0000), // lw t2, 0(t4) (unsupported)
+            (start + 8, 0x4200_0018), // eret (unsupported)
         ]);
 
         let mut compiler = CraneliftCompiler::default();
@@ -1033,7 +1957,8 @@ mod tests {
             .expect("compile");
 
         let mut gpr = [0u64; 32];
-        let end_pc = block.execute(&mut gpr, 0xFFFF_FFFF_8000_2000);
+        let mut callbacks = default_callbacks();
+        let exec = block.execute(&mut gpr, 0xFFFF_FFFF_8000_2000, &mut callbacks);
 
         assert_eq!(block.instruction_count, 5);
         assert_eq!(gpr[8], 5);
@@ -1041,7 +1966,8 @@ mod tests {
         assert_eq!(gpr[10], 12);
         assert_eq!(gpr[2], 0x123C);
         assert_eq!(gpr[0], 0);
-        assert_eq!(end_pc, 0xFFFF_FFFF_8000_2000 + 20);
+        assert_eq!(exec.next_pc, 0xFFFF_FFFF_8000_2000 + 20);
+        assert_eq!(exec.retired_instructions, 5);
     }
 
     #[test]
@@ -1067,13 +1993,15 @@ mod tests {
             .expect("compile");
 
         let mut gpr = [0u64; 32];
+        let mut callbacks = default_callbacks();
         let start_pc = 0xFFFF_FFFF_8000_2200u64;
-        let end_pc = block.execute(&mut gpr, start_pc);
+        let exec = block.execute(&mut gpr, start_pc, &mut callbacks);
 
         assert!(block.has_control_flow);
         assert_eq!(block.instruction_count, 4);
         assert_eq!(gpr[10], 5);
-        assert_eq!(end_pc, start_pc + 16);
+        assert_eq!(exec.next_pc, start_pc + 16);
+        assert_eq!(exec.retired_instructions, 4);
     }
 
     #[test]
@@ -1098,13 +2026,15 @@ mod tests {
             .expect("compile");
 
         let mut gpr = [0u64; 32];
+        let mut callbacks = default_callbacks();
         let start_pc = 0xFFFF_FFFF_8000_2300u64;
-        let end_pc = block.execute(&mut gpr, start_pc);
+        let exec = block.execute(&mut gpr, start_pc, &mut callbacks);
 
         assert!(block.has_control_flow);
         assert_eq!(block.instruction_count, 4);
         assert_eq!(gpr[10], 0);
-        assert_eq!(end_pc, start_pc + 16);
+        assert_eq!(exec.next_pc, start_pc + 16);
+        assert_eq!(exec.retired_instructions, 3);
     }
 
     #[test]
@@ -1127,14 +2057,88 @@ mod tests {
             .expect("compile");
 
         let mut gpr = [0u64; 32];
+        let mut callbacks = default_callbacks();
         gpr[11] = 0xFFFF_FFFF_8000_2600;
         let start_pc = 0xFFFF_FFFF_8000_2400u64;
-        let end_pc = block.execute(&mut gpr, start_pc);
+        let exec = block.execute(&mut gpr, start_pc, &mut callbacks);
 
         assert!(block.has_control_flow);
         assert_eq!(block.instruction_count, 2);
         assert_eq!(gpr[9], 7);
-        assert_eq!(end_pc, gpr[11]);
+        assert_eq!(exec.next_pc, gpr[11]);
+        assert_eq!(exec.retired_instructions, 2);
+    }
+
+    #[test]
+    fn compiled_block_executes_memory_and_cop0_ops_via_callbacks() {
+        let start = 0x2500u32;
+        let mut src = TestSource::with_words(&[
+            (start, 0x3C0C_8000),      // lui t4, 0x8000
+            (start + 4, 0x2408_0012),  // addiu t0, r0, 0x12
+            (start + 8, 0xA188_0103),  // sb t0, 0x103(t4)
+            (start + 12, 0x9189_0103), // lbu t1, 0x103(t4)
+            (start + 16, 0x240A_0034), // addiu t2, r0, 0x34
+            (start + 20, 0xAD8A_0100), // sw t2, 0x100(t4)
+            (start + 24, 0x8D8B_0100), // lw t3, 0x100(t4)
+            (start + 28, 0x408B_6000), // mtc0 t3, $12
+            (start + 32, 0x4002_6000), // mfc0 v0, $12
+            (start + 36, 0x4200_0018), // eret (sentinel: unsupported)
+        ]);
+
+        let mut compiler = CraneliftCompiler::default();
+        let block = compiler
+            .compile(
+                &CompileRequest {
+                    start_phys: start,
+                    max_instructions: 16,
+                },
+                &mut src,
+            )
+            .expect("compile");
+
+        let mut gpr = [0u64; 32];
+        let mut state = CallbackState::default();
+        let mut callbacks = state_callbacks(&mut state);
+        let start_pc = 0xFFFF_FFFF_8000_2500u64;
+        let exec = block.execute(&mut gpr, start_pc, &mut callbacks);
+
+        assert_eq!(exec.next_pc, start_pc + 36);
+        assert_eq!(exec.retired_instructions, 9);
+        assert_eq!(gpr[9], 0x12);
+        assert_eq!(gpr[11], 0x34);
+        assert_eq!(gpr[2], 0x34);
+        assert_eq!(state.cop0[12], 0x34);
+    }
+
+    #[test]
+    fn compiled_block_mfc0_sign_extends_low_32_bits() {
+        let start = 0x2600u32;
+        let mut src = TestSource::with_words(&[
+            (start, 0x4008_6800),     // mfc0 t0, $13
+            (start + 4, 0x4200_0018), // eret (sentinel: unsupported)
+        ]);
+
+        let mut compiler = CraneliftCompiler::default();
+        let block = compiler
+            .compile(
+                &CompileRequest {
+                    start_phys: start,
+                    max_instructions: 4,
+                },
+                &mut src,
+            )
+            .expect("compile");
+
+        let mut gpr = [0u64; 32];
+        let mut state = CallbackState::default();
+        state.cop0[13] = 0x0000_0000_8000_0001;
+        let mut callbacks = state_callbacks(&mut state);
+        let start_pc = 0xFFFF_FFFF_8000_2600u64;
+        let exec = block.execute(&mut gpr, start_pc, &mut callbacks);
+
+        assert_eq!(exec.next_pc, start_pc + 4);
+        assert_eq!(exec.retired_instructions, 1);
+        assert_eq!(gpr[8], 0xFFFF_FFFF_8000_0001);
     }
 
     #[test]
@@ -1164,7 +2168,7 @@ mod tests {
     #[test]
     fn compile_failure_is_recorded_and_cached() {
         let start = 0x4000u32;
-        let mut src = TestSource::with_words(&[(start, 0x0800_0000)]); // j (unsupported)
+        let mut src = TestSource::with_words(&[(start, 0x4200_0018)]); // eret (unsupported)
         let mut rc = Recompiler::new(
             Box::<CraneliftCompiler>::default(),
             RecompilerConfig::default(),
@@ -1178,7 +2182,7 @@ mod tests {
             rc.last_error(),
             Some(CompileError::UnsupportedOpcode {
                 phys_addr,
-                opcode: 0x0800_0000
+                opcode: 0x4200_0018
             }) if *phys_addr == start
         ));
 

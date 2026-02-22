@@ -6,7 +6,7 @@ use std::collections::HashMap;
 
 use n64_dynarec::{
     CompiledBlock, CraneliftCompiler, EnsureResult, InstructionSource, Recompiler,
-    RecompilerConfig, RecompilerStats,
+    RecompilerConfig, RecompilerStats, RuntimeCallbacks,
 };
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -34,6 +34,7 @@ pub struct DynarecStats {
     pub hot_entries: usize,
     pub hot_threshold: u16,
     pub min_native_instructions: u32,
+    pub chain_limit: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -55,6 +56,115 @@ impl<B: Bus> InstructionSource for BusSource<'_, B> {
     }
 }
 
+struct CallbackContext<B: Bus> {
+    cpu: *mut Vr4300,
+    bus: *mut B,
+}
+
+unsafe extern "C" fn cb_load_u8<B: Bus>(user: *mut u8, vaddr: u64) -> u64 {
+    // SAFETY: user pointer is created from `CallbackContext<B>` in `run_native_block`.
+    let ctx = unsafe { &mut *(user as *mut CallbackContext<B>) };
+    // SAFETY: pointers come from live mutable references held by `run_native_block`.
+    let cpu = unsafe { &mut *ctx.cpu };
+    // SAFETY: pointers come from live mutable references held by `run_native_block`.
+    let bus = unsafe { &mut *ctx.bus };
+    let phys = cpu.translate_address(vaddr);
+    u64::from(bus.read_u8(phys))
+}
+
+unsafe extern "C" fn cb_load_u16<B: Bus>(user: *mut u8, vaddr: u64) -> u64 {
+    // SAFETY: user pointer is created from `CallbackContext<B>` in `run_native_block`.
+    let ctx = unsafe { &mut *(user as *mut CallbackContext<B>) };
+    // SAFETY: pointers come from live mutable references held by `run_native_block`.
+    let cpu = unsafe { &mut *ctx.cpu };
+    // SAFETY: pointers come from live mutable references held by `run_native_block`.
+    let bus = unsafe { &mut *ctx.bus };
+    let phys = cpu.translate_address(vaddr);
+    u64::from(bus.read_u16(phys))
+}
+
+unsafe extern "C" fn cb_load_u32<B: Bus>(user: *mut u8, vaddr: u64) -> u64 {
+    // SAFETY: user pointer is created from `CallbackContext<B>` in `run_native_block`.
+    let ctx = unsafe { &mut *(user as *mut CallbackContext<B>) };
+    // SAFETY: pointers come from live mutable references held by `run_native_block`.
+    let cpu = unsafe { &mut *ctx.cpu };
+    // SAFETY: pointers come from live mutable references held by `run_native_block`.
+    let bus = unsafe { &mut *ctx.bus };
+    let phys = cpu.translate_address(vaddr);
+    u64::from(bus.read_u32(phys))
+}
+
+unsafe extern "C" fn cb_load_u64<B: Bus>(user: *mut u8, vaddr: u64) -> u64 {
+    // SAFETY: user pointer is created from `CallbackContext<B>` in `run_native_block`.
+    let ctx = unsafe { &mut *(user as *mut CallbackContext<B>) };
+    // SAFETY: pointers come from live mutable references held by `run_native_block`.
+    let cpu = unsafe { &mut *ctx.cpu };
+    // SAFETY: pointers come from live mutable references held by `run_native_block`.
+    let bus = unsafe { &mut *ctx.bus };
+    let phys = cpu.translate_address(vaddr);
+    bus.read_u64(phys)
+}
+
+unsafe extern "C" fn cb_store_u8<B: Bus>(user: *mut u8, vaddr: u64, value: u64) {
+    // SAFETY: user pointer is created from `CallbackContext<B>` in `run_native_block`.
+    let ctx = unsafe { &mut *(user as *mut CallbackContext<B>) };
+    // SAFETY: pointers come from live mutable references held by `run_native_block`.
+    let cpu = unsafe { &mut *ctx.cpu };
+    // SAFETY: pointers come from live mutable references held by `run_native_block`.
+    let bus = unsafe { &mut *ctx.bus };
+    let phys = cpu.translate_address(vaddr);
+    bus.write_u8(phys, value as u8);
+}
+
+unsafe extern "C" fn cb_store_u16<B: Bus>(user: *mut u8, vaddr: u64, value: u64) {
+    // SAFETY: user pointer is created from `CallbackContext<B>` in `run_native_block`.
+    let ctx = unsafe { &mut *(user as *mut CallbackContext<B>) };
+    // SAFETY: pointers come from live mutable references held by `run_native_block`.
+    let cpu = unsafe { &mut *ctx.cpu };
+    // SAFETY: pointers come from live mutable references held by `run_native_block`.
+    let bus = unsafe { &mut *ctx.bus };
+    let phys = cpu.translate_address(vaddr);
+    bus.write_u16(phys, value as u16);
+}
+
+unsafe extern "C" fn cb_store_u32<B: Bus>(user: *mut u8, vaddr: u64, value: u64) {
+    // SAFETY: user pointer is created from `CallbackContext<B>` in `run_native_block`.
+    let ctx = unsafe { &mut *(user as *mut CallbackContext<B>) };
+    // SAFETY: pointers come from live mutable references held by `run_native_block`.
+    let cpu = unsafe { &mut *ctx.cpu };
+    // SAFETY: pointers come from live mutable references held by `run_native_block`.
+    let bus = unsafe { &mut *ctx.bus };
+    let phys = cpu.translate_address(vaddr);
+    bus.write_u32(phys, value as u32);
+}
+
+unsafe extern "C" fn cb_store_u64<B: Bus>(user: *mut u8, vaddr: u64, value: u64) {
+    // SAFETY: user pointer is created from `CallbackContext<B>` in `run_native_block`.
+    let ctx = unsafe { &mut *(user as *mut CallbackContext<B>) };
+    // SAFETY: pointers come from live mutable references held by `run_native_block`.
+    let cpu = unsafe { &mut *ctx.cpu };
+    // SAFETY: pointers come from live mutable references held by `run_native_block`.
+    let bus = unsafe { &mut *ctx.bus };
+    let phys = cpu.translate_address(vaddr);
+    bus.write_u64(phys, value);
+}
+
+unsafe extern "C" fn cb_cop0_read<B: Bus>(user: *mut u8, reg: u64) -> u64 {
+    // SAFETY: user pointer is created from `CallbackContext<B>` in `run_native_block`.
+    let ctx = unsafe { &mut *(user as *mut CallbackContext<B>) };
+    // SAFETY: pointers come from live mutable references held by `run_native_block`.
+    let cpu = unsafe { &mut *ctx.cpu };
+    cpu.cop0.read_reg((reg as usize) & 0x1F)
+}
+
+unsafe extern "C" fn cb_cop0_write<B: Bus>(user: *mut u8, reg: u64, value: u64) {
+    // SAFETY: user pointer is created from `CallbackContext<B>` in `run_native_block`.
+    let ctx = unsafe { &mut *(user as *mut CallbackContext<B>) };
+    // SAFETY: pointers come from live mutable references held by `run_native_block`.
+    let cpu = unsafe { &mut *ctx.cpu };
+    cpu.cop0.write_reg((reg as usize) & 0x1F, value);
+}
+
 /// Dynarec engine with interpreter fallback.
 ///
 /// This first stage compiles block metadata/caching through the dynarec
@@ -66,6 +176,7 @@ pub struct DynarecEngine {
     hot_counts: HashMap<u32, u16>,
     hot_threshold: u16,
     min_native_instructions: u32,
+    chain_limit: u32,
 }
 
 impl DynarecEngine {
@@ -87,7 +198,8 @@ impl DynarecEngine {
 
     pub fn new_cranelift() -> Self {
         let hot_threshold = Self::parse_env_u16("N64_DYNAREC_HOT_THRESHOLD", 8192);
-        let min_native_instructions = Self::parse_env_u32("N64_DYNAREC_MIN_BLOCK_INSNS", 1);
+        let min_native_instructions = Self::parse_env_u32("N64_DYNAREC_MIN_BLOCK_INSNS", 2);
+        let chain_limit = Self::parse_env_u32("N64_DYNAREC_CHAIN_LIMIT", 3);
         let compiler = Box::<CraneliftCompiler>::default();
         let recompiler = Recompiler::new(compiler, RecompilerConfig::default());
         Self {
@@ -97,6 +209,7 @@ impl DynarecEngine {
             hot_counts: HashMap::new(),
             hot_threshold,
             min_native_instructions,
+            chain_limit,
         }
     }
 
@@ -109,13 +222,14 @@ impl DynarecEngine {
             hot_entries: self.hot_counts.len(),
             hot_threshold: self.hot_threshold,
             min_native_instructions: self.min_native_instructions,
+            chain_limit: self.chain_limit,
         }
     }
 
     pub fn stats_line(&self) -> String {
         let stats = self.stats();
         format!(
-            "native_blocks={} native_instr={} fallback_instr={} fallback_early_guard={} fallback_guard_after_lookup={} fallback_no_block={} fallback_failed_cache={} fallback_cold={} ensure_calls={} ensure_compiled={} ensure_compile_failed={} ensure_cache_hit={} recompiler_cache_hits={} recompiler_failed_cache_hits={} recompiler_blocks_compiled={} recompiler_compile_failures={} recompiler_invalidated_blocks={} block_cache_len={} failed_cache_len={} hot_entries={} hot_threshold={} min_block_insns={}",
+            "native_blocks={} native_instr={} fallback_instr={} fallback_early_guard={} fallback_guard_after_lookup={} fallback_no_block={} fallback_failed_cache={} fallback_cold={} ensure_calls={} ensure_compiled={} ensure_compile_failed={} ensure_cache_hit={} recompiler_cache_hits={} recompiler_failed_cache_hits={} recompiler_blocks_compiled={} recompiler_compile_failures={} recompiler_invalidated_blocks={} block_cache_len={} failed_cache_len={} hot_entries={} hot_threshold={} min_block_insns={} chain_limit={}",
             stats.runtime.native_blocks_executed,
             stats.runtime.native_instructions_executed,
             stats.runtime.fallback_instructions_executed,
@@ -137,7 +251,8 @@ impl DynarecEngine {
             stats.failed_cache_len,
             stats.hot_entries,
             stats.hot_threshold,
-            stats.min_native_instructions
+            stats.min_native_instructions,
+            stats.chain_limit
         )
     }
 
@@ -234,13 +349,35 @@ impl DynarecEngine {
         true
     }
 
-    fn run_native_block(&mut self, cpu: &mut Vr4300, bus: &impl Bus, block: &CompiledBlock) -> u64 {
-        let count = block.instruction_count;
+    fn run_native_block<B: Bus>(
+        &mut self,
+        cpu: &mut Vr4300,
+        bus: &mut B,
+        block: &CompiledBlock,
+    ) -> u64 {
         let start_pc = cpu.pc;
+        let mut callback_ctx = CallbackContext {
+            cpu: (cpu as *mut Vr4300),
+            bus: (bus as *mut B),
+        };
+        let mut callbacks = RuntimeCallbacks {
+            user: (&mut callback_ctx as *mut CallbackContext<B>).cast::<u8>(),
+            load_u8: cb_load_u8::<B>,
+            load_u16: cb_load_u16::<B>,
+            load_u32: cb_load_u32::<B>,
+            load_u64: cb_load_u64::<B>,
+            store_u8: cb_store_u8::<B>,
+            store_u16: cb_store_u16::<B>,
+            store_u32: cb_store_u32::<B>,
+            store_u64: cb_store_u64::<B>,
+            cop0_read: cb_cop0_read::<B>,
+            cop0_write: cb_cop0_write::<B>,
+        };
+        let execution = block.execute(&mut cpu.gpr, start_pc, &mut callbacks);
+        let count = execution.retired_instructions;
+        let next_pc = execution.next_pc;
 
-        let next_pc = block.execute(&mut cpu.gpr, start_pc);
-
-        for i in 0..count {
+        for i in 0..u64::from(count) {
             let pc = start_pc.wrapping_add((i as u64) * 4);
             cpu.pc_history[cpu.pc_history_idx] = pc as u32;
             cpu.pc_history_idx = (cpu.pc_history_idx + 1) & 63;
@@ -269,7 +406,48 @@ impl DynarecEngine {
             .native_instructions_executed
             .wrapping_add(count as u64);
 
-        count as u64
+        u64::from(count)
+    }
+
+    fn run_native_chain<B: Bus>(
+        &mut self,
+        cpu: &mut Vr4300,
+        bus: &mut B,
+        first_block: CompiledBlock,
+    ) -> u64 {
+        let mut total_retired = 0u64;
+        let mut blocks_left = self.chain_limit.max(1);
+        let mut block = first_block;
+
+        loop {
+            let retired = self.run_native_block(cpu, bus, &block);
+            if retired == 0 {
+                break;
+            }
+            total_retired = total_retired.wrapping_add(retired);
+            blocks_left -= 1;
+            if blocks_left == 0 {
+                break;
+            }
+
+            let pc32 = cpu.pc as u32;
+            if cpu.in_delay_slot
+                || cpu.next_pc != cpu.pc.wrapping_add(4)
+                || !(0x8000_0000..=0xBFFF_FFFF).contains(&pc32)
+            {
+                break;
+            }
+            let next_phys = pc32 & 0x1FFF_FFFF;
+            let Some(next_block) = self.recompiler.lookup(next_phys).copied() else {
+                break;
+            };
+            if !self.can_run_native_block(cpu, bus, &next_block, next_phys) {
+                break;
+            }
+            block = next_block;
+        }
+
+        total_retired
     }
 }
 
@@ -286,7 +464,7 @@ impl ExecutionEngine for DynarecEngine {
         let start_phys = pc32 & 0x1FFF_FFFF;
         if let Some(block) = self.recompiler.lookup(start_phys).copied() {
             if self.can_run_native_block(cpu, bus, &block, start_phys) {
-                return self.run_native_block(cpu, bus, &block);
+                return self.run_native_chain(cpu, bus, block);
             }
             return self.run_fallback(cpu, bus, FallbackReason::GuardAfterLookup);
         }
@@ -328,7 +506,7 @@ impl ExecutionEngine for DynarecEngine {
 
         if let Some(block) = self.recompiler.lookup(start_phys).copied() {
             if self.can_run_native_block(cpu, bus, &block, start_phys) {
-                return self.run_native_block(cpu, bus, &block);
+                return self.run_native_chain(cpu, bus, block);
             }
             return self.run_fallback(cpu, bus, FallbackReason::GuardAfterLookup);
         }
