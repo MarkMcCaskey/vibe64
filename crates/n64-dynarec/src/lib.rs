@@ -1918,6 +1918,32 @@ fn emit_op(
 }
 
 /// Cranelift backend compiler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CraneliftOptLevel {
+    None,
+    Speed,
+    SpeedAndSize,
+}
+
+impl CraneliftOptLevel {
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "none" => Some(Self::None),
+            "speed" => Some(Self::Speed),
+            "speed_and_size" | "speed-size" | "speedsize" => Some(Self::SpeedAndSize),
+            _ => None,
+        }
+    }
+
+    fn as_setting(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Speed => "speed",
+            Self::SpeedAndSize => "speed_and_size",
+        }
+    }
+}
+
 pub struct CraneliftCompiler {
     module: JITModule,
     context: cranelift_codegen::Context,
@@ -1941,40 +1967,27 @@ pub struct CraneliftCompiler {
     next_symbol_id: u64,
 }
 
-impl Default for CraneliftCompiler {
-    fn default() -> Self {
-        fn parse_env_bool(name: &str, default: bool) -> bool {
-            match std::env::var(name) {
-                Ok(raw) => match raw.trim().to_ascii_lowercase().as_str() {
-                    "1" | "on" | "true" | "yes" => true,
-                    "0" | "off" | "false" | "no" => false,
-                    _ => default,
-                },
-                Err(_) => default,
-            }
+impl CraneliftCompiler {
+    fn parse_env_bool(name: &str, default: bool) -> bool {
+        match std::env::var(name) {
+            Ok(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+                "1" | "on" | "true" | "yes" => true,
+                "0" | "off" | "false" | "no" => false,
+                _ => default,
+            },
+            Err(_) => default,
         }
+    }
 
-        let env_level = std::env::var("N64_CRANELIFT_OPT_LEVEL")
-            .unwrap_or_else(|_| "none".to_string())
-            .to_ascii_lowercase();
-        let opt_level = match env_level.as_str() {
-            "none" => "none",
-            "speed_and_size" | "speed-size" | "speedsize" => "speed_and_size",
-            "speed" => "speed",
-            other => {
-                log::warn!(
-                    "Unknown N64_CRANELIFT_OPT_LEVEL={:?}; using \"none\"",
-                    other
-                );
-                "none"
-            }
-        };
-        let verify_ir = parse_env_bool("N64_CRANELIFT_VERIFY", false);
+    pub fn with_opt_level(opt_level: CraneliftOptLevel) -> Self {
+        let verify_ir = Self::parse_env_bool("N64_CRANELIFT_VERIFY", false);
+        Self::with_opt_level_and_verify(opt_level, verify_ir)
+    }
 
+    pub fn with_opt_level_and_verify(opt_level: CraneliftOptLevel, verify_ir: bool) -> Self {
         let mut flag_builder = settings::builder();
-        // Tweakable via N64_CRANELIFT_OPT_LEVEL for benchmarking and tuning.
         flag_builder
-            .set("opt_level", opt_level)
+            .set("opt_level", opt_level.as_setting())
             .expect("set cranelift opt_level");
         // Useful for debugging backend issues; disabled by default for JIT throughput.
         flag_builder
@@ -2098,6 +2111,24 @@ impl Default for CraneliftCompiler {
             lo_write_id,
             next_symbol_id: 0,
         }
+    }
+}
+
+impl Default for CraneliftCompiler {
+    fn default() -> Self {
+        let env_level =
+            std::env::var("N64_CRANELIFT_OPT_LEVEL").unwrap_or_else(|_| "none".to_string());
+        let opt_level = match CraneliftOptLevel::parse(&env_level) {
+            Some(level) => level,
+            None => {
+                log::warn!(
+                    "Unknown N64_CRANELIFT_OPT_LEVEL={:?}; using \"none\"",
+                    env_level
+                );
+                CraneliftOptLevel::None
+            }
+        };
+        Self::with_opt_level(opt_level)
     }
 }
 
@@ -3274,6 +3305,31 @@ mod tests {
             fastmem_phys_limit: 0,
             fastmem_phys_mask: 0,
         }
+    }
+
+    #[test]
+    fn cranelift_opt_level_parsing_accepts_aliases() {
+        assert_eq!(
+            CraneliftOptLevel::parse("none"),
+            Some(CraneliftOptLevel::None)
+        );
+        assert_eq!(
+            CraneliftOptLevel::parse("speed"),
+            Some(CraneliftOptLevel::Speed)
+        );
+        assert_eq!(
+            CraneliftOptLevel::parse("speed_and_size"),
+            Some(CraneliftOptLevel::SpeedAndSize)
+        );
+        assert_eq!(
+            CraneliftOptLevel::parse("speed-size"),
+            Some(CraneliftOptLevel::SpeedAndSize)
+        );
+        assert_eq!(
+            CraneliftOptLevel::parse("SPEEDSIZE"),
+            Some(CraneliftOptLevel::SpeedAndSize)
+        );
+        assert_eq!(CraneliftOptLevel::parse("unknown"), None);
     }
 
     #[test]

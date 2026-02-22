@@ -9,8 +9,9 @@ use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
 use n64_dynarec::{
-    BlockCompiler, CompileError, CompileRequest, CompiledBlock, CraneliftCompiler, EnsureResult,
-    InstructionSource, Recompiler, RecompilerConfig, RecompilerStats, RuntimeCallbacks,
+    BlockCompiler, CompileError, CompileRequest, CompiledBlock, CraneliftCompiler,
+    CraneliftOptLevel, EnsureResult, InstructionSource, Recompiler, RecompilerConfig,
+    RecompilerStats, RuntimeCallbacks,
 };
 
 const TRACKING_PAGE_SHIFT: u32 = 12;
@@ -167,8 +168,12 @@ enum AsyncCompileMessage {
     Shutdown,
 }
 
-fn async_compile_worker_loop(rx: Receiver<AsyncCompileMessage>, tx: Sender<AsyncCompileResult>) {
-    let mut compiler = CraneliftCompiler::default();
+fn async_compile_worker_loop(
+    rx: Receiver<AsyncCompileMessage>,
+    tx: Sender<AsyncCompileResult>,
+    opt_level: CraneliftOptLevel,
+) {
+    let mut compiler = CraneliftCompiler::with_opt_level(opt_level);
     while let Ok(message) = rx.recv() {
         match message {
             AsyncCompileMessage::Shutdown => break,
@@ -368,6 +373,7 @@ unsafe extern "C" fn cb_lo_write<B: Bus>(user: *mut u8, value: u64) {
 pub struct DynarecEngine {
     fallback: Interpreter,
     recompiler: Recompiler,
+    promote_compiler: Box<CraneliftCompiler>,
     runtime: DynarecRuntimeStats,
     hot_counts: HashMap<u32, u16>,
     promote_counts: HashMap<u32, u16>,
@@ -442,18 +448,31 @@ impl DynarecEngine {
             .unwrap_or(default)
     }
 
+    fn parse_env_opt_level(name: &str, default: CraneliftOptLevel) -> CraneliftOptLevel {
+        match std::env::var(name) {
+            Ok(raw) => match CraneliftOptLevel::parse(&raw) {
+                Some(level) => level,
+                None => {
+                    log::warn!("Unknown {} value {:?}; using {:?}", name, raw, default);
+                    default
+                }
+            },
+            Err(_) => default,
+        }
+    }
+
     pub fn new_cranelift() -> Self {
         let hot_threshold = Self::parse_env_u16("N64_DYNAREC_HOT_THRESHOLD", 32);
         let max_block_instructions = Self::parse_env_u32("N64_DYNAREC_MAX_BLOCK_INSNS", 256);
-        let tier1_default = max_block_instructions.max(1);
+        let tier1_default = max_block_instructions.min(64).max(1);
         let tier1_max_block_instructions =
             Self::parse_env_u32("N64_DYNAREC_TIER1_MAX_BLOCK_INSNS", tier1_default)
                 .min(max_block_instructions)
                 .max(1);
         let promote_hot_threshold =
-            Self::parse_env_u16_allow_zero("N64_DYNAREC_PROMOTE_THRESHOLD", 0);
+            Self::parse_env_u16_allow_zero("N64_DYNAREC_PROMOTE_THRESHOLD", 8);
         let async_promote_enabled =
-            Self::parse_env_bool("N64_DYNAREC_ASYNC_PROMOTE", false) && promote_hot_threshold > 0;
+            Self::parse_env_bool("N64_DYNAREC_ASYNC_PROMOTE", true) && promote_hot_threshold > 0;
         let async_snapshot_instructions =
             Self::parse_env_u32("N64_DYNAREC_ASYNC_SNAPSHOT_INSNS", 256);
         let async_queue_limit =
@@ -467,7 +486,21 @@ impl DynarecEngine {
             Self::parse_env_u32("N64_DYNAREC_COMPILE_BUDGET_BURST_MS", 30);
         let compile_budget_cap_us =
             i64::from(compile_budget_us_per_ms.saturating_mul(compile_budget_burst_ms.max(1)));
-        let compiler = Box::<CraneliftCompiler>::default();
+        let global_opt_set = std::env::var("N64_CRANELIFT_OPT_LEVEL").is_ok();
+        let global_opt_level =
+            Self::parse_env_opt_level("N64_CRANELIFT_OPT_LEVEL", CraneliftOptLevel::None);
+        let tier1_opt_level =
+            Self::parse_env_opt_level("N64_DYNAREC_TIER1_OPT_LEVEL", global_opt_level);
+        let tier2_default_opt = if global_opt_set {
+            global_opt_level
+        } else {
+            CraneliftOptLevel::Speed
+        };
+        let tier2_opt_level =
+            Self::parse_env_opt_level("N64_DYNAREC_TIER2_OPT_LEVEL", tier2_default_opt);
+
+        let compiler = Box::new(CraneliftCompiler::with_opt_level(tier1_opt_level));
+        let promote_compiler = Box::new(CraneliftCompiler::with_opt_level(tier2_opt_level));
         let recompiler = Recompiler::new(
             compiler,
             RecompilerConfig {
@@ -479,7 +512,7 @@ impl DynarecEngine {
             let (result_tx, result_rx) = mpsc::channel::<AsyncCompileResult>();
             match thread::Builder::new()
                 .name("n64-jit-promote".to_string())
-                .spawn(move || async_compile_worker_loop(job_rx, result_tx))
+                .spawn(move || async_compile_worker_loop(job_rx, result_tx, tier2_opt_level))
             {
                 Ok(handle) => (Some(job_tx), Some(result_rx), Some(handle)),
                 Err(err) => {
@@ -493,6 +526,7 @@ impl DynarecEngine {
         Self {
             fallback: Interpreter,
             recompiler,
+            promote_compiler,
             runtime: DynarecRuntimeStats::default(),
             hot_counts: HashMap::default(),
             promote_counts: HashMap::default(),
@@ -528,7 +562,9 @@ impl DynarecEngine {
     #[cfg(test)]
     pub fn new_cranelift_for_tests() -> Self {
         let max_block_instructions = 256;
-        let compiler = Box::<CraneliftCompiler>::default();
+        let compiler = Box::new(CraneliftCompiler::with_opt_level(CraneliftOptLevel::None));
+        let promote_compiler =
+            Box::new(CraneliftCompiler::with_opt_level(CraneliftOptLevel::Speed));
         let recompiler = Recompiler::new(
             compiler,
             RecompilerConfig {
@@ -538,6 +574,7 @@ impl DynarecEngine {
         Self {
             fallback: Interpreter,
             recompiler,
+            promote_compiler,
             runtime: DynarecRuntimeStats::default(),
             hot_counts: HashMap::default(),
             promote_counts: HashMap::default(),
@@ -1081,10 +1118,13 @@ impl DynarecEngine {
         self.promote_attempted.insert(start_phys);
         self.runtime.promote_calls += 1;
         let compile_start = Instant::now();
-        let ensure_result = {
+        let compile_result = {
+            let request = CompileRequest {
+                start_phys,
+                max_instructions: self.max_block_instructions.max(1),
+            };
             let mut source = BusSource { bus };
-            self.recompiler
-                .recompile_with_max(start_phys, self.max_block_instructions, &mut source)
+            self.promote_compiler.compile(&request, &mut source)
         };
         let compile_elapsed_us = compile_start
             .elapsed()
@@ -1097,28 +1137,31 @@ impl DynarecEngine {
         self.runtime.promote_time_max_us = self.runtime.promote_time_max_us.max(compile_elapsed_us);
         self.charge_compile_budget(compile_elapsed_us);
 
-        match ensure_result {
-            EnsureResult::CacheHit => {
-                self.runtime.promote_cache_hit += 1;
-                self.remove_promote_tracking(start_phys);
-            }
-            EnsureResult::Compiled => {
+        match compile_result {
+            Ok(promoted) => {
+                let existing_max = self
+                    .recompiler
+                    .lookup(start_phys)
+                    .map(|cached| cached.max_retired_instructions)
+                    .unwrap_or(0);
+                if existing_max >= promoted.max_retired_instructions {
+                    self.runtime.promote_cache_hit += 1;
+                    self.remove_promote_tracking(start_phys);
+                    return;
+                }
+                self.recompiler.install_compiled_block(start_phys, promoted);
                 self.runtime.promote_compiled += 1;
-                if let Some(promoted) = self.recompiler.lookup(start_phys) {
-                    self.raise_tier_floor(start_phys, promoted.max_retired_instructions);
-                }
+                self.raise_tier_floor(start_phys, promoted.max_retired_instructions);
                 self.remove_promote_tracking(start_phys);
             }
-            EnsureResult::CompileFailed => {
+            Err(err) => {
                 self.runtime.promote_compile_failed += 1;
-                if let Some(err) = self.recompiler.last_error() {
-                    log::debug!(
-                        "Dynarec promote failed at {:#010X} (backend={}): {:?}",
-                        start_phys,
-                        self.recompiler.backend_name(),
-                        err
-                    );
-                }
+                log::debug!(
+                    "Dynarec promote failed at {:#010X} (backend={}): {:?}",
+                    start_phys,
+                    self.recompiler.backend_name(),
+                    err
+                );
             }
         }
     }
