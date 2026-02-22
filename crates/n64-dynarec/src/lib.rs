@@ -6,7 +6,7 @@
 use std::collections::{HashMap, HashSet};
 
 use cranelift_codegen::ir::condcodes::IntCC;
-use cranelift_codegen::ir::{types, AbiParam, FuncRef, InstBuilder, MemFlags, Value};
+use cranelift_codegen::ir::{types, AbiParam, FuncRef, InstBuilder, MemFlags, Type, Value};
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_jit::{JITBuilder, JITModule};
@@ -45,6 +45,12 @@ pub struct RuntimeCallbacks {
     pub hi_write: unsafe extern "C" fn(*mut u8, u64),
     pub lo_read: unsafe extern "C" fn(*mut u8) -> u64,
     pub lo_write: unsafe extern "C" fn(*mut u8, u64),
+    /// Optional fastmem base pointer (RDRAM backing). Null disables fastmem.
+    pub fastmem_base: *mut u8,
+    /// Exclusive physical range limit for fastmem loads/stores.
+    pub fastmem_phys_limit: u64,
+    /// Physical address mirror mask for fastmem (e.g. RDRAM size mask).
+    pub fastmem_phys_mask: u64,
 }
 
 unsafe extern "C" fn n64_jit_load_u8(ctx: *mut u8, vaddr: u64) -> u64 {
@@ -152,7 +158,7 @@ unsafe extern "C" fn n64_jit_lo_write(ctx: *mut u8, value: u64) {
     unsafe { (cbs.lo_write)(cbs.user, value) }
 }
 
-type JitBlockFn = unsafe extern "C" fn(*mut u64, u64, *mut u8, *mut u32) -> u64;
+type JitBlockFn = unsafe extern "C" fn(*mut u64, *mut u64, u64, *mut u8, *mut u32) -> u64;
 
 /// Pointer to compiled native entry point.
 #[derive(Clone, Copy)]
@@ -181,6 +187,8 @@ pub struct CompiledBlock {
     pub end_phys: u32,
     /// Number of guest instructions included in this block.
     pub instruction_count: u32,
+    /// Number of instructions in this block delegated via `Op::Interp`.
+    pub interp_op_count: u32,
     /// True if the block ended on a control-transfer boundary.
     pub has_control_flow: bool,
     entry: BlockEntry,
@@ -197,17 +205,19 @@ impl CompiledBlock {
     pub fn execute(
         &self,
         gpr: &mut [u64; 32],
+        fpr: &mut [u64; 32],
         start_pc: u64,
         callbacks: *mut RuntimeCallbacks,
     ) -> BlockExecution {
         let mut retired = 0u32;
         // SAFETY: compiled blocks are generated with signature
-        // `extern "C" fn(*mut u64, u64, *mut u8, *mut u32) -> u64`,
-        // `gpr` points to 32 contiguous u64s, and callback pointer comes from
-        // the caller.
+        // `extern "C" fn(*mut u64, *mut u64, u64, *mut u8, *mut u32) -> u64`,
+        // `gpr`/`fpr` point to 32 contiguous u64s, and callback pointer comes
+        // from the caller.
         let next_pc = unsafe {
             (self.entry.as_fn())(
                 gpr.as_mut_ptr(),
+                fpr.as_mut_ptr(),
                 start_pc,
                 callbacks.cast::<u8>(),
                 (&mut retired as *mut u32).cast::<u32>(),
@@ -455,10 +465,24 @@ enum Op {
     Sb { base: u8, rt: u8, imm: i16 },
     Sh { base: u8, rt: u8, imm: i16 },
     Sd { base: u8, rt: u8, imm: i16 },
+    Lwc1 { base: u8, ft: u8, imm: i16 },
+    Swc1 { base: u8, ft: u8, imm: i16 },
+    Ldc1 { base: u8, ft: u8, imm: i16 },
+    Sdc1 { base: u8, ft: u8, imm: i16 },
     Mfc0 { rt: u8, rd: u8 },
     Dmfc0 { rt: u8, rd: u8 },
     Mtc0 { rt: u8, rd: u8 },
     Dmtc0 { rt: u8, rd: u8 },
+    Mfc1 { rt: u8, fs: u8 },
+    Mtc1 { rt: u8, fs: u8 },
+    AddS { fd: u8, fs: u8, ft: u8 },
+    SubS { fd: u8, fs: u8, ft: u8 },
+    MulS { fd: u8, fs: u8, ft: u8 },
+    DivS { fd: u8, fs: u8, ft: u8 },
+    AddD { fd: u8, fs: u8, ft: u8 },
+    SubD { fd: u8, fs: u8, ft: u8 },
+    MulD { fd: u8, fs: u8, ft: u8 },
+    DivD { fd: u8, fs: u8, ft: u8 },
     Interp { raw: u32 },
     Sync,
     Cache,
@@ -486,12 +510,24 @@ enum BranchTerminator {
 
 #[derive(Debug, Clone, Copy)]
 enum TraceStep {
-    Op(Op),
+    Op {
+        phys: u32,
+        op: Op,
+    },
     Branch {
+        phys: u32,
         branch: BranchTerminator,
         delay_op: Op,
         continue_fallthrough: bool,
     },
+}
+
+impl TraceStep {
+    fn phys(self) -> u32 {
+        match self {
+            TraceStep::Op { phys, .. } | TraceStep::Branch { phys, .. } => phys,
+        }
+    }
 }
 
 fn decode_branch(raw: u32) -> Option<BranchTerminator> {
@@ -674,8 +710,78 @@ fn decode_supported_non_branch(raw: u32) -> Option<Op> {
             0x2F => Some(Op::Dsubu { rs, rt, rd }),
             _ => None,
         },
-        0x11 if rs != 0x08 => Some(Op::Interp { raw }),
-        0x31 | 0x35 | 0x39 | 0x3D => Some(Op::Interp { raw }),
+        0x11 => match rs {
+            0x00 => Some(Op::Mfc1 { rt, fs: rd }),
+            0x04 => Some(Op::Mtc1 { rt, fs: rd }),
+            0x10 => match funct {
+                0x00 => Some(Op::AddS {
+                    fd: sa,
+                    fs: rd,
+                    ft: rt,
+                }),
+                0x01 => Some(Op::SubS {
+                    fd: sa,
+                    fs: rd,
+                    ft: rt,
+                }),
+                0x02 => Some(Op::MulS {
+                    fd: sa,
+                    fs: rd,
+                    ft: rt,
+                }),
+                0x03 => Some(Op::DivS {
+                    fd: sa,
+                    fs: rd,
+                    ft: rt,
+                }),
+                _ => Some(Op::Interp { raw }),
+            },
+            0x11 => match funct {
+                0x00 => Some(Op::AddD {
+                    fd: sa,
+                    fs: rd,
+                    ft: rt,
+                }),
+                0x01 => Some(Op::SubD {
+                    fd: sa,
+                    fs: rd,
+                    ft: rt,
+                }),
+                0x02 => Some(Op::MulD {
+                    fd: sa,
+                    fs: rd,
+                    ft: rt,
+                }),
+                0x03 => Some(Op::DivD {
+                    fd: sa,
+                    fs: rd,
+                    ft: rt,
+                }),
+                _ => Some(Op::Interp { raw }),
+            },
+            0x08 => None,
+            _ => Some(Op::Interp { raw }),
+        },
+        0x31 => Some(Op::Lwc1 {
+            base: rs,
+            ft: rt,
+            imm: imm_i16,
+        }),
+        0x35 => Some(Op::Ldc1 {
+            base: rs,
+            ft: rt,
+            imm: imm_i16,
+        }),
+        0x39 => Some(Op::Swc1 {
+            base: rs,
+            ft: rt,
+            imm: imm_i16,
+        }),
+        0x3D => Some(Op::Sdc1 {
+            base: rs,
+            ft: rt,
+            imm: imm_i16,
+        }),
         0x2F => Some(Op::Cache),
         0x01 | 0x02 | 0x03 | 0x04 | 0x05 | 0x06 | 0x07 | 0x14 | 0x15 | 0x16 | 0x17 => None,
         _ => None,
@@ -712,6 +818,61 @@ fn store_gpr(
     }
 }
 
+fn load_fpr_word(
+    builder: &mut FunctionBuilder<'_>,
+    fpr_ptr: Value,
+    reg: u8,
+    flags: MemFlags,
+) -> Value {
+    let raw64 = builder
+        .ins()
+        .load(types::I64, flags, fpr_ptr, i32::from(reg) * 8);
+    builder.ins().ireduce(types::I32, raw64)
+}
+
+fn store_fpr_word(
+    builder: &mut FunctionBuilder<'_>,
+    fpr_ptr: Value,
+    reg: u8,
+    value32: Value,
+    flags: MemFlags,
+) {
+    let value64 = builder.ins().uextend(types::I64, value32);
+    builder
+        .ins()
+        .store(flags, value64, fpr_ptr, i32::from(reg) * 8);
+}
+
+fn load_fpr_double_bits(
+    builder: &mut FunctionBuilder<'_>,
+    fpr_ptr: Value,
+    reg: u8,
+    flags: MemFlags,
+) -> Value {
+    let low32 = load_fpr_word(builder, fpr_ptr, reg, flags);
+    let high32 = load_fpr_word(builder, fpr_ptr, reg | 1, flags);
+    let low64 = builder.ins().uextend(types::I64, low32);
+    let high64 = builder.ins().uextend(types::I64, high32);
+    let sh = builder.ins().iconst(types::I64, 32);
+    let high64 = builder.ins().ishl(high64, sh);
+    builder.ins().bor(high64, low64)
+}
+
+fn store_fpr_double_bits(
+    builder: &mut FunctionBuilder<'_>,
+    fpr_ptr: Value,
+    reg: u8,
+    bits64: Value,
+    flags: MemFlags,
+) {
+    let low32 = builder.ins().ireduce(types::I32, bits64);
+    let sh = builder.ins().iconst(types::I64, 32);
+    let high64 = builder.ins().ushr(bits64, sh);
+    let high32 = builder.ins().ireduce(types::I32, high64);
+    store_fpr_word(builder, fpr_ptr, reg, low32, flags);
+    store_fpr_word(builder, fpr_ptr, reg | 1, high32, flags);
+}
+
 #[derive(Clone, Copy)]
 struct ImportedFuncRefs {
     load_u8: FuncRef,
@@ -729,6 +890,196 @@ struct ImportedFuncRefs {
     hi_write: FuncRef,
     lo_read: FuncRef,
     lo_write: FuncRef,
+}
+
+#[derive(Clone, Copy)]
+struct FastmemValues {
+    ptr_ty: Type,
+    base: Value,
+    phys_limit: Value,
+    phys_mask: Value,
+}
+
+fn i64_to_ptr_sized(builder: &mut FunctionBuilder<'_>, ptr_ty: Type, value: Value) -> Value {
+    if ptr_ty == types::I64 {
+        value
+    } else {
+        builder.ins().ireduce(ptr_ty, value)
+    }
+}
+
+fn fastmem_guard_and_addr(
+    builder: &mut FunctionBuilder<'_>,
+    fastmem: FastmemValues,
+    vaddr: Value,
+    align: u8,
+) -> (Value, Value) {
+    let vaddr32 = builder.ins().ireduce(types::I32, vaddr);
+    let seg_mask = builder
+        .ins()
+        .iconst(types::I32, i64::from(0xE000_0000u32 as i32));
+    let seg = builder.ins().band(vaddr32, seg_mask);
+    let kseg0 = builder
+        .ins()
+        .iconst(types::I32, i64::from(0x8000_0000u32 as i32));
+    let kseg1 = builder
+        .ins()
+        .iconst(types::I32, i64::from(0xA000_0000u32 as i32));
+    let is_kseg0 = builder.ins().icmp(IntCC::Equal, seg, kseg0);
+    let is_kseg1 = builder.ins().icmp(IntCC::Equal, seg, kseg1);
+    let is_direct = builder.ins().bor(is_kseg0, is_kseg1);
+
+    let phys_mask_const = iconst_u64(builder, 0x1FFF_FFFF);
+    let phys = builder.ins().band(vaddr, phys_mask_const);
+    let in_range = builder
+        .ins()
+        .icmp(IntCC::UnsignedLessThan, phys, fastmem.phys_limit);
+    let null = builder.ins().iconst(fastmem.ptr_ty, 0);
+    let has_base = builder.ins().icmp(IntCC::NotEqual, fastmem.base, null);
+
+    let mut fast_cond = builder.ins().band(has_base, is_direct);
+    fast_cond = builder.ins().band(fast_cond, in_range);
+    if align > 1 {
+        let align_mask = iconst_u64(builder, u64::from(align - 1));
+        let aligned_bits = builder.ins().band(vaddr, align_mask);
+        let zero = iconst_u64(builder, 0);
+        let aligned = builder.ins().icmp(IntCC::Equal, aligned_bits, zero);
+        fast_cond = builder.ins().band(fast_cond, aligned);
+    }
+
+    let masked_phys = builder.ins().band(phys, fastmem.phys_mask);
+    let offset = i64_to_ptr_sized(builder, fastmem.ptr_ty, masked_phys);
+    let addr = builder.ins().iadd(fastmem.base, offset);
+    (fast_cond, addr)
+}
+
+fn load_be_from_fastmem(
+    builder: &mut FunctionBuilder<'_>,
+    addr: Value,
+    width: u8,
+    flags: MemFlags,
+) -> Value {
+    match width {
+        1 => {
+            let raw = builder.ins().load(types::I8, flags, addr, 0);
+            builder.ins().uextend(types::I64, raw)
+        }
+        2 => {
+            let raw = builder.ins().load(types::I16, flags, addr, 0);
+            let be = builder.ins().bswap(raw);
+            builder.ins().uextend(types::I64, be)
+        }
+        4 => {
+            let raw = builder.ins().load(types::I32, flags, addr, 0);
+            let be = builder.ins().bswap(raw);
+            builder.ins().uextend(types::I64, be)
+        }
+        8 => {
+            let raw = builder.ins().load(types::I64, flags, addr, 0);
+            builder.ins().bswap(raw)
+        }
+        _ => unreachable!("unsupported fastmem load width"),
+    }
+}
+
+fn store_be_to_fastmem(
+    builder: &mut FunctionBuilder<'_>,
+    addr: Value,
+    value64: Value,
+    width: u8,
+    flags: MemFlags,
+) {
+    match width {
+        1 => {
+            let v = builder.ins().ireduce(types::I8, value64);
+            builder.ins().store(flags, v, addr, 0);
+        }
+        2 => {
+            let v = builder.ins().ireduce(types::I16, value64);
+            let be = builder.ins().bswap(v);
+            builder.ins().store(flags, be, addr, 0);
+        }
+        4 => {
+            let v = builder.ins().ireduce(types::I32, value64);
+            let be = builder.ins().bswap(v);
+            builder.ins().store(flags, be, addr, 0);
+        }
+        8 => {
+            let be = builder.ins().bswap(value64);
+            builder.ins().store(flags, be, addr, 0);
+        }
+        _ => unreachable!("unsupported fastmem store width"),
+    }
+}
+
+fn emit_load_via_fastmem(
+    builder: &mut FunctionBuilder<'_>,
+    callbacks_ptr: Value,
+    helper: FuncRef,
+    fastmem: FastmemValues,
+    vaddr: Value,
+    width: u8,
+) -> Value {
+    let (fast_cond, fast_addr) = fastmem_guard_and_addr(builder, fastmem, vaddr, width);
+
+    let fast_block = builder.create_block();
+    let slow_block = builder.create_block();
+    let done_block = builder.create_block();
+    builder.append_block_param(done_block, types::I64);
+    builder
+        .ins()
+        .brif(fast_cond, fast_block, &[], slow_block, &[]);
+
+    builder.switch_to_block(fast_block);
+    let mut fast_flags = MemFlags::new();
+    fast_flags.set_notrap();
+    fast_flags.set_aligned();
+    let fast_val = load_be_from_fastmem(builder, fast_addr, width, fast_flags);
+    let args = [fast_val.into()];
+    builder.ins().jump(done_block, &args);
+
+    builder.switch_to_block(slow_block);
+    let call = builder.ins().call(helper, &[callbacks_ptr, vaddr]);
+    let slow_val = builder.inst_results(call)[0];
+    let args = [slow_val.into()];
+    builder.ins().jump(done_block, &args);
+
+    builder.switch_to_block(done_block);
+    builder.block_params(done_block)[0]
+}
+
+fn emit_store_via_fastmem(
+    builder: &mut FunctionBuilder<'_>,
+    callbacks_ptr: Value,
+    helper: FuncRef,
+    fastmem: FastmemValues,
+    vaddr: Value,
+    value64: Value,
+    width: u8,
+) {
+    let (fast_cond, fast_addr) = fastmem_guard_and_addr(builder, fastmem, vaddr, width);
+
+    let fast_block = builder.create_block();
+    let slow_block = builder.create_block();
+    let done_block = builder.create_block();
+    builder
+        .ins()
+        .brif(fast_cond, fast_block, &[], slow_block, &[]);
+
+    builder.switch_to_block(fast_block);
+    let mut fast_flags = MemFlags::new();
+    fast_flags.set_notrap();
+    fast_flags.set_aligned();
+    store_be_to_fastmem(builder, fast_addr, value64, width, fast_flags);
+    builder.ins().jump(done_block, &[]);
+
+    builder.switch_to_block(slow_block);
+    builder
+        .ins()
+        .call(helper, &[callbacks_ptr, vaddr, value64]);
+    builder.ins().jump(done_block, &[]);
+
+    builder.switch_to_block(done_block);
 }
 
 fn read_hi(
@@ -774,8 +1125,10 @@ fn write_lo(
 fn emit_op(
     builder: &mut FunctionBuilder<'_>,
     gpr_ptr: Value,
+    fpr_ptr: Value,
     callbacks_ptr: Value,
     helpers: ImportedFuncRefs,
+    fastmem: FastmemValues,
     flags: MemFlags,
     current_pc: Value,
     op: Op,
@@ -1110,8 +1463,14 @@ fn emit_op(
         Op::Lb { base, rt, imm } => {
             let base_addr = load_gpr(builder, gpr_ptr, base, flags);
             let vaddr = builder.ins().iadd_imm(base_addr, i64::from(imm));
-            let call = builder.ins().call(helpers.load_u8, &[callbacks_ptr, vaddr]);
-            let loaded = builder.inst_results(call)[0];
+            let loaded = emit_load_via_fastmem(
+                builder,
+                callbacks_ptr,
+                helpers.load_u8,
+                fastmem,
+                vaddr,
+                1,
+            );
             let loaded8 = builder.ins().ireduce(types::I8, loaded);
             let loaded64 = builder.ins().sextend(types::I64, loaded8);
             store_gpr(builder, gpr_ptr, rt, loaded64, flags);
@@ -1119,10 +1478,14 @@ fn emit_op(
         Op::Lh { base, rt, imm } => {
             let base_addr = load_gpr(builder, gpr_ptr, base, flags);
             let vaddr = builder.ins().iadd_imm(base_addr, i64::from(imm));
-            let call = builder
-                .ins()
-                .call(helpers.load_u16, &[callbacks_ptr, vaddr]);
-            let loaded = builder.inst_results(call)[0];
+            let loaded = emit_load_via_fastmem(
+                builder,
+                callbacks_ptr,
+                helpers.load_u16,
+                fastmem,
+                vaddr,
+                2,
+            );
             let loaded16 = builder.ins().ireduce(types::I16, loaded);
             let loaded64 = builder.ins().sextend(types::I64, loaded16);
             store_gpr(builder, gpr_ptr, rt, loaded64, flags);
@@ -1130,10 +1493,14 @@ fn emit_op(
         Op::Lhu { base, rt, imm } => {
             let base_addr = load_gpr(builder, gpr_ptr, base, flags);
             let vaddr = builder.ins().iadd_imm(base_addr, i64::from(imm));
-            let call = builder
-                .ins()
-                .call(helpers.load_u16, &[callbacks_ptr, vaddr]);
-            let loaded = builder.inst_results(call)[0];
+            let loaded = emit_load_via_fastmem(
+                builder,
+                callbacks_ptr,
+                helpers.load_u16,
+                fastmem,
+                vaddr,
+                2,
+            );
             let loaded16 = builder.ins().ireduce(types::I16, loaded);
             let loaded64 = builder.ins().uextend(types::I64, loaded16);
             store_gpr(builder, gpr_ptr, rt, loaded64, flags);
@@ -1141,10 +1508,14 @@ fn emit_op(
         Op::Lw { base, rt, imm } => {
             let base_addr = load_gpr(builder, gpr_ptr, base, flags);
             let vaddr = builder.ins().iadd_imm(base_addr, i64::from(imm));
-            let call = builder
-                .ins()
-                .call(helpers.load_u32, &[callbacks_ptr, vaddr]);
-            let loaded = builder.inst_results(call)[0];
+            let loaded = emit_load_via_fastmem(
+                builder,
+                callbacks_ptr,
+                helpers.load_u32,
+                fastmem,
+                vaddr,
+                4,
+            );
             let loaded32 = builder.ins().ireduce(types::I32, loaded);
             let loaded64 = builder.ins().sextend(types::I64, loaded32);
             store_gpr(builder, gpr_ptr, rt, loaded64, flags);
@@ -1152,10 +1523,14 @@ fn emit_op(
         Op::Lwu { base, rt, imm } => {
             let base_addr = load_gpr(builder, gpr_ptr, base, flags);
             let vaddr = builder.ins().iadd_imm(base_addr, i64::from(imm));
-            let call = builder
-                .ins()
-                .call(helpers.load_u32, &[callbacks_ptr, vaddr]);
-            let loaded = builder.inst_results(call)[0];
+            let loaded = emit_load_via_fastmem(
+                builder,
+                callbacks_ptr,
+                helpers.load_u32,
+                fastmem,
+                vaddr,
+                4,
+            );
             let loaded32 = builder.ins().ireduce(types::I32, loaded);
             let loaded64 = builder.ins().uextend(types::I64, loaded32);
             store_gpr(builder, gpr_ptr, rt, loaded64, flags);
@@ -1163,17 +1538,27 @@ fn emit_op(
         Op::Ld { base, rt, imm } => {
             let base_addr = load_gpr(builder, gpr_ptr, base, flags);
             let vaddr = builder.ins().iadd_imm(base_addr, i64::from(imm));
-            let call = builder
-                .ins()
-                .call(helpers.load_u64, &[callbacks_ptr, vaddr]);
-            let loaded64 = builder.inst_results(call)[0];
+            let loaded64 = emit_load_via_fastmem(
+                builder,
+                callbacks_ptr,
+                helpers.load_u64,
+                fastmem,
+                vaddr,
+                8,
+            );
             store_gpr(builder, gpr_ptr, rt, loaded64, flags);
         }
         Op::Lbu { base, rt, imm } => {
             let base_addr = load_gpr(builder, gpr_ptr, base, flags);
             let vaddr = builder.ins().iadd_imm(base_addr, i64::from(imm));
-            let call = builder.ins().call(helpers.load_u8, &[callbacks_ptr, vaddr]);
-            let loaded = builder.inst_results(call)[0];
+            let loaded = emit_load_via_fastmem(
+                builder,
+                callbacks_ptr,
+                helpers.load_u8,
+                fastmem,
+                vaddr,
+                1,
+            );
             let loaded8 = builder.ins().ireduce(types::I8, loaded);
             let loaded64 = builder.ins().uextend(types::I64, loaded8);
             store_gpr(builder, gpr_ptr, rt, loaded64, flags);
@@ -1184,9 +1569,15 @@ fn emit_op(
             let value = load_gpr(builder, gpr_ptr, rt, flags);
             let value32 = builder.ins().ireduce(types::I32, value);
             let value64 = builder.ins().uextend(types::I64, value32);
-            builder
-                .ins()
-                .call(helpers.store_u32, &[callbacks_ptr, vaddr, value64]);
+            emit_store_via_fastmem(
+                builder,
+                callbacks_ptr,
+                helpers.store_u32,
+                fastmem,
+                vaddr,
+                value64,
+                4,
+            );
         }
         Op::Sb { base, rt, imm } => {
             let base_addr = load_gpr(builder, gpr_ptr, base, flags);
@@ -1194,9 +1585,15 @@ fn emit_op(
             let value = load_gpr(builder, gpr_ptr, rt, flags);
             let value8 = builder.ins().ireduce(types::I8, value);
             let value64 = builder.ins().uextend(types::I64, value8);
-            builder
-                .ins()
-                .call(helpers.store_u8, &[callbacks_ptr, vaddr, value64]);
+            emit_store_via_fastmem(
+                builder,
+                callbacks_ptr,
+                helpers.store_u8,
+                fastmem,
+                vaddr,
+                value64,
+                1,
+            );
         }
         Op::Sh { base, rt, imm } => {
             let base_addr = load_gpr(builder, gpr_ptr, base, flags);
@@ -1204,17 +1601,167 @@ fn emit_op(
             let value = load_gpr(builder, gpr_ptr, rt, flags);
             let value16 = builder.ins().ireduce(types::I16, value);
             let value64 = builder.ins().uextend(types::I64, value16);
-            builder
-                .ins()
-                .call(helpers.store_u16, &[callbacks_ptr, vaddr, value64]);
+            emit_store_via_fastmem(
+                builder,
+                callbacks_ptr,
+                helpers.store_u16,
+                fastmem,
+                vaddr,
+                value64,
+                2,
+            );
         }
         Op::Sd { base, rt, imm } => {
             let base_addr = load_gpr(builder, gpr_ptr, base, flags);
             let vaddr = builder.ins().iadd_imm(base_addr, i64::from(imm));
             let value = load_gpr(builder, gpr_ptr, rt, flags);
-            builder
-                .ins()
-                .call(helpers.store_u64, &[callbacks_ptr, vaddr, value]);
+            emit_store_via_fastmem(
+                builder,
+                callbacks_ptr,
+                helpers.store_u64,
+                fastmem,
+                vaddr,
+                value,
+                8,
+            );
+        }
+        Op::Lwc1 { base, ft, imm } => {
+            let base_addr = load_gpr(builder, gpr_ptr, base, flags);
+            let vaddr = builder.ins().iadd_imm(base_addr, i64::from(imm));
+            let loaded = emit_load_via_fastmem(
+                builder,
+                callbacks_ptr,
+                helpers.load_u32,
+                fastmem,
+                vaddr,
+                4,
+            );
+            let bits32 = builder.ins().ireduce(types::I32, loaded);
+            store_fpr_word(builder, fpr_ptr, ft, bits32, flags);
+        }
+        Op::Swc1 { base, ft, imm } => {
+            let base_addr = load_gpr(builder, gpr_ptr, base, flags);
+            let vaddr = builder.ins().iadd_imm(base_addr, i64::from(imm));
+            let bits32 = load_fpr_word(builder, fpr_ptr, ft, flags);
+            let value64 = builder.ins().uextend(types::I64, bits32);
+            emit_store_via_fastmem(
+                builder,
+                callbacks_ptr,
+                helpers.store_u32,
+                fastmem,
+                vaddr,
+                value64,
+                4,
+            );
+        }
+        Op::Ldc1 { base, ft, imm } => {
+            let base_addr = load_gpr(builder, gpr_ptr, base, flags);
+            let vaddr = builder.ins().iadd_imm(base_addr, i64::from(imm));
+            let loaded = emit_load_via_fastmem(
+                builder,
+                callbacks_ptr,
+                helpers.load_u64,
+                fastmem,
+                vaddr,
+                8,
+            );
+            store_fpr_double_bits(builder, fpr_ptr, ft, loaded, flags);
+        }
+        Op::Sdc1 { base, ft, imm } => {
+            let base_addr = load_gpr(builder, gpr_ptr, base, flags);
+            let vaddr = builder.ins().iadd_imm(base_addr, i64::from(imm));
+            let value = load_fpr_double_bits(builder, fpr_ptr, ft, flags);
+            emit_store_via_fastmem(
+                builder,
+                callbacks_ptr,
+                helpers.store_u64,
+                fastmem,
+                vaddr,
+                value,
+                8,
+            );
+        }
+        Op::Mfc1 { rt, fs } => {
+            let bits32 = load_fpr_word(builder, fpr_ptr, fs, flags);
+            let value64 = builder.ins().sextend(types::I64, bits32);
+            store_gpr(builder, gpr_ptr, rt, value64, flags);
+        }
+        Op::Mtc1 { rt, fs } => {
+            let value64 = load_gpr(builder, gpr_ptr, rt, flags);
+            let bits32 = builder.ins().ireduce(types::I32, value64);
+            store_fpr_word(builder, fpr_ptr, fs, bits32, flags);
+        }
+        Op::AddS { fd, fs, ft } => {
+            let fs_bits = load_fpr_word(builder, fpr_ptr, fs, flags);
+            let ft_bits = load_fpr_word(builder, fpr_ptr, ft, flags);
+            let fs_val = builder.ins().bitcast(types::F32, MemFlags::new(), fs_bits);
+            let ft_val = builder.ins().bitcast(types::F32, MemFlags::new(), ft_bits);
+            let result = builder.ins().fadd(fs_val, ft_val);
+            let result_bits = builder.ins().bitcast(types::I32, MemFlags::new(), result);
+            store_fpr_word(builder, fpr_ptr, fd, result_bits, flags);
+        }
+        Op::SubS { fd, fs, ft } => {
+            let fs_bits = load_fpr_word(builder, fpr_ptr, fs, flags);
+            let ft_bits = load_fpr_word(builder, fpr_ptr, ft, flags);
+            let fs_val = builder.ins().bitcast(types::F32, MemFlags::new(), fs_bits);
+            let ft_val = builder.ins().bitcast(types::F32, MemFlags::new(), ft_bits);
+            let result = builder.ins().fsub(fs_val, ft_val);
+            let result_bits = builder.ins().bitcast(types::I32, MemFlags::new(), result);
+            store_fpr_word(builder, fpr_ptr, fd, result_bits, flags);
+        }
+        Op::MulS { fd, fs, ft } => {
+            let fs_bits = load_fpr_word(builder, fpr_ptr, fs, flags);
+            let ft_bits = load_fpr_word(builder, fpr_ptr, ft, flags);
+            let fs_val = builder.ins().bitcast(types::F32, MemFlags::new(), fs_bits);
+            let ft_val = builder.ins().bitcast(types::F32, MemFlags::new(), ft_bits);
+            let result = builder.ins().fmul(fs_val, ft_val);
+            let result_bits = builder.ins().bitcast(types::I32, MemFlags::new(), result);
+            store_fpr_word(builder, fpr_ptr, fd, result_bits, flags);
+        }
+        Op::DivS { fd, fs, ft } => {
+            let fs_bits = load_fpr_word(builder, fpr_ptr, fs, flags);
+            let ft_bits = load_fpr_word(builder, fpr_ptr, ft, flags);
+            let fs_val = builder.ins().bitcast(types::F32, MemFlags::new(), fs_bits);
+            let ft_val = builder.ins().bitcast(types::F32, MemFlags::new(), ft_bits);
+            let result = builder.ins().fdiv(fs_val, ft_val);
+            let result_bits = builder.ins().bitcast(types::I32, MemFlags::new(), result);
+            store_fpr_word(builder, fpr_ptr, fd, result_bits, flags);
+        }
+        Op::AddD { fd, fs, ft } => {
+            let fs_bits = load_fpr_double_bits(builder, fpr_ptr, fs, flags);
+            let ft_bits = load_fpr_double_bits(builder, fpr_ptr, ft, flags);
+            let fs_val = builder.ins().bitcast(types::F64, MemFlags::new(), fs_bits);
+            let ft_val = builder.ins().bitcast(types::F64, MemFlags::new(), ft_bits);
+            let result = builder.ins().fadd(fs_val, ft_val);
+            let result_bits = builder.ins().bitcast(types::I64, MemFlags::new(), result);
+            store_fpr_double_bits(builder, fpr_ptr, fd, result_bits, flags);
+        }
+        Op::SubD { fd, fs, ft } => {
+            let fs_bits = load_fpr_double_bits(builder, fpr_ptr, fs, flags);
+            let ft_bits = load_fpr_double_bits(builder, fpr_ptr, ft, flags);
+            let fs_val = builder.ins().bitcast(types::F64, MemFlags::new(), fs_bits);
+            let ft_val = builder.ins().bitcast(types::F64, MemFlags::new(), ft_bits);
+            let result = builder.ins().fsub(fs_val, ft_val);
+            let result_bits = builder.ins().bitcast(types::I64, MemFlags::new(), result);
+            store_fpr_double_bits(builder, fpr_ptr, fd, result_bits, flags);
+        }
+        Op::MulD { fd, fs, ft } => {
+            let fs_bits = load_fpr_double_bits(builder, fpr_ptr, fs, flags);
+            let ft_bits = load_fpr_double_bits(builder, fpr_ptr, ft, flags);
+            let fs_val = builder.ins().bitcast(types::F64, MemFlags::new(), fs_bits);
+            let ft_val = builder.ins().bitcast(types::F64, MemFlags::new(), ft_bits);
+            let result = builder.ins().fmul(fs_val, ft_val);
+            let result_bits = builder.ins().bitcast(types::I64, MemFlags::new(), result);
+            store_fpr_double_bits(builder, fpr_ptr, fd, result_bits, flags);
+        }
+        Op::DivD { fd, fs, ft } => {
+            let fs_bits = load_fpr_double_bits(builder, fpr_ptr, fs, flags);
+            let ft_bits = load_fpr_double_bits(builder, fpr_ptr, ft, flags);
+            let fs_val = builder.ins().bitcast(types::F64, MemFlags::new(), fs_bits);
+            let ft_val = builder.ins().bitcast(types::F64, MemFlags::new(), ft_bits);
+            let result = builder.ins().fdiv(fs_val, ft_val);
+            let result_bits = builder.ins().bitcast(types::I64, MemFlags::new(), result);
+            store_fpr_double_bits(builder, fpr_ptr, fd, result_bits, flags);
         }
         Op::Mfc0 { rt, rd } => {
             let reg = iconst_u64(builder, u64::from(rd));
@@ -1425,6 +1972,7 @@ impl BlockCompiler for CraneliftCompiler {
         let mut phys = request.start_phys;
         let max_instructions = request.max_instructions.max(1);
         let mut decoded_count = 0u32;
+        let mut interp_op_count = 0u32;
         let mut has_control_flow = false;
 
         while decoded_count < max_instructions {
@@ -1467,6 +2015,9 @@ impl BlockCompiler for CraneliftCompiler {
                     }
                     break;
                 };
+                if matches!(delay_op, Op::Interp { .. }) {
+                    interp_op_count = interp_op_count.saturating_add(1);
+                }
                 let continue_fallthrough = matches!(
                     branch,
                     BranchTerminator::Beq { .. }
@@ -1483,6 +2034,7 @@ impl BlockCompiler for CraneliftCompiler {
                         | BranchTerminator::Bgezl { .. }
                 );
                 steps.push(TraceStep::Branch {
+                    phys,
                     branch,
                     delay_op,
                     continue_fallthrough,
@@ -1498,7 +2050,10 @@ impl BlockCompiler for CraneliftCompiler {
 
             match decode_supported_non_branch(opcode) {
                 Some(op) => {
-                    steps.push(TraceStep::Op(op));
+                    if matches!(op, Op::Interp { .. }) {
+                        interp_op_count = interp_op_count.saturating_add(1);
+                    }
+                    steps.push(TraceStep::Op { phys, op });
                     decoded_count += 1;
                     phys = phys.wrapping_add(4);
                 }
@@ -1518,6 +2073,11 @@ impl BlockCompiler for CraneliftCompiler {
         self.context.func.signature.params.clear();
         self.context.func.signature.returns.clear();
         let ptr_ty = self.module.target_config().pointer_type();
+        self.context
+            .func
+            .signature
+            .params
+            .push(AbiParam::new(ptr_ty));
         self.context
             .func
             .signature
@@ -1551,9 +2111,37 @@ impl BlockCompiler for CraneliftCompiler {
         builder.seal_block(entry_block);
 
         let gpr_ptr = builder.block_params(entry_block)[0];
-        let start_pc = builder.block_params(entry_block)[1];
-        let callbacks_ptr = builder.block_params(entry_block)[2];
-        let retired_out_ptr = builder.block_params(entry_block)[3];
+        let fpr_ptr = builder.block_params(entry_block)[1];
+        let start_pc = builder.block_params(entry_block)[2];
+        let callbacks_ptr = builder.block_params(entry_block)[3];
+        let retired_out_ptr = builder.block_params(entry_block)[4];
+        let mut callback_flags = MemFlags::new();
+        callback_flags.set_notrap();
+        callback_flags.set_aligned();
+        let fastmem_base = builder.ins().load(
+            ptr_ty,
+            callback_flags,
+            callbacks_ptr,
+            std::mem::offset_of!(RuntimeCallbacks, fastmem_base) as i32,
+        );
+        let fastmem_phys_limit = builder.ins().load(
+            types::I64,
+            callback_flags,
+            callbacks_ptr,
+            std::mem::offset_of!(RuntimeCallbacks, fastmem_phys_limit) as i32,
+        );
+        let fastmem_phys_mask = builder.ins().load(
+            types::I64,
+            callback_flags,
+            callbacks_ptr,
+            std::mem::offset_of!(RuntimeCallbacks, fastmem_phys_mask) as i32,
+        );
+        let fastmem = FastmemValues {
+            ptr_ty,
+            base: fastmem_base,
+            phys_limit: fastmem_phys_limit,
+            phys_mask: fastmem_phys_mask,
+        };
         let helpers = ImportedFuncRefs {
             load_u8: self
                 .module
@@ -1605,39 +2193,72 @@ impl BlockCompiler for CraneliftCompiler {
         flags.set_notrap();
         flags.set_aligned();
 
+        let mut phys_to_index = HashMap::with_capacity(steps.len());
+        for (idx, step) in steps.iter().copied().enumerate() {
+            phys_to_index.insert(step.phys(), idx);
+        }
+
         let exit_block = builder.create_block();
         builder.append_block_param(exit_block, types::I64);
         builder.append_block_param(exit_block, types::I32);
+        let step_blocks: Vec<_> = steps
+            .iter()
+            .map(|_| {
+                let b = builder.create_block();
+                builder.append_block_param(b, types::I32);
+                b
+            })
+            .collect();
 
-        let mut current_pc = start_pc;
-        let mut retired_count = builder.ins().iconst(types::I32, 0);
-        let mut terminated = false;
+        let zero_retired = builder.ins().iconst(types::I32, 0);
+        let args = [zero_retired.into()];
+        builder.ins().jump(step_blocks[0], &args);
 
-        for step in steps.iter().copied() {
-            if terminated {
-                break;
-            }
+        for (step_idx, step) in steps.iter().copied().enumerate() {
+            let step_block = step_blocks[step_idx];
+            builder.switch_to_block(step_block);
+            let retired_count = builder.block_params(step_block)[0];
+            let step_phys = step.phys();
+            let step_delta = i64::from(step_phys.wrapping_sub(request.start_phys));
+            let current_pc = builder.ins().iadd_imm(start_pc, step_delta);
+
             match step {
-                TraceStep::Op(op) => {
+                TraceStep::Op { op, .. } => {
                     emit_op(
                         &mut builder,
                         gpr_ptr,
+                        fpr_ptr,
                         callbacks_ptr,
                         helpers,
+                        fastmem,
                         flags,
                         current_pc,
                         op,
                     );
-                    retired_count = builder.ins().iadd_imm(retired_count, 1);
-                    current_pc = builder.ins().iadd_imm(current_pc, 4);
+                    let retired_after = builder.ins().iadd_imm(retired_count, 1);
+                    if let Some(next_block) = step_blocks.get(step_idx + 1).copied() {
+                        let args = [retired_after.into()];
+                        builder.ins().jump(next_block, &args);
+                    } else {
+                        let ret_pc = builder.ins().iadd_imm(current_pc, 4);
+                        let args = [ret_pc.into(), retired_after.into()];
+                        builder.ins().jump(exit_block, &args);
+                    }
                 }
                 TraceStep::Branch {
+                    phys,
                     branch,
                     delay_op,
                     continue_fallthrough,
                 } => {
                     let next_of_branch = builder.ins().iadd_imm(current_pc, 4);
                     let fallthrough_pc = builder.ins().iadd_imm(current_pc, 8);
+                    let fallthrough_block = if continue_fallthrough {
+                        step_blocks.get(step_idx + 1).copied()
+                    } else {
+                        None
+                    };
+
                     match branch {
                         BranchTerminator::J { target } => {
                             let upper = iconst_u64(&mut builder, 0xFFFF_FFFF_F000_0000);
@@ -1646,8 +2267,10 @@ impl BlockCompiler for CraneliftCompiler {
                             emit_op(
                                 &mut builder,
                                 gpr_ptr,
+                                fpr_ptr,
                                 callbacks_ptr,
                                 helpers,
+                                fastmem,
                                 flags,
                                 next_of_branch,
                                 delay_op,
@@ -1656,7 +2279,6 @@ impl BlockCompiler for CraneliftCompiler {
                             let retired_after = builder.ins().iadd_imm(retired_count, 2);
                             let args = [target_pc.into(), retired_after.into()];
                             builder.ins().jump(exit_block, &args);
-                            terminated = true;
                         }
                         BranchTerminator::Jal { target } => {
                             let upper = iconst_u64(&mut builder, 0xFFFF_FFFF_F000_0000);
@@ -1667,8 +2289,10 @@ impl BlockCompiler for CraneliftCompiler {
                             emit_op(
                                 &mut builder,
                                 gpr_ptr,
+                                fpr_ptr,
                                 callbacks_ptr,
                                 helpers,
+                                fastmem,
                                 flags,
                                 next_of_branch,
                                 delay_op,
@@ -1677,14 +2301,15 @@ impl BlockCompiler for CraneliftCompiler {
                             let retired_after = builder.ins().iadd_imm(retired_count, 2);
                             let args = [target_pc.into(), retired_after.into()];
                             builder.ins().jump(exit_block, &args);
-                            terminated = true;
                         }
                         BranchTerminator::Jr { rs } => {
                             emit_op(
                                 &mut builder,
                                 gpr_ptr,
+                                fpr_ptr,
                                 callbacks_ptr,
                                 helpers,
+                                fastmem,
                                 flags,
                                 next_of_branch,
                                 delay_op,
@@ -1693,7 +2318,6 @@ impl BlockCompiler for CraneliftCompiler {
                             let retired_after = builder.ins().iadd_imm(retired_count, 2);
                             let args = [target_pc.into(), retired_after.into()];
                             builder.ins().jump(exit_block, &args);
-                            terminated = true;
                         }
                         BranchTerminator::Jalr { rs, rd } => {
                             let link = builder.ins().iadd_imm(current_pc, 8);
@@ -1701,18 +2325,18 @@ impl BlockCompiler for CraneliftCompiler {
                             emit_op(
                                 &mut builder,
                                 gpr_ptr,
+                                fpr_ptr,
                                 callbacks_ptr,
                                 helpers,
+                                fastmem,
                                 flags,
                                 next_of_branch,
                                 delay_op,
                             );
-                            // Match interpreter ordering: target is read after link write.
                             let target_pc = load_gpr(&mut builder, gpr_ptr, rs, flags);
                             let retired_after = builder.ins().iadd_imm(retired_count, 2);
                             let args = [target_pc.into(), retired_after.into()];
                             builder.ins().jump(exit_block, &args);
-                            terminated = true;
                         }
                         BranchTerminator::Beq { rs, rt, offset }
                         | BranchTerminator::Bne { rs, rt, offset }
@@ -1730,67 +2354,118 @@ impl BlockCompiler for CraneliftCompiler {
                                 .ins()
                                 .iconst(types::I64, i64::from((offset as i32) << 2));
                             let taken_pc = builder.ins().iadd(next_of_branch, offset_val);
+                            let target_phys = phys
+                                .wrapping_add(4)
+                                .wrapping_add(((offset as i32) << 2) as u32);
+                            let taken_block = phys_to_index
+                                .get(&target_phys)
+                                .copied()
+                                .filter(|idx| *idx > step_idx)
+                                .map(|idx| step_blocks[idx]);
                             let is_likely = matches!(
                                 branch,
                                 BranchTerminator::Beql { .. } | BranchTerminator::Bnel { .. }
                             );
-                            if is_likely && continue_fallthrough {
-                                let taken_block = builder.create_block();
-                                let cont_block = builder.create_block();
-                                builder
-                                    .ins()
-                                    .brif(cond_taken, taken_block, &[], cont_block, &[]);
-                                builder.seal_block(taken_block);
-                                builder.seal_block(cont_block);
 
-                                builder.switch_to_block(taken_block);
+                            if is_likely {
+                                let taken_exec_block = builder.create_block();
+                                let not_taken_retired = builder.ins().iadd_imm(retired_count, 1);
+                                match fallthrough_block {
+                                    Some(fallthrough) => {
+                                        let args = [not_taken_retired.into()];
+                                        builder.ins().brif(
+                                            cond_taken,
+                                            taken_exec_block,
+                                            &[],
+                                            fallthrough,
+                                            &args,
+                                        );
+                                    }
+                                    None => {
+                                        let args =
+                                            [fallthrough_pc.into(), not_taken_retired.into()];
+                                        builder.ins().brif(
+                                            cond_taken,
+                                            taken_exec_block,
+                                            &[],
+                                            exit_block,
+                                            &args,
+                                        );
+                                    }
+                                }
+
+                                builder.switch_to_block(taken_exec_block);
                                 emit_op(
                                     &mut builder,
                                     gpr_ptr,
+                                    fpr_ptr,
                                     callbacks_ptr,
                                     helpers,
+                                    fastmem,
                                     flags,
                                     next_of_branch,
                                     delay_op,
                                 );
                                 let taken_retired = builder.ins().iadd_imm(retired_count, 2);
-                                let args = [taken_pc.into(), taken_retired.into()];
-                                builder.ins().jump(exit_block, &args);
-
-                                builder.switch_to_block(cont_block);
-                                retired_count = builder.ins().iadd_imm(retired_count, 1);
-                                current_pc = fallthrough_pc;
+                                match taken_block {
+                                    Some(target) => {
+                                        let args = [taken_retired.into()];
+                                        builder.ins().jump(target, &args);
+                                    }
+                                    None => {
+                                        let args = [taken_pc.into(), taken_retired.into()];
+                                        builder.ins().jump(exit_block, &args);
+                                    }
+                                }
                             } else {
                                 emit_op(
                                     &mut builder,
                                     gpr_ptr,
+                                    fpr_ptr,
                                     callbacks_ptr,
                                     helpers,
+                                    fastmem,
                                     flags,
                                     next_of_branch,
                                     delay_op,
                                 );
                                 let retired_after = builder.ins().iadd_imm(retired_count, 2);
-                                if continue_fallthrough {
-                                    let cont_block = builder.create_block();
-                                    let exit_args = [taken_pc.into(), retired_after.into()];
-                                    builder.ins().brif(
-                                        cond_taken,
-                                        exit_block,
-                                        &exit_args,
-                                        cont_block,
-                                        &[],
-                                    );
-                                    builder.seal_block(cont_block);
-                                    builder.switch_to_block(cont_block);
-                                    retired_count = retired_after;
-                                    current_pc = fallthrough_pc;
-                                } else {
-                                    let ret_pc =
-                                        builder.ins().select(cond_taken, taken_pc, fallthrough_pc);
-                                    let args = [ret_pc.into(), retired_after.into()];
-                                    builder.ins().jump(exit_block, &args);
-                                    terminated = true;
+                                match (taken_block, fallthrough_block) {
+                                    (Some(taken), Some(fallthrough)) => {
+                                        let args = [retired_after.into()];
+                                        builder.ins().brif(
+                                            cond_taken,
+                                            taken,
+                                            &args,
+                                            fallthrough,
+                                            &args,
+                                        );
+                                    }
+                                    (Some(taken), None) => {
+                                        let targs = [retired_after.into()];
+                                        let fargs = [fallthrough_pc.into(), retired_after.into()];
+                                        builder
+                                            .ins()
+                                            .brif(cond_taken, taken, &targs, exit_block, &fargs);
+                                    }
+                                    (None, Some(fallthrough)) => {
+                                        let targs = [taken_pc.into(), retired_after.into()];
+                                        let fargs = [retired_after.into()];
+                                        builder.ins().brif(
+                                            cond_taken,
+                                            exit_block,
+                                            &targs,
+                                            fallthrough,
+                                            &fargs,
+                                        );
+                                    }
+                                    (None, None) => {
+                                        let targs = [taken_pc.into(), retired_after.into()];
+                                        let fargs = [fallthrough_pc.into(), retired_after.into()];
+                                        builder.ins().brif(
+                                            cond_taken, exit_block, &targs, exit_block, &fargs,
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -1822,6 +2497,14 @@ impl BlockCompiler for CraneliftCompiler {
                                 .ins()
                                 .iconst(types::I64, i64::from((offset as i32) << 2));
                             let taken_pc = builder.ins().iadd(next_of_branch, offset_val);
+                            let target_phys = phys
+                                .wrapping_add(4)
+                                .wrapping_add(((offset as i32) << 2) as u32);
+                            let taken_block = phys_to_index
+                                .get(&target_phys)
+                                .copied()
+                                .filter(|idx| *idx > step_idx)
+                                .map(|idx| step_blocks[idx]);
                             let is_likely = matches!(
                                 branch,
                                 BranchTerminator::Blezl { .. }
@@ -1829,63 +2512,106 @@ impl BlockCompiler for CraneliftCompiler {
                                     | BranchTerminator::Bltzl { .. }
                                     | BranchTerminator::Bgezl { .. }
                             );
-                            if is_likely && continue_fallthrough {
-                                let taken_block = builder.create_block();
-                                let cont_block = builder.create_block();
-                                builder
-                                    .ins()
-                                    .brif(cond_taken, taken_block, &[], cont_block, &[]);
-                                builder.seal_block(taken_block);
-                                builder.seal_block(cont_block);
 
-                                builder.switch_to_block(taken_block);
+                            if is_likely {
+                                let taken_exec_block = builder.create_block();
+                                let not_taken_retired = builder.ins().iadd_imm(retired_count, 1);
+                                match fallthrough_block {
+                                    Some(fallthrough) => {
+                                        let args = [not_taken_retired.into()];
+                                        builder.ins().brif(
+                                            cond_taken,
+                                            taken_exec_block,
+                                            &[],
+                                            fallthrough,
+                                            &args,
+                                        );
+                                    }
+                                    None => {
+                                        let args =
+                                            [fallthrough_pc.into(), not_taken_retired.into()];
+                                        builder.ins().brif(
+                                            cond_taken,
+                                            taken_exec_block,
+                                            &[],
+                                            exit_block,
+                                            &args,
+                                        );
+                                    }
+                                }
+
+                                builder.switch_to_block(taken_exec_block);
                                 emit_op(
                                     &mut builder,
                                     gpr_ptr,
+                                    fpr_ptr,
                                     callbacks_ptr,
                                     helpers,
+                                    fastmem,
                                     flags,
                                     next_of_branch,
                                     delay_op,
                                 );
                                 let taken_retired = builder.ins().iadd_imm(retired_count, 2);
-                                let args = [taken_pc.into(), taken_retired.into()];
-                                builder.ins().jump(exit_block, &args);
-
-                                builder.switch_to_block(cont_block);
-                                retired_count = builder.ins().iadd_imm(retired_count, 1);
-                                current_pc = fallthrough_pc;
+                                match taken_block {
+                                    Some(target) => {
+                                        let args = [taken_retired.into()];
+                                        builder.ins().jump(target, &args);
+                                    }
+                                    None => {
+                                        let args = [taken_pc.into(), taken_retired.into()];
+                                        builder.ins().jump(exit_block, &args);
+                                    }
+                                }
                             } else {
                                 emit_op(
                                     &mut builder,
                                     gpr_ptr,
+                                    fpr_ptr,
                                     callbacks_ptr,
                                     helpers,
+                                    fastmem,
                                     flags,
                                     next_of_branch,
                                     delay_op,
                                 );
                                 let retired_after = builder.ins().iadd_imm(retired_count, 2);
-                                if continue_fallthrough {
-                                    let cont_block = builder.create_block();
-                                    let exit_args = [taken_pc.into(), retired_after.into()];
-                                    builder.ins().brif(
-                                        cond_taken,
-                                        exit_block,
-                                        &exit_args,
-                                        cont_block,
-                                        &[],
-                                    );
-                                    builder.seal_block(cont_block);
-                                    builder.switch_to_block(cont_block);
-                                    retired_count = retired_after;
-                                    current_pc = fallthrough_pc;
-                                } else {
-                                    let ret_pc =
-                                        builder.ins().select(cond_taken, taken_pc, fallthrough_pc);
-                                    let args = [ret_pc.into(), retired_after.into()];
-                                    builder.ins().jump(exit_block, &args);
-                                    terminated = true;
+                                match (taken_block, fallthrough_block) {
+                                    (Some(taken), Some(fallthrough)) => {
+                                        let args = [retired_after.into()];
+                                        builder.ins().brif(
+                                            cond_taken,
+                                            taken,
+                                            &args,
+                                            fallthrough,
+                                            &args,
+                                        );
+                                    }
+                                    (Some(taken), None) => {
+                                        let targs = [retired_after.into()];
+                                        let fargs = [fallthrough_pc.into(), retired_after.into()];
+                                        builder
+                                            .ins()
+                                            .brif(cond_taken, taken, &targs, exit_block, &fargs);
+                                    }
+                                    (None, Some(fallthrough)) => {
+                                        let targs = [taken_pc.into(), retired_after.into()];
+                                        let fargs = [retired_after.into()];
+                                        builder.ins().brif(
+                                            cond_taken,
+                                            exit_block,
+                                            &targs,
+                                            fallthrough,
+                                            &fargs,
+                                        );
+                                    }
+                                    (None, None) => {
+                                        let targs = [taken_pc.into(), retired_after.into()];
+                                        let fargs = [fallthrough_pc.into(), retired_after.into()];
+                                        builder.ins().brif(
+                                            cond_taken, exit_block, &targs, exit_block, &fargs,
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -1894,13 +2620,8 @@ impl BlockCompiler for CraneliftCompiler {
             }
         }
 
-        if !terminated {
-            let args = [current_pc.into(), retired_count.into()];
-            builder.ins().jump(exit_block, &args);
-        }
-
+        builder.seal_all_blocks();
         builder.switch_to_block(exit_block);
-        builder.seal_block(exit_block);
         let exit_params = builder.block_params(exit_block);
         let ret_pc = exit_params[0];
         let retired_count = exit_params[1];
@@ -1944,6 +2665,7 @@ impl BlockCompiler for CraneliftCompiler {
                 .start_phys
                 .wrapping_add(instruction_count.saturating_mul(4)),
             instruction_count,
+            interp_op_count,
             has_control_flow,
             entry,
         })
@@ -2040,6 +2762,9 @@ mod tests {
             hi_write: test_hi_write,
             lo_read: test_lo_read,
             lo_write: test_lo_write,
+            fastmem_base: std::ptr::null_mut(),
+            fastmem_phys_limit: 0,
+            fastmem_phys_mask: 0,
         }
     }
 
@@ -2185,6 +2910,9 @@ mod tests {
             hi_write: state_hi_write,
             lo_read: state_lo_read,
             lo_write: state_lo_write,
+            fastmem_base: std::ptr::null_mut(),
+            fastmem_phys_limit: 0,
+            fastmem_phys_mask: 0,
         }
     }
 
@@ -2236,8 +2964,9 @@ mod tests {
             .expect("compile");
 
         let mut gpr = [0u64; 32];
+        let mut fpr = [0u64; 32];
         let mut callbacks = default_callbacks();
-        let exec = block.execute(&mut gpr, 0xFFFF_FFFF_8000_2000, &mut callbacks);
+        let exec = block.execute(&mut gpr, &mut fpr, 0xFFFF_FFFF_8000_2000, &mut callbacks);
 
         assert_eq!(block.instruction_count, 5);
         assert_eq!(gpr[8], 5);
@@ -2273,9 +3002,10 @@ mod tests {
             .expect("compile");
 
         let mut gpr = [0u64; 32];
+        let mut fpr = [0u64; 32];
         let mut callbacks = default_callbacks();
         let start_pc = 0xFFFF_FFFF_8000_2200u64;
-        let exec = block.execute(&mut gpr, start_pc, &mut callbacks);
+        let exec = block.execute(&mut gpr, &mut fpr, start_pc, &mut callbacks);
 
         assert!(block.has_control_flow);
         assert_eq!(block.instruction_count, 5);
@@ -2306,9 +3036,10 @@ mod tests {
             .expect("compile");
 
         let mut gpr = [0u64; 32];
+        let mut fpr = [0u64; 32];
         let mut callbacks = default_callbacks();
         let start_pc = 0xFFFF_FFFF_8000_2300u64;
-        let exec = block.execute(&mut gpr, start_pc, &mut callbacks);
+        let exec = block.execute(&mut gpr, &mut fpr, start_pc, &mut callbacks);
 
         assert!(block.has_control_flow);
         assert_eq!(block.instruction_count, 4);
@@ -2337,10 +3068,11 @@ mod tests {
             .expect("compile");
 
         let mut gpr = [0u64; 32];
+        let mut fpr = [0u64; 32];
         let mut callbacks = default_callbacks();
         gpr[11] = 0xFFFF_FFFF_8000_2600;
         let start_pc = 0xFFFF_FFFF_8000_2400u64;
-        let exec = block.execute(&mut gpr, start_pc, &mut callbacks);
+        let exec = block.execute(&mut gpr, &mut fpr, start_pc, &mut callbacks);
 
         assert!(block.has_control_flow);
         assert_eq!(block.instruction_count, 2);
@@ -2370,10 +3102,11 @@ mod tests {
             .expect("compile");
 
         let mut gpr = [0u64; 32];
+        let mut fpr = [0u64; 32];
         let mut callbacks = default_callbacks();
         let start_pc = 0xFFFF_FFFF_8000_2480u64;
         gpr[25] = start_pc + 0x40;
-        let exec = block.execute(&mut gpr, start_pc, &mut callbacks);
+        let exec = block.execute(&mut gpr, &mut fpr, start_pc, &mut callbacks);
 
         assert!(block.has_control_flow);
         assert_eq!(block.instruction_count, 2);
@@ -2414,10 +3147,11 @@ mod tests {
             .expect("compile");
 
         let mut gpr = [0u64; 32];
+        let mut fpr = [0u64; 32];
         let mut state = CallbackState::default();
         let mut callbacks = state_callbacks(&mut state);
         let start_pc = 0xFFFF_FFFF_8000_24C0u64;
-        let exec = block.execute(&mut gpr, start_pc, &mut callbacks);
+        let exec = block.execute(&mut gpr, &mut fpr, start_pc, &mut callbacks);
 
         assert_eq!(exec.next_pc, start_pc + 48);
         assert_eq!(exec.retired_instructions, 12);
@@ -2459,10 +3193,11 @@ mod tests {
             .expect("compile");
 
         let mut gpr = [0u64; 32];
+        let mut fpr = [0u64; 32];
         let mut state = CallbackState::default();
         let mut callbacks = state_callbacks(&mut state);
         let start_pc = 0xFFFF_FFFF_8000_2500u64;
-        let exec = block.execute(&mut gpr, start_pc, &mut callbacks);
+        let exec = block.execute(&mut gpr, &mut fpr, start_pc, &mut callbacks);
 
         assert_eq!(exec.next_pc, start_pc + 36);
         assert_eq!(exec.retired_instructions, 9);
@@ -2470,6 +3205,102 @@ mod tests {
         assert_eq!(gpr[11], 0x34);
         assert_eq!(gpr[2], 0x34);
         assert_eq!(state.cop0[12], 0x34);
+    }
+
+    #[test]
+    fn compiled_block_uses_fastmem_for_integer_load_store() {
+        let start = 0x2580u32;
+        let mut src = TestSource::with_words(&[
+            (start, 0x3C0C_8000),     // lui t4, 0x8000
+            (start + 4, 0x8D88_0000), // lw t0, 0(t4)
+            (start + 8, 0xA188_0007), // sb t0, 7(t4)
+            (start + 12, 0x9189_0007), // lbu t1, 7(t4)
+        ]);
+
+        let mut compiler = CraneliftCompiler::default();
+        let block = compiler
+            .compile(
+                &CompileRequest {
+                    start_phys: start,
+                    max_instructions: 4,
+                },
+                &mut src,
+            )
+            .expect("compile");
+
+        let mut gpr = [0u64; 32];
+        let mut fpr = [0u64; 32];
+        let mut state = CallbackState::default();
+        let mut callbacks = state_callbacks(&mut state);
+        let mut fastmem = vec![0u8; 8 * 1024 * 1024];
+        fastmem[0..4].copy_from_slice(&0x1122_3344u32.to_be_bytes());
+        callbacks.fastmem_base = fastmem.as_mut_ptr();
+        callbacks.fastmem_phys_limit = 0x03F0_0000;
+        callbacks.fastmem_phys_mask = 0x007F_FFFF;
+
+        let start_pc = 0xFFFF_FFFF_8000_2580u64;
+        let exec = block.execute(&mut gpr, &mut fpr, start_pc, &mut callbacks);
+
+        assert_eq!(exec.next_pc, start_pc + 16);
+        assert_eq!(exec.retired_instructions, 4);
+        assert_eq!(gpr[8], 0x1122_3344);
+        assert_eq!(gpr[9], 0x44);
+        assert_eq!(fastmem[7], 0x44);
+        assert!(state.mem.is_empty(), "slow callback path should not run");
+    }
+
+    #[test]
+    fn compiled_block_executes_cop1_memory_ops_via_fastmem() {
+        let start = 0x25C0u32;
+        let mut src = TestSource::with_words(&[
+            (start, 0x3C0C_8000),      // lui t4, 0x8000
+            (start + 4, 0xC582_0000),  // lwc1 f2, 0(t4)
+            (start + 8, 0xC584_0004),  // lwc1 f4, 4(t4)
+            (start + 12, 0x4604_1180), // add.s f6, f2, f4
+            (start + 16, 0xE586_0008), // swc1 f6, 8(t4)
+            (start + 20, 0xD588_0010), // ldc1 f8, 16(t4)
+            (start + 24, 0xF588_0018), // sdc1 f8, 24(t4)
+        ]);
+
+        let mut compiler = CraneliftCompiler::default();
+        let block = compiler
+            .compile(
+                &CompileRequest {
+                    start_phys: start,
+                    max_instructions: 7,
+                },
+                &mut src,
+            )
+            .expect("compile");
+
+        let mut gpr = [0u64; 32];
+        let mut fpr = [0u64; 32];
+        let mut state = CallbackState::default();
+        let mut callbacks = state_callbacks(&mut state);
+        let mut fastmem = vec![0u8; 8 * 1024 * 1024];
+        fastmem[0..4].copy_from_slice(&0x3FC0_0000u32.to_be_bytes()); // 1.5f32
+        fastmem[4..8].copy_from_slice(&0x4010_0000u32.to_be_bytes()); // 2.25f32
+        fastmem[16..24].copy_from_slice(&0x1122_3344_5566_7788u64.to_be_bytes());
+        callbacks.fastmem_base = fastmem.as_mut_ptr();
+        callbacks.fastmem_phys_limit = 0x03F0_0000;
+        callbacks.fastmem_phys_mask = 0x007F_FFFF;
+
+        let start_pc = 0xFFFF_FFFF_8000_25C0u64;
+        let exec = block.execute(&mut gpr, &mut fpr, start_pc, &mut callbacks);
+
+        assert_eq!(exec.next_pc, start_pc + 28);
+        assert_eq!(exec.retired_instructions, 7);
+        assert_eq!(u32::from_be_bytes([fastmem[8], fastmem[9], fastmem[10], fastmem[11]]), 0x4070_0000);
+        assert_eq!(
+            u64::from_be_bytes([
+                fastmem[24], fastmem[25], fastmem[26], fastmem[27], fastmem[28], fastmem[29],
+                fastmem[30], fastmem[31]
+            ]),
+            0x1122_3344_5566_7788
+        );
+        assert_eq!(fpr[8], 0x5566_7788);
+        assert_eq!(fpr[9], 0x1122_3344);
+        assert!(state.mem.is_empty(), "slow callback path should not run");
     }
 
     #[test]
@@ -2492,11 +3323,12 @@ mod tests {
             .expect("compile");
 
         let mut gpr = [0u64; 32];
+        let mut fpr = [0u64; 32];
         let mut state = CallbackState::default();
         state.cop0[13] = 0x0000_0000_8000_0001;
         let mut callbacks = state_callbacks(&mut state);
         let start_pc = 0xFFFF_FFFF_8000_2600u64;
-        let exec = block.execute(&mut gpr, start_pc, &mut callbacks);
+        let exec = block.execute(&mut gpr, &mut fpr, start_pc, &mut callbacks);
 
         assert_eq!(exec.next_pc, start_pc + 4);
         assert_eq!(exec.retired_instructions, 1);

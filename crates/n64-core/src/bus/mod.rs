@@ -1,5 +1,12 @@
 pub mod map;
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DynarecFastmem {
+    pub rdram_base: *mut u8,
+    pub rdram_phys_limit: u64,
+    pub rdram_phys_mask: u64,
+}
+
 /// Memory bus trait. All memory access goes through this.
 ///
 /// The CPU calls read/write on the Bus; the Bus dispatches to
@@ -22,6 +29,12 @@ pub trait Bus {
     /// Called when writes may have modified executable RDRAM.
     /// Dynarec listens here to invalidate compiled blocks.
     fn notify_dma_write(&mut self, start: u32, len: u32);
+
+    /// Optional fastmem view used by dynarec to inline direct RDRAM accesses.
+    /// Interpreter code does not use this path.
+    fn dynarec_fastmem(&mut self) -> Option<DynarecFastmem> {
+        None
+    }
 
     /// Check for pending unmasked interrupts (MI_INTR & MI_MASK).
     fn pending_interrupts(&self) -> bool;

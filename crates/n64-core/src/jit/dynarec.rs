@@ -365,6 +365,12 @@ impl DynarecEngine {
             return false;
         }
 
+        // Blocks dominated by interpreter-delegated ops are usually slower than
+        // the plain interpreter path.
+        if block.interp_op_count != 0 && block.interp_op_count >= block.instruction_count {
+            return false;
+        }
+
         // Delay-slot and non-linear PC paths need exact per-instruction handling.
         if cpu.in_delay_slot || cpu.next_pc != cpu.pc.wrapping_add(4) {
             return false;
@@ -399,6 +405,7 @@ impl DynarecEngine {
         block: &CompiledBlock,
     ) -> u64 {
         let start_pc = cpu.pc;
+        let fastmem = bus.dynarec_fastmem().unwrap_or_default();
         let mut callback_ctx = CallbackContext {
             cpu: (cpu as *mut Vr4300),
             bus: (bus as *mut B),
@@ -420,8 +427,11 @@ impl DynarecEngine {
             hi_write: cb_hi_write::<B>,
             lo_read: cb_lo_read::<B>,
             lo_write: cb_lo_write::<B>,
+            fastmem_base: fastmem.rdram_base,
+            fastmem_phys_limit: fastmem.rdram_phys_limit,
+            fastmem_phys_mask: fastmem.rdram_phys_mask,
         };
-        let execution = block.execute(&mut cpu.gpr, start_pc, &mut callbacks);
+        let execution = block.execute(&mut cpu.gpr, &mut cpu.cop1.fpr, start_pc, &mut callbacks);
         let count = execution.retired_instructions;
         let next_pc = execution.next_pc;
 

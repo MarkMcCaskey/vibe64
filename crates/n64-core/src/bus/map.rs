@@ -1,4 +1,4 @@
-use crate::bus::Bus;
+use crate::bus::{Bus, DynarecFastmem};
 use crate::cart::Cartridge;
 use crate::memory::pif::Pif;
 use crate::memory::rdram::Rdram;
@@ -766,6 +766,14 @@ impl Bus for Interconnect {
 
     fn notify_dma_write(&mut self, start: u32, len: u32) {
         self.queue_code_invalidation(start, len);
+    }
+
+    fn dynarec_fastmem(&mut self) -> Option<DynarecFastmem> {
+        Some(DynarecFastmem {
+            rdram_base: self.rdram.fastmem_base(),
+            rdram_phys_limit: 0x03F0_0000,
+            rdram_phys_mask: self.rdram.fastmem_mask(),
+        })
     }
 
     fn pending_interrupts(&self) -> bool {

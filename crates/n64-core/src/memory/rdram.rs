@@ -1,9 +1,11 @@
+use memmap2::MmapMut;
+
 /// RDRAM — the N64's main system memory.
 ///
 /// 4 MB on base N64, 8 MB with Expansion Pak.
 /// Mapped at physical address 0x0000_0000.
 pub struct Rdram {
-    data: Vec<u8>,
+    data: MmapMut,
     /// Debug: track highest address written above 0xA0000
     pub debug_high_write: u32,
 }
@@ -12,8 +14,10 @@ const RDRAM_SIZE: usize = 8 * 1024 * 1024; // 8 MB (Expansion Pak)
 
 impl Rdram {
     pub fn new() -> Self {
+        let mut data = MmapMut::map_anon(RDRAM_SIZE).expect("allocate RDRAM mmap");
+        data.fill(0);
         Self {
-            data: vec![0u8; RDRAM_SIZE],
+            data,
             debug_high_write: 0,
         }
     }
@@ -49,6 +53,16 @@ impl Rdram {
     /// Mutable access to RDRAM data (for renderer writing to framebuffer).
     pub fn data_mut(&mut self) -> &mut [u8] {
         &mut self.data
+    }
+
+    /// Base pointer for dynarec fastmem accesses.
+    pub fn fastmem_base(&mut self) -> *mut u8 {
+        self.data.as_mut_ptr()
+    }
+
+    /// Address mask for mirrored 8MB RDRAM accesses.
+    pub fn fastmem_mask(&self) -> u64 {
+        (RDRAM_SIZE - 1) as u64
     }
 
     pub fn write_u32(&mut self, addr: u32, val: u32) {

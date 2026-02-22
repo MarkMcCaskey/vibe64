@@ -10,4 +10,5 @@ dynarec = ["dep:n64-dynarec"]
 [dependencies]
 log = "0.4"
 thiserror = "2"
+memmap2 = "0.9"
 n64-dynarec = { path = "../n64-dynarec", optional = true }

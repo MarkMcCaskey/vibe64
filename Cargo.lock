@@ -1467,6 +1467,7 @@ name = "n64-core"
 version = "0.1.0"
 dependencies = [
  "log",
+ "memmap2",
  "n64-dynarec",
  "thiserror 2.0.18",
 ]
