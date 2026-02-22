@@ -7,7 +7,7 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use smallvec::SmallVec;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread::{self, JoinHandle};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use n64_dynarec::{
     BlockCompiler, CompileError, CompileRequest, CompiledBlock, CraneliftCompiler,
@@ -496,6 +496,8 @@ pub struct DynarecEngine {
     async_promote_enabled: bool,
     async_snapshot_instructions: u32,
     async_queue_limit: usize,
+    async_queue_backoff: Duration,
+    async_queue_backoff_until: Option<Instant>,
     min_native_instructions: u32,
     native_gas_limit: u32,
     /// 0 means unlimited chaining (bounded by `native_gas_limit`).
@@ -585,6 +587,9 @@ impl DynarecEngine {
             Self::parse_env_u32("N64_DYNAREC_ASYNC_SNAPSHOT_INSNS", 256);
         let async_queue_limit =
             Self::parse_env_u32("N64_DYNAREC_ASYNC_QUEUE_LIMIT", 256).max(1) as usize;
+        let async_queue_backoff_ms =
+            Self::parse_env_u32("N64_DYNAREC_ASYNC_QUEUE_BACKOFF_MS", 1).max(1);
+        let async_queue_backoff = Duration::from_millis(u64::from(async_queue_backoff_ms));
         let min_native_instructions = Self::parse_env_u32("N64_DYNAREC_MIN_BLOCK_INSNS", 2);
         let native_gas_limit = Self::parse_env_u32("N64_DYNAREC_NATIVE_GAS", 8192);
         let chain_limit = Self::parse_env_u32_allow_zero("N64_DYNAREC_CHAIN_LIMIT", 0);
@@ -653,6 +658,8 @@ impl DynarecEngine {
             async_promote_enabled: async_tx.is_some(),
             async_snapshot_instructions,
             async_queue_limit,
+            async_queue_backoff,
+            async_queue_backoff_until: None,
             min_native_instructions,
             native_gas_limit,
             chain_limit,
@@ -703,6 +710,8 @@ impl DynarecEngine {
             async_promote_enabled: false,
             async_snapshot_instructions: 256,
             async_queue_limit: 8,
+            async_queue_backoff: Duration::from_millis(1),
+            async_queue_backoff_until: None,
             min_native_instructions: 1,
             native_gas_limit: 1024,
             chain_limit: 0,
@@ -842,6 +851,7 @@ impl DynarecEngine {
         self.promote_pages.clear();
         self.compile_budget_credit_us = self.compile_budget_cap_us;
         self.compile_budget_last_refill = Instant::now();
+        self.async_queue_backoff_until = None;
     }
 
     fn run_fallback(
@@ -1298,10 +1308,17 @@ impl DynarecEngine {
         if !self.async_promote_enabled {
             return AsyncEnqueueStatus::Disabled;
         }
+        if let Some(until) = self.async_queue_backoff_until {
+            if Instant::now() < until {
+                return AsyncEnqueueStatus::QueueFull;
+            }
+            self.async_queue_backoff_until = None;
+        }
         if self.pending_promotions.contains(&start_phys) {
             return AsyncEnqueueStatus::AlreadyPending;
         }
         if self.pending_promotions.len() >= self.async_queue_limit {
+            self.async_queue_backoff_until = Some(Instant::now() + self.async_queue_backoff);
             match kind {
                 AsyncCompileKind::Tier1 => self.runtime.ensure_async_queue_full += 1,
                 AsyncCompileKind::Promote => self.runtime.promote_async_queue_full += 1,
