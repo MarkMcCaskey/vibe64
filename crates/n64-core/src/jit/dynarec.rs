@@ -41,6 +41,9 @@ pub struct DynarecRuntimeStats {
     pub native_instructions_executed: u64,
     pub native_interp_delegated_instructions: u64,
     pub native_gas_exits: u64,
+    pub native_link_hits: u64,
+    pub native_link_misses: u64,
+    pub native_link_inserts: u64,
     pub promote_calls: u64,
     pub promote_compiled: u64,
     pub promote_compile_failed: u64,
@@ -78,6 +81,7 @@ pub struct DynarecStats {
     pub runtime: DynarecRuntimeStats,
     pub recompiler: RecompilerStats,
     pub block_cache_len: usize,
+    pub native_link_cache_len: usize,
     pub failed_cache_len: usize,
     pub hot_entries: usize,
     pub hot_threshold: u16,
@@ -109,6 +113,12 @@ enum FallbackReason {
     FailedCache,
     Cold,
     CompileBudget,
+}
+
+#[derive(Clone, Copy)]
+struct NativeEdgeLink {
+    target_start_phys: u32,
+    target_block: CompiledBlock,
 }
 
 struct BusSource<'a, B: Bus> {
@@ -381,6 +391,7 @@ pub struct DynarecEngine {
     promote_spans: HashMap<u32, (u32, u32)>,
     promote_pages: HashMap<u32, HashSet<u32>>,
     tier_floor_insns: HashMap<u32, u32>,
+    native_links: HashMap<u32, NativeEdgeLink>,
     hot_threshold: u16,
     max_block_instructions: u32,
     tier1_max_block_instructions: u32,
@@ -534,6 +545,7 @@ impl DynarecEngine {
             promote_spans: HashMap::default(),
             promote_pages: HashMap::default(),
             tier_floor_insns: HashMap::default(),
+            native_links: HashMap::default(),
             hot_threshold,
             max_block_instructions,
             tier1_max_block_instructions,
@@ -582,6 +594,7 @@ impl DynarecEngine {
             promote_spans: HashMap::default(),
             promote_pages: HashMap::default(),
             tier_floor_insns: HashMap::default(),
+            native_links: HashMap::default(),
             hot_threshold: 1,
             max_block_instructions,
             tier1_max_block_instructions: 2,
@@ -612,6 +625,7 @@ impl DynarecEngine {
             runtime: self.runtime,
             recompiler: self.recompiler.stats(),
             block_cache_len: self.recompiler.cache_len(),
+            native_link_cache_len: self.native_links.len(),
             failed_cache_len: self.recompiler.failed_cache_len(),
             hot_entries: self.hot_counts.len(),
             hot_threshold: self.hot_threshold,
@@ -634,11 +648,14 @@ impl DynarecEngine {
     pub fn stats_line(&self) -> String {
         let stats = self.stats();
         format!(
-            "native_blocks={} native_instr={} native_interp_instr={} native_gas_exits={} promote_calls={} promote_compiled={} promote_compile_failed={} promote_cache_hit={} promote_skipped_budget={} promote_time_us={} promote_time_max_us={} promote_async_enqueued={} promote_async_completed={} promote_async_dropped_stale={} promote_async_queue_full={} promote_async_snapshot_miss={} promote_async_worker_down={} fallback_instr={} fallback_early_guard={} fallback_guard_after_lookup={} fallback_no_block={} fallback_failed_cache={} fallback_cold={} fallback_compile_budget={} ensure_calls={} ensure_compiled={} ensure_compile_failed={} ensure_cache_hit={} ensure_time_us={} ensure_time_max_us={} recompiler_cache_hits={} recompiler_failed_cache_hits={} recompiler_blocks_compiled={} recompiler_compile_failures={} recompiler_invalidated_blocks={} invalidate_calls={} invalidate_bytes={} invalidate_time_us={} invalidate_time_max_us={} block_cache_len={} failed_cache_len={} hot_entries={} hot_threshold={} max_block_insns={} tier1_max_block_insns={} promote_hot_threshold={} async_promote_enabled={} async_snapshot_insns={} async_queue_limit={} min_block_insns={} native_gas={} chain_limit={} compile_budget_us_per_ms={} compile_budget_burst_ms={} compile_budget_cap_us={} compile_budget_credit_us={}",
+            "native_blocks={} native_instr={} native_interp_instr={} native_gas_exits={} native_link_hits={} native_link_misses={} native_link_inserts={} promote_calls={} promote_compiled={} promote_compile_failed={} promote_cache_hit={} promote_skipped_budget={} promote_time_us={} promote_time_max_us={} promote_async_enqueued={} promote_async_completed={} promote_async_dropped_stale={} promote_async_queue_full={} promote_async_snapshot_miss={} promote_async_worker_down={} fallback_instr={} fallback_early_guard={} fallback_guard_after_lookup={} fallback_no_block={} fallback_failed_cache={} fallback_cold={} fallback_compile_budget={} ensure_calls={} ensure_compiled={} ensure_compile_failed={} ensure_cache_hit={} ensure_time_us={} ensure_time_max_us={} recompiler_cache_hits={} recompiler_failed_cache_hits={} recompiler_blocks_compiled={} recompiler_compile_failures={} recompiler_invalidated_blocks={} invalidate_calls={} invalidate_bytes={} invalidate_time_us={} invalidate_time_max_us={} block_cache_len={} native_link_cache_len={} failed_cache_len={} hot_entries={} hot_threshold={} max_block_insns={} tier1_max_block_insns={} promote_hot_threshold={} async_promote_enabled={} async_snapshot_insns={} async_queue_limit={} min_block_insns={} native_gas={} chain_limit={} compile_budget_us_per_ms={} compile_budget_burst_ms={} compile_budget_cap_us={} compile_budget_credit_us={}",
             stats.runtime.native_blocks_executed,
             stats.runtime.native_instructions_executed,
             stats.runtime.native_interp_delegated_instructions,
             stats.runtime.native_gas_exits,
+            stats.runtime.native_link_hits,
+            stats.runtime.native_link_misses,
+            stats.runtime.native_link_inserts,
             stats.runtime.promote_calls,
             stats.runtime.promote_compiled,
             stats.runtime.promote_compile_failed,
@@ -675,6 +692,7 @@ impl DynarecEngine {
             stats.runtime.invalidate_time_us,
             stats.runtime.invalidate_time_max_us,
             stats.block_cache_len,
+            stats.native_link_cache_len,
             stats.failed_cache_len,
             stats.hot_entries,
             stats.hot_threshold,
@@ -882,6 +900,63 @@ impl DynarecEngine {
         *entry = entry.saturating_add(1);
     }
 
+    fn clear_native_links(&mut self) {
+        self.native_links.clear();
+    }
+
+    fn lookup_native_link<B: Bus>(
+        &mut self,
+        source_start_phys: u32,
+        next_phys: u32,
+        cpu: &Vr4300,
+        bus: &B,
+    ) -> Option<CompiledBlock> {
+        let Some(link) = self.native_links.get(&source_start_phys).copied() else {
+            self.runtime.native_link_misses = self.runtime.native_link_misses.wrapping_add(1);
+            return None;
+        };
+        if link.target_start_phys != next_phys {
+            self.runtime.native_link_misses = self.runtime.native_link_misses.wrapping_add(1);
+            return None;
+        }
+        if !self.can_run_native_block(cpu, bus, &link.target_block, next_phys) {
+            self.runtime.native_link_misses = self.runtime.native_link_misses.wrapping_add(1);
+            return None;
+        }
+        self.runtime.native_link_hits = self.runtime.native_link_hits.wrapping_add(1);
+        Some(link.target_block)
+    }
+
+    fn remember_native_link(
+        &mut self,
+        source_start_phys: u32,
+        next_phys: u32,
+        target_block: CompiledBlock,
+    ) {
+        let needs_update = self
+            .native_links
+            .get(&source_start_phys)
+            .map(|existing| {
+                existing.target_start_phys != next_phys
+                    || existing.target_block.start_phys != target_block.start_phys
+                    || existing.target_block.end_phys != target_block.end_phys
+                    || existing.target_block.max_retired_instructions
+                        != target_block.max_retired_instructions
+            })
+            .unwrap_or(true);
+        if !needs_update {
+            return;
+        }
+        self.runtime.native_link_inserts = self.runtime.native_link_inserts.wrapping_add(1);
+        self.native_links.insert(
+            source_start_phys,
+            NativeEdgeLink {
+                target_start_phys: next_phys,
+                target_block,
+            },
+        );
+    }
+
     fn should_attempt_promotion(&mut self, start_phys: u32) -> bool {
         if self.promote_hot_threshold == 0
             || self.max_block_instructions <= self.tier1_max_block_instructions
@@ -1054,6 +1129,7 @@ impl DynarecEngine {
                     self.runtime.promote_cache_hit += 1;
                     return;
                 }
+                self.clear_native_links();
                 self.recompiler
                     .install_compiled_block(result.start_phys, block);
                 self.runtime.promote_compiled += 1;
@@ -1149,6 +1225,7 @@ impl DynarecEngine {
                     self.remove_promote_tracking(start_phys);
                     return;
                 }
+                self.clear_native_links();
                 self.recompiler.install_compiled_block(start_phys, promoted);
                 self.runtime.promote_compiled += 1;
                 self.raise_tier_floor(start_phys, promoted.max_retired_instructions);
@@ -1318,6 +1395,7 @@ impl DynarecEngine {
         let mut block = first_block;
 
         loop {
+            let source_start_phys = block.start_phys;
             let retired = self.run_native_block(cpu, bus, &block);
             if retired == 0 {
                 break;
@@ -1328,7 +1406,7 @@ impl DynarecEngine {
                 break;
             }
 
-            self.maybe_promote_block(block.start_phys, block, bus);
+            self.maybe_promote_block(source_start_phys, block, bus);
 
             if let Some(left) = blocks_left.as_mut() {
                 *left -= 1;
@@ -1346,12 +1424,19 @@ impl DynarecEngine {
 
             let pc32 = cpu.pc as u32;
             let next_phys = pc32 & 0x1FFF_FFFF;
+            if let Some(linked_block) =
+                self.lookup_native_link(source_start_phys, next_phys, cpu, &*bus)
+            {
+                block = linked_block;
+                continue;
+            }
             let Some(next_block) = self.recompiler.lookup(next_phys).copied() else {
                 break;
             };
             if !self.can_run_native_block(cpu, bus, &next_block, next_phys) {
                 break;
             }
+            self.remember_native_link(source_start_phys, next_phys, next_block);
             block = next_block;
         }
 
@@ -1455,6 +1540,7 @@ impl ExecutionEngine for DynarecEngine {
         let (first_page, last_page) = page_span_from_start_len(start, len);
         self.bump_page_generations(first_page, last_page);
         self.recompiler.invalidate_range(start, len);
+        self.clear_native_links();
 
         let promote_drop = Self::collect_indexed_keys(&self.promote_pages, first_page, last_page);
         for key in promote_drop {
