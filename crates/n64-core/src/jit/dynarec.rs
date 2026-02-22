@@ -281,6 +281,22 @@ struct CallbackContext<B: Bus> {
     pending_code_writes: *mut PendingCodeWrites,
 }
 
+fn push_pending_code_write(pending: &mut PendingCodeWrites, start_phys: u32, len: u32) {
+    if len == 0 {
+        return;
+    }
+    let end_phys = start_phys.saturating_add(len);
+    if let Some((last_start, last_len)) = pending.last_mut() {
+        let last_end = last_start.saturating_add(*last_len);
+        if start_phys <= last_end {
+            let merged_end = last_end.max(end_phys);
+            *last_len = merged_end.saturating_sub(*last_start);
+            return;
+        }
+    }
+    pending.push((start_phys, len));
+}
+
 unsafe fn queue_store_invalidation_if_compiled<B: Bus>(
     ctx: &mut CallbackContext<B>,
     phys: u32,
@@ -297,7 +313,7 @@ unsafe fn queue_store_invalidation_if_compiled<B: Bus>(
     let pending = unsafe { &mut *ctx.pending_code_writes };
     for page in first_page..=last_page {
         if recompiler.has_cached_page(page) {
-            pending.push((phys, len));
+            push_pending_code_write(pending, phys, len);
             break;
         }
     }
@@ -1766,8 +1782,18 @@ impl DynarecEngine {
         let count = execution.retired_instructions;
         let next_pc = execution.next_pc;
 
-        if !pending_code_writes.is_empty() {
-            pending_code_writes.sort_unstable_by_key(|(start, _)| *start);
+        if pending_code_writes.len() == 1 {
+            let (run_start, run_len) = pending_code_writes[0];
+            if self.recompiler.has_cached_overlap(run_start, run_len) {
+                self.invalidate_range(run_start, run_len);
+            }
+        } else if pending_code_writes.len() > 1 {
+            let already_sorted = pending_code_writes
+                .windows(2)
+                .all(|pair| pair[0].0 <= pair[1].0);
+            if !already_sorted {
+                pending_code_writes.sort_unstable_by_key(|(start, _)| *start);
+            }
             let mut iter = pending_code_writes.into_iter();
             let (mut run_start, first_len) = iter.next().expect("non-empty");
             let mut run_end = run_start.saturating_add(first_len);
