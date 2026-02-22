@@ -1052,6 +1052,12 @@ impl DynarecEngine {
         }
     }
 
+    fn clear_pending_promotions(&mut self) {
+        self.pending_promotions.clear();
+        self.pending_spans.clear();
+        self.pending_pages.clear();
+    }
+
     fn collect_indexed_keys(
         index: &HashMap<u32, HashSet<u32>>,
         first_page: u32,
@@ -1500,6 +1506,7 @@ impl DynarecEngine {
                     self.async_promote_enabled = false;
                     self.async_rx = None;
                     self.async_tx = None;
+                    self.clear_pending_promotions();
                     break;
                 }
             }
@@ -2065,12 +2072,9 @@ impl ExecutionEngine for DynarecEngine {
             self.remove_promote_tracking(key);
             self.promote_attempted.remove(&key);
         }
-
-        let pending_drop = Self::collect_indexed_keys(&self.pending_pages, first_page, last_page);
-        for key in pending_drop {
-            self.remove_pending_promotion(key);
-            self.promote_attempted.remove(&key);
-        }
+        // Keep pending async entries until their worker result is drained. Jobs
+        // are not cancellable once queued, and dropping pending markers here can
+        // re-enqueue duplicate compiles for the same start_phys.
 
         let elapsed_us = invalidate_start
             .elapsed()
@@ -2260,6 +2264,49 @@ mod tests {
         );
         assert!(cpu.gpr[8] > 5);
         assert_eq!(engine.runtime.native_blocks_executed, 1);
+    }
+
+    #[test]
+    fn invalidate_range_keeps_pending_async_tracking() {
+        let mut engine = DynarecEngine::new_cranelift_for_tests();
+        let start = 0x1234u32;
+        let span = page_span_from_start_len(start, 4);
+        engine.index_pending_promotion(start, span);
+
+        engine.invalidate_range(start, 4);
+
+        assert!(engine.pending_promotions.contains(&start));
+        assert_eq!(engine.pending_spans.get(&start).copied(), Some(span));
+        let contains_in_page_index = engine
+            .pending_pages
+            .get(&span.0)
+            .map(|keys| keys.contains(&start))
+            .unwrap_or(false);
+        assert!(contains_in_page_index);
+    }
+
+    #[test]
+    fn async_disconnect_clears_pending_async_tracking() {
+        let mut engine = DynarecEngine::new_cranelift_for_tests();
+        let start = 0x2000u32;
+        let span = page_span_from_start_len(start, 4);
+        engine.index_pending_promotion(start, span);
+
+        let (tx, rx) = mpsc::channel::<AsyncCompileResult>();
+        drop(tx);
+        let (job_tx, _job_rx) = mpsc::channel::<AsyncCompileMessage>();
+        engine.async_promote_enabled = true;
+        engine.async_tx = Some(job_tx);
+        engine.async_rx = Some(rx);
+
+        engine.drain_async_compile_results();
+
+        assert!(!engine.async_promote_enabled);
+        assert!(engine.async_tx.is_none());
+        assert!(engine.async_rx.is_none());
+        assert!(engine.pending_promotions.is_empty());
+        assert!(engine.pending_spans.is_empty());
+        assert!(engine.pending_pages.is_empty());
     }
 
     #[test]
