@@ -1273,7 +1273,11 @@ impl Renderer {
             // Perspective divide + viewport transform → screen space
             if cw.abs() > 0.0001 {
                 let inv_w = 1.0 / cw;
-                let z = (cz * inv_w * self.viewport_scale[2] + self.viewport_trans[2])
+                // RSP setup converts clip-space depth to screen Z with an extra
+                // fixed-point scale of 32:
+                //   screenZ = 32 * ((z / w) * vscale[2] + vtrans[2]).
+                // Using unscaled depth collapses precision and causes z-fighting.
+                let z = (32.0 * (cz * inv_w * self.viewport_scale[2] + self.viewport_trans[2]))
                     .clamp(0.0, 0xFFFF as f32);
                 self.vertex_buffer[idx] = Vertex {
                     x: cx * inv_w * self.viewport_scale[0] + self.viewport_trans[0],
