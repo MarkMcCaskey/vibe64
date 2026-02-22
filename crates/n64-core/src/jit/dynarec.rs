@@ -566,7 +566,7 @@ impl DynarecEngine {
         let async_queue_limit =
             Self::parse_env_u32("N64_DYNAREC_ASYNC_QUEUE_LIMIT", 256).max(1) as usize;
         let min_native_instructions = Self::parse_env_u32("N64_DYNAREC_MIN_BLOCK_INSNS", 2);
-        let native_gas_limit = Self::parse_env_u32("N64_DYNAREC_NATIVE_GAS", 16384);
+        let native_gas_limit = Self::parse_env_u32("N64_DYNAREC_NATIVE_GAS", 8192);
         let chain_limit = Self::parse_env_u32_allow_zero("N64_DYNAREC_CHAIN_LIMIT", 0);
         let native_link_fanout = Self::parse_env_u32("N64_DYNAREC_LINK_FANOUT", 8) as usize;
         let compile_budget_us_per_ms =
