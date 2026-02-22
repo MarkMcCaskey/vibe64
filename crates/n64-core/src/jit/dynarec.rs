@@ -1717,6 +1717,9 @@ impl DynarecEngine {
     ) -> u64 {
         let mut total_retired = 0u64;
         let gas_limit = u64::from(self.native_gas_limit.max(1));
+        // External event horizon (VI/PI/SI/AI) changes only as retired cycles
+        // progress unless a block writes interrupt-relevant device state.
+        let mut external_event_budget = Self::external_event_budget_left(&*bus, total_retired);
         let mut blocks_left = if self.chain_limit == 0 {
             None
         } else {
@@ -1726,7 +1729,7 @@ impl DynarecEngine {
 
         loop {
             let mut gas_left = gas_limit.saturating_sub(total_retired);
-            if let Some(event_left) = Self::external_event_budget_left(&*bus, total_retired) {
+            if let Some(event_left) = external_event_budget {
                 if total_retired == 0 {
                     gas_left = gas_left.min(event_left.max(1));
                 } else {
@@ -1750,6 +1753,11 @@ impl DynarecEngine {
             if total_retired >= gas_limit {
                 self.runtime.native_gas_exits = self.runtime.native_gas_exits.wrapping_add(1);
                 break;
+            }
+            if block.may_write_interrupt_state {
+                external_event_budget = Self::external_event_budget_left(&*bus, total_retired);
+            } else if let Some(left) = external_event_budget.as_mut() {
+                *left = left.saturating_sub(retired);
             }
 
             self.maybe_promote_block(source_start_phys, block, bus);
