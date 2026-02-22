@@ -267,6 +267,23 @@ mod tests {
         assert_eq!(a.ll_bit, b.ll_bit);
     }
 
+    #[cfg(feature = "dynarec")]
+    fn dynarec_stat_value(engine: &Engine, key: &str) -> u64 {
+        let line = engine
+            .dynarec_stats_line()
+            .expect("expected dynarec stats line");
+        for token in line.split_whitespace() {
+            if let Some((k, v)) = token.split_once('=') {
+                if k == key {
+                    return v
+                        .parse::<u64>()
+                        .unwrap_or_else(|_| panic!("invalid dynarec stat value {k}={v}"));
+                }
+            }
+        }
+        panic!("missing dynarec stat key: {key}");
+    }
+
     #[test]
     fn interpreter_executes_simple_program() {
         let mut bus = TestBus::new(0x2000);
@@ -428,5 +445,32 @@ mod tests {
         assert_eq!(cpu_dynarec.gpr[3], 36); // v1: sum 1..8
         assert_eq!(bus_dynarec.read_u32(0x100), 8);
         assert_eq!(bus_dynarec.read_u32(0x104), 36);
+    }
+
+    #[cfg(feature = "dynarec")]
+    #[test]
+    fn dynarec_promotes_hot_blocks() {
+        let program = [
+            0x2408_0000, // addiu t0, r0, 0
+            0x2409_0010, // addiu t1, r0, 16
+            0x2508_0001, // addiu t0, t0, 1
+            0x1509_FFFE, // bne t0, t1, -2
+            0x0000_0000, // nop (delay slot)
+            0x3502_0000, // ori v0, t0, 0
+            0x4200_0018, // eret (sentinel: unsupported)
+        ];
+
+        let mut bus = TestBus::new(0x3000);
+        bus.load_program(0, &program);
+        let mut cpu = init_cpu();
+        let mut dynarec_engine = Engine::dynarec_for_tests();
+
+        let end_pc = init_cpu().pc + 6 * 4;
+        run_until_pc(&mut dynarec_engine, &mut cpu, &mut bus, end_pc, 256);
+
+        let promoted = dynarec_stat_value(&dynarec_engine, "promote_compiled");
+        assert!(promoted >= 1, "expected at least one promoted block");
+        let compiled = dynarec_stat_value(&dynarec_engine, "recompiler_blocks_compiled");
+        assert!(compiled >= 2, "expected baseline + promoted compilations");
     }
 }

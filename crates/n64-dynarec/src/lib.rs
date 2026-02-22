@@ -384,6 +384,15 @@ impl Recompiler {
         start_phys: u32,
         source: &mut dyn InstructionSource,
     ) -> EnsureResult {
+        self.ensure_compiled_with_max(start_phys, self.config.max_block_instructions, source)
+    }
+
+    pub fn ensure_compiled_with_max(
+        &mut self,
+        start_phys: u32,
+        max_block_instructions: u32,
+        source: &mut dyn InstructionSource,
+    ) -> EnsureResult {
         if self.cache.contains_key(&start_phys) {
             self.stats.cache_hits += 1;
             return EnsureResult::CacheHit;
@@ -396,7 +405,7 @@ impl Recompiler {
 
         let request = CompileRequest {
             start_phys,
-            max_instructions: self.config.max_block_instructions.max(1),
+            max_instructions: max_block_instructions.max(1),
         };
         match self.compiler.compile(&request, source) {
             Ok(block) => {
@@ -408,6 +417,44 @@ impl Recompiler {
             Err(err) => {
                 self.stats.compile_failures += 1;
                 self.insert_failed(start_phys);
+                self.last_error = Some(err);
+                EnsureResult::CompileFailed
+            }
+        }
+    }
+
+    /// Recompile a cached block with a new instruction budget.
+    ///
+    /// If no block is cached yet, this falls back to `ensure_compiled_with_max`.
+    /// If compilation fails for an existing cached block, the old block is kept.
+    pub fn recompile_with_max(
+        &mut self,
+        start_phys: u32,
+        max_block_instructions: u32,
+        source: &mut dyn InstructionSource,
+    ) -> EnsureResult {
+        let Some(existing) = self.cache.get(&start_phys).copied() else {
+            return self.ensure_compiled_with_max(start_phys, max_block_instructions, source);
+        };
+
+        let requested_max = max_block_instructions.max(1);
+        if existing.max_retired_instructions >= requested_max {
+            self.stats.cache_hits += 1;
+            return EnsureResult::CacheHit;
+        }
+
+        let request = CompileRequest {
+            start_phys,
+            max_instructions: requested_max,
+        };
+        match self.compiler.compile(&request, source) {
+            Ok(block) => {
+                self.stats.blocks_compiled += 1;
+                self.insert_cached(start_phys, block);
+                EnsureResult::Compiled
+            }
+            Err(err) => {
+                self.stats.compile_failures += 1;
                 self.last_error = Some(err);
                 EnsureResult::CompileFailed
             }
@@ -3831,6 +3878,79 @@ mod tests {
         rc.invalidate_range(0x2000, 4);
         assert_eq!(rc.cache_len(), 0);
         assert_eq!(rc.stats().invalidated_blocks, 1);
+    }
+
+    #[test]
+    fn recompile_with_max_promotes_cached_block() {
+        let start = 0x3400u32;
+        let mut src = TestSource::with_words(&[
+            (start, 0x2408_0001),      // addiu t0, r0, 1
+            (start + 4, 0x2508_0001),  // addiu t0, t0, 1
+            (start + 8, 0x2508_0001),  // addiu t0, t0, 1
+            (start + 12, 0x2508_0001), // addiu t0, t0, 1
+            (start + 16, 0x4200_0018), // eret (sentinel: unsupported)
+        ]);
+        let mut rc = Recompiler::new(
+            Box::<CraneliftCompiler>::default(),
+            RecompilerConfig {
+                max_block_instructions: 8,
+            },
+        );
+
+        assert_eq!(
+            rc.ensure_compiled_with_max(start, 1, &mut src),
+            EnsureResult::Compiled
+        );
+        let tier1 = rc.lookup(start).expect("tier1 block");
+        assert_eq!(tier1.max_retired_instructions, 1);
+
+        assert_eq!(
+            rc.recompile_with_max(start, 4, &mut src),
+            EnsureResult::Compiled
+        );
+        let promoted = rc.lookup(start).expect("promoted block");
+        assert!(promoted.max_retired_instructions >= 4);
+
+        assert_eq!(
+            rc.recompile_with_max(start, 2, &mut src),
+            EnsureResult::CacheHit
+        );
+        assert_eq!(rc.stats().blocks_compiled, 2);
+    }
+
+    #[test]
+    fn recompile_with_max_keeps_existing_block_on_failure() {
+        let start = 0x3500u32;
+        let mut src = TestSource::with_words(&[
+            (start, 0x2408_0001),     // addiu t0, r0, 1
+            (start + 4, 0x2508_0001), // addiu t0, t0, 1
+        ]);
+        let mut rc = Recompiler::new(
+            Box::<CraneliftCompiler>::default(),
+            RecompilerConfig {
+                max_block_instructions: 8,
+            },
+        );
+
+        assert_eq!(
+            rc.ensure_compiled_with_max(start, 2, &mut src),
+            EnsureResult::Compiled
+        );
+        let before = rc.lookup(start).expect("baseline block");
+        assert_eq!(before.max_retired_instructions, 2);
+
+        // Simulate code changing to an unsupported opcode before promotion.
+        src.words.insert(start, 0x4200_0018);
+        assert_eq!(
+            rc.recompile_with_max(start, 8, &mut src),
+            EnsureResult::CompileFailed
+        );
+        let after = rc
+            .lookup(start)
+            .expect("cached block after failed recompile");
+        assert_eq!(after.max_retired_instructions, 2);
+        assert_eq!(rc.stats().blocks_compiled, 1);
+        assert_eq!(rc.stats().compile_failures, 1);
     }
 
     #[test]
