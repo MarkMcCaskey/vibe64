@@ -2935,6 +2935,12 @@ fn main() {
             if let Some(stats) = n64.dynarec_stats_line() {
                 println!("BENCH_DYNAREC {}", stats);
             }
+            if matches!(
+                std::env::var("N64_BENCH_SAVE_SCREENSHOT").as_deref(),
+                Ok("1" | "true" | "TRUE" | "yes" | "YES")
+            ) {
+                save_screenshot(&n64);
+            }
             return;
         }
 
