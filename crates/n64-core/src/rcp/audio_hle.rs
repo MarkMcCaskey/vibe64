@@ -4,6 +4,7 @@
 /// command tables. This emulator supports:
 /// - **Nead**: Zelda OoT, Majora's Mask
 /// - **Standard**: Super Mario 64, Star Fox 64, etc.
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AudioAbi {
     Nead,
@@ -36,6 +37,9 @@ pub struct AudioHle {
     // Standard ABI volume/pan
     vol_left: i16,
     vol_right: i16,
+    std_aux_r: u16,
+    std_aux_wet_l: u16,
+    std_aux_wet_r: u16,
 
     // FILTER state
     filter_count: u16,
@@ -54,8 +58,11 @@ impl AudioHle {
             adpcm_loop: 0,
             env_values: [0; 3],
             env_steps: [0; 3],
-            vol_left: 0,
-            vol_right: 0,
+            vol_left: 0x7FFF,
+            vol_right: 0x7FFF,
+            std_aux_r: 0,
+            std_aux_wet_l: 0,
+            std_aux_wet_r: 0,
             filter_count: 0,
             filter_lut_addr: 0,
         }
@@ -119,7 +126,7 @@ impl AudioHle {
             0x09 => self.cmd_duplicate(w0, w1),
             0x0A => self.cmd_dmemmove(w0, w1),
             0x0B => self.cmd_loadadpcm(w0, w1, rdram),
-            0x0C => self.cmd_mixer(w0, w1),
+            0x0C => self.cmd_standard_mixer(w0, w1),
             0x0D => self.cmd_interleave(w0, w1),
             0x0E => self.cmd_hilogain(w0, w1),
             0x0F => self.cmd_setloop(w0, w1),
@@ -136,20 +143,22 @@ impl AudioHle {
     fn dispatch_standard(&mut self, w0: u32, w1: u32, rdram: &mut [u8]) {
         let cmd = (w0 >> 24) & 0xFF;
         match cmd {
-            0x00 => self.cmd_adpcm(w0, w1, rdram),
-            0x01 => self.cmd_standard_clearbuff(w0, w1),
-            0x02 => self.cmd_standard_envmixer(w0, w1),
-            0x03 => self.cmd_standard_loadbuff(w0, w1, rdram),
-            0x04 => self.cmd_resample(w0, w1, rdram),
-            0x05 => self.cmd_standard_savebuff(w0, w1, rdram),
-            0x07 => self.cmd_standard_mixer(w0, w1),
+            0x00 => {} // SPNOOP / NOOP
+            0x01 => self.cmd_adpcm(w0, w1, rdram),
+            0x02 => self.cmd_standard_clearbuff(w0, w1),
+            0x03 => self.cmd_standard_envmixer(w0, w1),
+            0x04 => self.cmd_standard_loadbuff(w0, w1, rdram),
+            0x05 => self.cmd_resample(w0, w1, rdram),
+            0x06 => self.cmd_standard_savebuff(w0, w1, rdram),
+            0x07 => {} // ABI1 SEGMENT/unknown: not needed for physical-address lists
             0x08 => self.cmd_standard_setbuff(w0, w1),
             0x09 => self.cmd_standard_setvol(w0, w1),
-            0x0A => self.cmd_duplicate(w0, w1),
+            0x0A => self.cmd_dmemmove(w0, w1),
             0x0B => self.cmd_standard_loadadpcm(w0, w1, rdram),
-            0x0C => self.cmd_standard_addmixer(w0, w1),
-            0x0D => self.cmd_resample_zoh(w0, w1, rdram),
+            0x0C => self.cmd_mixer(w0, w1),
+            0x0D => self.cmd_interl(w0, w1),
             0x0E => self.cmd_standard_hilogain(w0, w1),
+            0x0F => self.cmd_setloop(w0, w1),
             _ => {}
         }
     }
@@ -168,10 +177,24 @@ impl AudioHle {
     }
 
     fn cmd_standard_setbuff(&mut self, w0: u32, w1: u32) {
-        // Standard layout: count in w0 low, in/out in w1
-        self.buf_count = (w0 & 0xFFFF) as u16;
-        self.buf_in = (w1 >> 16) as u16;
-        self.buf_out = (w1 & 0xFFFF) as u16;
+        let flags = ((w0 >> 16) & 0xFF) as u8;
+        if flags & 0x08 != 0 {
+            // Auxiliary buffer form used by ABI1 ENVMIXER:
+            //   w0[15:0]  = right/dry buffer
+            //   w1[31:16] = wet left
+            //   w1[15:0]  = wet right
+            self.std_aux_r = w0 as u16;
+            self.std_aux_wet_l = (w1 >> 16) as u16;
+            self.std_aux_wet_r = w1 as u16;
+            return;
+        }
+        // ABI1 layout:
+        //   w0[15:0]   = in DMEM
+        //   w1[31:16]  = out DMEM
+        //   w1[15:0]   = count (bytes)
+        self.buf_in = w0 as u16;
+        self.buf_out = (w1 >> 16) as u16;
+        self.buf_count = w1 as u16;
     }
 
     fn cmd_standard_loadadpcm(&mut self, w0: u32, w1: u32, rdram: &[u8]) {
@@ -186,18 +209,18 @@ impl AudioHle {
     }
 
     fn cmd_standard_clearbuff(&mut self, w0: u32, w1: u32) {
-        let dmem_addr = (w1 & 0xFFFF) as usize;
-        let count = (w0 & 0xFFFF) as usize;
+        let dmem_addr = (w0 & 0xFFFF) as usize;
+        let count = (w1 & 0xFFFF) as usize;
         let end = (dmem_addr + count).min(DMEM_SIZE);
         for i in dmem_addr..end {
             self.dmem[i] = 0;
         }
     }
 
-    fn cmd_standard_loadbuff(&mut self, w0: u32, w1: u32, rdram: &[u8]) {
-        let count = (w0 & 0xFFFF) as usize;
+    fn cmd_standard_loadbuff(&mut self, _w0: u32, w1: u32, rdram: &[u8]) {
+        let count = ((self.buf_count as usize) + 7) & !7;
         let addr = Self::resolve_addr(w1);
-        let dmem_off = ((w0 >> 16) & 0xFF) as usize * 8;
+        let dmem_off = (self.buf_in as usize) & !3;
 
         let copy_len = count
             .min(DMEM_SIZE.saturating_sub(dmem_off))
@@ -205,42 +228,15 @@ impl AudioHle {
         self.dmem[dmem_off..dmem_off + copy_len].copy_from_slice(&rdram[addr..addr + copy_len]);
     }
 
-    fn cmd_standard_savebuff(&mut self, w0: u32, w1: u32, rdram: &mut [u8]) {
-        let count = (w0 & 0xFFFF) as usize;
+    fn cmd_standard_savebuff(&mut self, _w0: u32, w1: u32, rdram: &mut [u8]) {
+        let count = ((self.buf_count as usize) + 7) & !7;
         let addr = Self::resolve_addr(w1);
-        let dmem_off = ((w0 >> 16) & 0xFF) as usize * 8;
+        let dmem_off = (self.buf_out as usize) & !3;
 
         let copy_len = count
             .min(DMEM_SIZE.saturating_sub(dmem_off))
             .min(rdram.len().saturating_sub(addr));
         rdram[addr..addr + copy_len].copy_from_slice(&self.dmem[dmem_off..dmem_off + copy_len]);
-    }
-
-    fn cmd_standard_addmixer(&mut self, w0: u32, w1: u32) {
-        let count = (w0 & 0xFFFF) as usize;
-        let src = (w1 >> 16) as u16;
-        let dst = (w1 & 0xFFFF) as u16;
-        for i in (0..count).step_by(2) {
-            let s = self.read_i16(src.wrapping_add(i as u16)) as i64;
-            let d = self.read_i16(dst.wrapping_add(i as u16)) as i64;
-            self.write_i16(
-                dst.wrapping_add(i as u16),
-                (s + d).clamp(-32768, 32767) as i16,
-            );
-        }
-    }
-
-    fn cmd_standard_mixer(&mut self, w0: u32, w1: u32) {
-        let count = (w0 & 0xFFFF) as usize;
-        let gain = ((w0 >> 16) & 0xFF) as i16; // 8-bit gain in bits 16-23
-        let src = (w1 >> 16) as u16;
-        let dst = (w1 & 0xFFFF) as u16;
-        for i in (0..count).step_by(2) {
-            let s = self.read_i16(src.wrapping_add(i as u16)) as i64;
-            let d = self.read_i16(dst.wrapping_add(i as u16)) as i64;
-            let r = d + ((s * gain as i64) >> 8); // 8-bit shift for 8-bit gain
-            self.write_i16(dst.wrapping_add(i as u16), r.clamp(-32768, 32767) as i16);
-        }
     }
 
     #[allow(dead_code)]
@@ -251,22 +247,108 @@ impl AudioHle {
         self.vol_right = (vol * pan / 127) as i16;
     }
 
-    fn cmd_standard_setvol(&mut self, _w0: u32, w1: u32) {
-        let vol = (w1 >> 16) as i16; // vol in high 16 bits of w1
-        self.vol_left = vol;
-        self.vol_right = vol;
+    fn cmd_standard_setvol(&mut self, w0: u32, _w1: u32) {
+        let flags = ((w0 >> 16) & 0xFF) as u8;
+        let vol = w0 as i16;
+        if flags & 0x08 != 0 {
+            self.vol_left = vol;
+            self.vol_right = vol;
+            return;
+        }
+        if vol.unsigned_abs() < 0x100 {
+            // ABI1 ramp/setup forms commonly use tiny immediates that are not
+            // direct final gains; leave current gains unchanged.
+            return;
+        }
+        let set_left = flags & 0x02 != 0;
+        let set_right = flags & 0x04 != 0;
+
+        match (set_left, set_right) {
+            (true, true) => {
+                self.vol_left = vol;
+                self.vol_right = vol;
+            }
+            (true, false) => self.vol_left = vol,
+            (false, true) => self.vol_right = vol,
+            (false, false) => {
+                self.vol_left = vol;
+                self.vol_right = vol;
+            }
+        }
     }
 
     fn cmd_standard_envmixer(&mut self, w0: u32, w1: u32) {
-        let dmem = (w1 & 0xFFFF) as u16; // Simple ABI 0 envmixer uses one addr
-        let count = (w0 & 0xFFFF) as usize;
+        let _flags = ((w0 >> 16) & 0xFF) as u8;
+        let _state_addr = Self::resolve_addr(w1);
+        let count = ((self.buf_count as usize) + 0xF) & !0xF;
+        let in_addr = self.buf_in;
+        let out_l = self.buf_out;
+        let out_r = self.std_aux_r;
+        let wet_l = self.std_aux_wet_l;
+        let wet_r = self.std_aux_wet_r;
+
+        let gain_l = if self.vol_left == 0 {
+            0x7FFF
+        } else {
+            self.vol_left
+        } as i64;
+        let gain_r = if self.vol_right == 0 {
+            0x7FFF
+        } else {
+            self.vol_right
+        } as i64;
+        let wet_gain = ((gain_l + gain_r) / 4).clamp(-32768, 32767);
 
         for i in (0..count).step_by(2) {
-            let s = self.read_i16(dmem.wrapping_add(i as u16)) as i64;
-            let l = ((s * self.vol_left as i64) >> 15) as i16;
-            let r = ((s * self.vol_right as i64) >> 15) as i16;
-            self.write_i16(dmem.wrapping_add((i * 2) as u16), l);
-            self.write_i16(dmem.wrapping_add((i * 2 + 2) as u16), r);
+            let s = self.read_i16(in_addr.wrapping_add(i as u16)) as i64;
+            let l = ((s * gain_l) >> 15).clamp(-32768, 32767) as i16;
+            let r = ((s * gain_r) >> 15).clamp(-32768, 32767) as i16;
+            let wl = ((s * wet_gain) >> 15).clamp(-32768, 32767) as i16;
+            let wr = wl;
+
+            let dl_cur = self.read_i16(out_l.wrapping_add(i as u16)) as i64;
+            self.write_i16(
+                out_l.wrapping_add(i as u16),
+                (dl_cur + l as i64).clamp(-32768, 32767) as i16,
+            );
+
+            if out_r != out_l {
+                let dr_cur = self.read_i16(out_r.wrapping_add(i as u16)) as i64;
+                self.write_i16(
+                    out_r.wrapping_add(i as u16),
+                    (dr_cur + r as i64).clamp(-32768, 32767) as i16,
+                );
+            }
+
+            if wet_l != 0 && wet_l != out_l && wet_l != out_r {
+                let wl_cur = self.read_i16(wet_l.wrapping_add(i as u16)) as i64;
+                self.write_i16(
+                    wet_l.wrapping_add(i as u16),
+                    (wl_cur + wl as i64).clamp(-32768, 32767) as i16,
+                );
+            }
+
+            if wet_r != 0 && wet_r != out_l && wet_r != out_r && wet_r != wet_l {
+                let wr_cur = self.read_i16(wet_r.wrapping_add(i as u16)) as i64;
+                self.write_i16(
+                    wet_r.wrapping_add(i as u16),
+                    (wr_cur + wr as i64).clamp(-32768, 32767) as i16,
+                );
+            }
+        }
+    }
+
+    fn cmd_standard_mixer(&mut self, w0: u32, w1: u32) {
+        // ABI1 mixer uses SETBUFF count in bytes and a signed Q15 gain in w0 low16.
+        let count = ((self.buf_count as usize) + 0xF) & !0xF;
+        let gain = w0 as i16;
+        let src = (w1 >> 16) as u16;
+        let dst = w1 as u16;
+        for i in (0..count).step_by(2) {
+            let s = self.read_i16(src.wrapping_add(i as u16)) as i64;
+            let d = self.read_i16(dst.wrapping_add(i as u16)) as i64;
+            let r = d + ((s * gain as i64) >> 15);
+            self.write_i16(dst.wrapping_add(i as u16), r.clamp(-32768, 32767) as i16);
         }
     }
 
@@ -1096,5 +1178,87 @@ mod tests {
         assert!(rdram[state_addr..state_addr + 32]
             .iter()
             .all(|&b| b == 0x00));
+    }
+
+    #[test]
+    fn standard_setbuff_load_save_follow_abi1_layout() {
+        let mut hle = AudioHle::new();
+        hle.abi = AudioAbi::Standard;
+        let mut rdram = vec![0u8; 0x400];
+
+        let src = 0x80usize;
+        let dst = 0x100usize;
+        for i in 0..16usize {
+            rdram[src + i] = (0xA0 + i as u8) as u8;
+        }
+
+        let list = 0x180usize;
+        // A_SETBUFF: in=0x0100, out=0x0100, count=0x0010
+        write_u32_be(&mut rdram, list, (0x08u32 << 24) | 0x0100);
+        write_u32_be(&mut rdram, list + 4, (0x0100u32 << 16) | 0x0010);
+        // A_LOADBUFF: src RDRAM -> buf_in
+        write_u32_be(&mut rdram, list + 8, 0x04u32 << 24);
+        write_u32_be(&mut rdram, list + 12, src as u32);
+        // A_SAVEBUFF: buf_out -> dst RDRAM
+        write_u32_be(&mut rdram, list + 16, 0x06u32 << 24);
+        write_u32_be(&mut rdram, list + 20, dst as u32);
+
+        hle.process_audio_list(&mut rdram, list as u32, 24);
+        assert_eq!(&rdram[dst..dst + 16], &rdram[src..src + 16]);
+    }
+
+    #[test]
+    fn standard_dmemmove_opcode_0a_uses_source_and_length_fields() {
+        let mut hle = AudioHle::new();
+        hle.abi = AudioAbi::Standard;
+        let mut dmem = vec![0u8; hle.dmem().len()];
+        let src = 0x0740usize;
+        let dst = 0x04C0usize;
+        for i in 0..8usize {
+            dmem[src + i] = (0x10 + i as u8) as u8;
+        }
+        hle.set_dmem(&dmem);
+
+        let mut rdram = vec![0u8; 0x100];
+        let list = 0x00usize;
+        write_u32_be(&mut rdram, list, (0x0Au32 << 24) | src as u32);
+        write_u32_be(&mut rdram, list + 4, ((dst as u32) << 16) | 0x0008);
+        hle.process_audio_list(&mut rdram, list as u32, 8);
+
+        let out = hle.dmem();
+        assert_eq!(&out[dst..dst + 8], &dmem[src..src + 8]);
+        assert!(out[dst + 8..dst + 16].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn standard_setvol_and_envmixer_scale_buf_in_samples() {
+        let mut hle = AudioHle::new();
+        hle.abi = AudioAbi::Standard;
+        let mut dmem = vec![0u8; hle.dmem().len()];
+        let in_addr = 0x0100usize;
+        dmem[in_addr..in_addr + 2].copy_from_slice(&0x2000i16.to_be_bytes());
+        hle.set_dmem(&dmem);
+
+        let mut rdram = vec![0u8; 0x200];
+        let list = 0x00usize;
+        // A_SETBUFF: in=0x0100 out=0x0000 count=0x0002
+        write_u32_be(&mut rdram, list, (0x08u32 << 24) | in_addr as u32);
+        write_u32_be(&mut rdram, list + 4, 0x0000_0002);
+        // A_SETVOL: flags=0x06, vol=0x4000
+        write_u32_be(
+            &mut rdram,
+            list + 8,
+            (0x09u32 << 24) | (0x06u32 << 16) | 0x4000,
+        );
+        write_u32_be(&mut rdram, list + 12, 0);
+        // A_ENVMIXER: flags in high byte, state ptr in w1
+        write_u32_be(&mut rdram, list + 16, (0x03u32 << 24) | (0x09u32 << 16));
+        write_u32_be(&mut rdram, list + 20, 0x100);
+        hle.process_audio_list(&mut rdram, list as u32, 24);
+
+        let out = hle.dmem();
+        let sample = i16::from_be_bytes([out[0], out[1]]);
+        assert!(sample > 0);
+        assert!(sample <= 0x2000);
     }
 }
