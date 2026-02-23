@@ -130,6 +130,50 @@ pub const MAX_COMMANDS: usize = 1_000_000;
 
 use super::renderer::Renderer;
 
+fn parse_texrect_extras(
+    renderer: &mut Renderer,
+    rdram: &[u8],
+    pc: &mut u32,
+    half1_cmd: u8,
+) -> (u32, u32) {
+    // Some microcode streams encode texrect extras as the next two raw words,
+    // while others emit RDPHALF_1 / RDPHALF_2 commands (order can vary).
+    // Keep previous latch values as fallback when only one half is updated.
+    let mut extra0 = renderer.rdp_half[0];
+    let mut extra1 = renderer.rdp_half[1];
+    let mut consumed_half_cmd = false;
+
+    for _ in 0..2 {
+        let w0 = read_u32(rdram, *pc);
+        let w1 = read_u32(rdram, pc.wrapping_add(4));
+        let cmd = (w0 >> 24) as u8;
+        match cmd {
+            c if c == half1_cmd => {
+                extra0 = w1;
+                renderer.rdp_half[0] = w1;
+                *pc = pc.wrapping_add(8);
+                consumed_half_cmd = true;
+            }
+            G_RDPHALF_2 => {
+                extra1 = w1;
+                renderer.rdp_half[1] = w1;
+                *pc = pc.wrapping_add(8);
+                consumed_half_cmd = true;
+            }
+            _ => break,
+        }
+    }
+
+    if consumed_half_cmd {
+        (extra0, extra1)
+    } else {
+        let extra0 = read_u32(rdram, *pc);
+        let extra1 = read_u32(rdram, pc.wrapping_add(4));
+        *pc = pc.wrapping_add(8);
+        (extra0, extra1)
+    }
+}
+
 /// Walk a display list starting at the given physical RDRAM address.
 /// Dispatches each GBI command to the renderer.
 pub fn process_display_list(renderer: &mut Renderer, rdram: &mut [u8], addr: u32) -> usize {
@@ -211,24 +255,7 @@ pub fn process_display_list(renderer: &mut Renderer, rdram: &mut [u8], addr: u32
             G_FILLRECT => renderer.cmd_fill_rect(w0, w1, rdram),
 
             G_TEXRECT | G_TEXRECTFLIP => {
-                // Texture rect uses 3 words total (128 bits):
-                // Word 0-1: rectangle coords
-                // Next command word pair: S/T coords and step
-                // In F3DEX2, the extra data comes as G_RDPHALF_1 + G_RDPHALF_2
-                // but some games embed it directly. Read next two words.
-                let w2 = read_u32(rdram, pc);
-                let w3 = read_u32(rdram, pc.wrapping_add(4));
-                pc = pc.wrapping_add(8);
-                // Sometimes preceded by RDPHALF commands, skip their headers
-                let (extra0, extra1) = if (w2 >> 24) as u8 == G_RDPHALF_1 {
-                    let h1 = w3;
-                    let _w4 = read_u32(rdram, pc);
-                    let w5 = read_u32(rdram, pc.wrapping_add(4));
-                    pc = pc.wrapping_add(8);
-                    (h1, w5)
-                } else {
-                    (w2, w3)
-                };
+                let (extra0, extra1) = parse_texrect_extras(renderer, rdram, &mut pc, G_RDPHALF_1);
                 renderer.cmd_texture_rect(w0, w1, extra0, extra1, rdram, cmd == G_TEXRECTFLIP);
             }
 
@@ -528,18 +555,8 @@ pub fn process_display_list_f3d(renderer: &mut Renderer, rdram: &mut [u8], addr:
             G_FILLRECT => renderer.cmd_fill_rect(w0, w1, rdram),
 
             G_TEXRECT | G_TEXRECTFLIP => {
-                let w2 = read_u32(rdram, pc);
-                let w3 = read_u32(rdram, pc.wrapping_add(4));
-                pc = pc.wrapping_add(8);
-                let (extra0, extra1) = if (w2 >> 24) as u8 == F3D_RDPHALF_1 {
-                    let h1 = w3;
-                    let _w4 = read_u32(rdram, pc);
-                    let w5 = read_u32(rdram, pc.wrapping_add(4));
-                    pc = pc.wrapping_add(8);
-                    (h1, w5)
-                } else {
-                    (w2, w3)
-                };
+                let (extra0, extra1) =
+                    parse_texrect_extras(renderer, rdram, &mut pc, F3D_RDPHALF_1);
                 renderer.cmd_texture_rect(w0, w1, extra0, extra1, rdram, cmd == G_TEXRECTFLIP);
             }
 
@@ -671,4 +688,48 @@ fn read_u32(rdram: &[u8], addr: u32) -> u32 {
         return 0;
     }
     u32::from_be_bytes([rdram[off], rdram[off + 1], rdram[off + 2], rdram[off + 3]])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_u32_be(buf: &mut [u8], addr: usize, val: u32) {
+        buf[addr..addr + 4].copy_from_slice(&val.to_be_bytes());
+    }
+
+    #[test]
+    fn texrect_extra_parser_accepts_half_commands_in_any_order() {
+        let mut renderer = Renderer::new();
+        renderer.rdp_half = [0xAAAA_AAAA, 0xBBBB_BBBB];
+        let mut rdram = vec![0u8; 64];
+
+        // First half2, then half1 (order can vary by microcode stream).
+        write_u32_be(&mut rdram, 0, (G_RDPHALF_2 as u32) << 24);
+        write_u32_be(&mut rdram, 4, 0x1111_2222);
+        write_u32_be(&mut rdram, 8, (G_RDPHALF_1 as u32) << 24);
+        write_u32_be(&mut rdram, 12, 0x3333_4444);
+
+        let mut pc = 0u32;
+        let (extra0, extra1) = parse_texrect_extras(&mut renderer, &rdram, &mut pc, G_RDPHALF_1);
+        assert_eq!(extra0, 0x3333_4444);
+        assert_eq!(extra1, 0x1111_2222);
+        assert_eq!(renderer.rdp_half[0], 0x3333_4444);
+        assert_eq!(renderer.rdp_half[1], 0x1111_2222);
+        assert_eq!(pc, 16);
+    }
+
+    #[test]
+    fn texrect_extra_parser_supports_inline_extra_words() {
+        let mut renderer = Renderer::new();
+        let mut rdram = vec![0u8; 32];
+        write_u32_be(&mut rdram, 0, 0xDEAD_BEEF);
+        write_u32_be(&mut rdram, 4, 0x0123_4567);
+
+        let mut pc = 0u32;
+        let (extra0, extra1) = parse_texrect_extras(&mut renderer, &rdram, &mut pc, G_RDPHALF_1);
+        assert_eq!(extra0, 0xDEAD_BEEF);
+        assert_eq!(extra1, 0x0123_4567);
+        assert_eq!(pc, 8);
+    }
 }
