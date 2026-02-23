@@ -147,14 +147,15 @@ fn parse_texrect_extras(
         let w0 = read_u32(rdram, *pc);
         let w1 = read_u32(rdram, pc.wrapping_add(4));
         let cmd = (w0 >> 24) as u8;
+        let is_pure_half_cmd = (w0 & 0x00FF_FFFF) == 0;
         match cmd {
-            c if c == half1_cmd => {
+            c if c == half1_cmd && is_pure_half_cmd => {
                 extra0 = w1;
                 renderer.rdp_half[0] = w1;
                 *pc = pc.wrapping_add(8);
                 consumed_half_cmd = true;
             }
-            G_RDPHALF_2 => {
+            G_RDPHALF_2 if is_pure_half_cmd => {
                 extra1 = w1;
                 renderer.rdp_half[1] = w1;
                 *pc = pc.wrapping_add(8);
@@ -730,6 +731,25 @@ mod tests {
         let (extra0, extra1) = parse_texrect_extras(&mut renderer, &rdram, &mut pc, G_RDPHALF_1);
         assert_eq!(extra0, 0xDEAD_BEEF);
         assert_eq!(extra1, 0x0123_4567);
+        assert_eq!(pc, 8);
+    }
+
+    #[test]
+    fn texrect_extra_parser_does_not_misclassify_inline_words_as_half_commands() {
+        let mut renderer = Renderer::new();
+        renderer.rdp_half = [0xAAAA_AAAA, 0xBBBB_BBBB];
+        let mut rdram = vec![0u8; 32];
+        // Top byte matches RDPHALF_1, but low bits are non-zero so this is
+        // an inline extra word, not a command.
+        write_u32_be(&mut rdram, 0, ((G_RDPHALF_1 as u32) << 24) | 0x00AA_BB);
+        write_u32_be(&mut rdram, 4, 0x1234_5678);
+
+        let mut pc = 0u32;
+        let (extra0, extra1) = parse_texrect_extras(&mut renderer, &rdram, &mut pc, G_RDPHALF_1);
+        assert_eq!(extra0, ((G_RDPHALF_1 as u32) << 24) | 0x00AA_BB);
+        assert_eq!(extra1, 0x1234_5678);
+        assert_eq!(renderer.rdp_half[0], 0xAAAA_AAAA);
+        assert_eq!(renderer.rdp_half[1], 0xBBBB_BBBB);
         assert_eq!(pc, 8);
     }
 }

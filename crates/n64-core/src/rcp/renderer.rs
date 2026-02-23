@@ -402,8 +402,7 @@ impl Renderer {
 
         let tile = &self.tiles[tile_idx];
         let tmem_offset = (tile.tmem as usize) * 8; // TMEM offset in bytes
-
-        // Calculate bytes per texel
+                                                    // Calculate bytes per texel
         let bytes_per_texel = match tile.size {
             0 => 1, // 4-bit (we'll handle as 1 byte per 2 texels)
             1 => 1, // 8-bit
@@ -502,7 +501,7 @@ impl Renderer {
                 0 => (row_texels + 1) / 2, // 4bpp
                 1 => row_texels,           // 8bpp
                 2 => row_texels * 2,       // 16bpp
-                3 => row_texels * 4,       // 32bpp
+                3 => row_texels * 2,       // 32bpp: 16-bit per TMEM bank
                 _ => row_texels,
             }
         };
@@ -548,6 +547,31 @@ impl Renderer {
             3 => 4,
             _ => 1,
         };
+
+        // 32-bit textures are banked in TMEM: RG in low bank, BA in high bank.
+        if tile.size == 3 && self.texture_image_size == 3 {
+            for t in tl..=th {
+                let dy = (t - tl) as usize;
+                for s in sl..=sh {
+                    let dx = (s - sl) as usize;
+                    let src_offset = (t as usize * src_width + s as usize) * 4;
+                    let src_addr = (src_base + src_offset) & (rdram.len() - 1);
+
+                    let mut dst_rg = tmem_offset + dy * line_bytes + dx * 2;
+                    let mut dst_ba = tmem_offset + 0x800 + dy * line_bytes + dx * 2;
+                    dst_rg = Self::swizzle_tmem_addr(dst_rg, dy as i32);
+                    dst_ba = Self::swizzle_tmem_addr(dst_ba, dy as i32);
+
+                    if dst_rg + 1 < 4096 && dst_ba + 1 < 4096 && src_addr + 3 < rdram.len() {
+                        self.tmem[dst_rg] = rdram[src_addr];
+                        self.tmem[dst_rg + 1] = rdram[src_addr + 1];
+                        self.tmem[dst_ba] = rdram[src_addr + 2];
+                        self.tmem[dst_ba + 1] = rdram[src_addr + 3];
+                    }
+                }
+            }
+            return;
+        }
 
         for t in tl..=th {
             let dy = (t - tl) as usize;
@@ -799,7 +823,17 @@ impl Renderer {
         let ti = self.wrap_coord(ti, tile.mask_t, tile.cm_t, span_t);
 
         let tmem_base = (tile.tmem as usize) * 8;
-        let line_bytes = (tile.line as usize) * 8;
+        let line_bytes = if tile.line != 0 {
+            (tile.line as usize) * 8
+        } else {
+            match tile.size {
+                0 => (span_s as usize + 1) / 2,
+                1 => span_s as usize,
+                2 => span_s as usize * 2,
+                3 => span_s as usize * 2,
+                _ => span_s as usize,
+            }
+        };
 
         match tile.size {
             0 => {
@@ -871,15 +905,17 @@ impl Renderer {
                 }
             }
             3 => {
-                // 32-bit RGBA
-                let mut byte_offset = tmem_base + ti as usize * line_bytes + si as usize * 4;
-                byte_offset = Self::swizzle_tmem_addr(byte_offset, ti);
-                if byte_offset + 3 < 4096 {
+                // 32-bit RGBA in banked TMEM layout: RG in low bank, BA in high bank.
+                let mut rg_offset = tmem_base + ti as usize * line_bytes + si as usize * 2;
+                let mut ba_offset = tmem_base + 0x800 + ti as usize * line_bytes + si as usize * 2;
+                rg_offset = Self::swizzle_tmem_addr(rg_offset, ti);
+                ba_offset = Self::swizzle_tmem_addr(ba_offset, ti);
+                if rg_offset + 1 < 4096 && ba_offset + 1 < 4096 {
                     [
-                        self.tmem[byte_offset],
-                        self.tmem[byte_offset + 1],
-                        self.tmem[byte_offset + 2],
-                        self.tmem[byte_offset + 3],
+                        self.tmem[rg_offset],
+                        self.tmem[rg_offset + 1],
+                        self.tmem[ba_offset],
+                        self.tmem[ba_offset + 1],
                     ]
                 } else {
                     [0, 0, 0, 0xFF]
@@ -2168,5 +2204,47 @@ mod tests {
             assert_eq!(texel[2], expected);
             assert_eq!(texel[3], expected);
         }
+    }
+
+    #[test]
+    fn load_tile_32bpp_respects_full_line_stride() {
+        let mut renderer = Renderer::new();
+        renderer.texture_image_addr = 0;
+        renderer.texture_image_width = 160;
+        renderer.texture_image_size = 3; // 32-bit source
+
+        let tile = &mut renderer.tiles[0];
+        tile.format = 0; // RGBA
+        tile.size = 3; // 32-bit
+        tile.line = 40; // 160 texels for 32bpp (40 * 16 bytes)
+        tile.tmem = 0;
+        tile.sl = 0;
+        tile.tl = 0;
+        tile.sh = 159 << 2;
+        tile.th = 1 << 2;
+
+        let mut rdram = vec![0u8; 4096];
+        for x in 0..160usize {
+            let off0 = x * 4;
+            rdram[off0] = x as u8;
+            rdram[off0 + 1] = 1;
+            rdram[off0 + 2] = 2;
+            rdram[off0 + 3] = 3;
+
+            let off1 = (160 + x) * 4;
+            rdram[off1] = x as u8;
+            rdram[off1 + 1] = 101;
+            rdram[off1 + 2] = 102;
+            rdram[off1 + 3] = 103;
+        }
+
+        let w0 = 0u32;
+        let w1 = ((159u32 << 2) << 12) | (1u32 << 2);
+        renderer.cmd_load_tile(w0, w1, &rdram);
+
+        let row0 = renderer.sample_texel_point(0, 0, 0);
+        let row1 = renderer.sample_texel_point(0, 0, 1);
+        assert_eq!(row0, [0, 1, 2, 3]);
+        assert_eq!(row1, [0, 101, 102, 103]);
     }
 }
