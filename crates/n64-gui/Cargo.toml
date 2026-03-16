@@ -1,0 +1,16 @@
+[package]
+name = "n64-gui"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+n64-core = { path = "../n64-core" }
+n64-frontend-common = { path = "../n64-frontend-common" }
+eframe = { version = "0.30", default-features = false, features = ["wgpu", "default_fonts"] }
+egui = "0.30"
+rfd = "0.15"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+dirs = "6"
+log = "0.4"
+env_logger = "0.11"

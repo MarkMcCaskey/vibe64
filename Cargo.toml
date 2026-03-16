@@ -4,6 +4,8 @@ members = [
     "crates/n64-core",
     "crates/n64-dynarec",
     "crates/n64-frontend",
+    "crates/n64-frontend-common",
+    "crates/n64-gui",
 ]
 
 [profile.dev]

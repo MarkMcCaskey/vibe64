@@ -279,4 +279,17 @@ impl AudioOutput {
         }
         new_muted
     }
+
+    /// Set mute state directly.
+    pub fn set_muted(&self, muted: bool) {
+        self.muted.store(muted, Ordering::Relaxed);
+        if muted {
+            self.resampler.lock().unwrap().native_queue.clear();
+        }
+    }
+
+    /// Returns whether audio is currently muted.
+    pub fn is_muted(&self) -> bool {
+        self.muted.load(Ordering::Relaxed)
+    }
 }

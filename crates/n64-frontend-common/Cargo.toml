@@ -1,0 +1,10 @@
+[package]
+name = "n64-frontend-common"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+n64-core = { path = "../n64-core" }
+cpal = "0.15"
+gilrs = "0.10"
+log = "0.4"

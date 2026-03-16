@@ -132,3 +132,12 @@ fn axis_to_n64(v: f32, deadzone: f32) -> i8 {
     // N64 stick practical range is around +/-80.
     (x * 80.0) as i8
 }
+
+/// Combine keyboard and gamepad axis values. The one with higher magnitude wins.
+pub fn combine_axis(kb: i8, gp: i8) -> i8 {
+    if gp.abs() >= kb.abs() {
+        gp
+    } else {
+        kb
+    }
+}

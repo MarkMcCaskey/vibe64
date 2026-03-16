@@ -1,11 +1,10 @@
 /// Debug overlay system for the N64 emulator.
 ///
-/// Draws text, wireframe, depth buffer, and diagnostic info onto the
-/// pixels RGBA8888 buffer AFTER the normal framebuffer blit, so it
-/// never corrupts emulation state.
+/// Draws text, wireframe, depth buffer, and diagnostic info onto an
+/// RGBA8888 buffer AFTER the normal framebuffer blit, so it never
+/// corrupts emulation state.
 use n64_core::bus::map::Interconnect;
 use n64_core::debug::DebugState;
-use winit::keyboard::KeyCode;
 
 const WIDTH: usize = 320;
 const HEIGHT: usize = 240;
@@ -825,17 +824,17 @@ pub fn draw_overlays(buf: &mut [u8], debug: &mut DebugState, bus: &Interconnect)
     }
 }
 
-/// Handle an F-key press to toggle debug modes.
-pub fn handle_f_key(debug: &mut DebugState, key: KeyCode) {
-    match key {
-        KeyCode::F1 => debug.flags.show_stats = !debug.flags.show_stats,
-        KeyCode::F2 => debug.flags.show_wireframe = !debug.flags.show_wireframe,
-        KeyCode::F3 => debug.flags.show_depth = !debug.flags.show_depth,
-        KeyCode::F4 => debug.flags.show_textures = !debug.flags.show_textures,
-        KeyCode::F5 => debug.flags.show_geometry = !debug.flags.show_geometry,
-        KeyCode::F6 => debug.flags.show_dl_log = !debug.flags.show_dl_log,
-        KeyCode::F7 => debug.flags.show_os_monitor = !debug.flags.show_os_monitor,
-        KeyCode::F8 => debug.flags.freeze_frame = !debug.flags.freeze_frame,
+/// Toggle a debug overlay by index (1-8, corresponding to F1-F8 keys).
+pub fn toggle_debug_overlay(debug: &mut DebugState, index: u8) {
+    match index {
+        1 => debug.flags.show_stats = !debug.flags.show_stats,
+        2 => debug.flags.show_wireframe = !debug.flags.show_wireframe,
+        3 => debug.flags.show_depth = !debug.flags.show_depth,
+        4 => debug.flags.show_textures = !debug.flags.show_textures,
+        5 => debug.flags.show_geometry = !debug.flags.show_geometry,
+        6 => debug.flags.show_dl_log = !debug.flags.show_dl_log,
+        7 => debug.flags.show_os_monitor = !debug.flags.show_os_monitor,
+        8 => debug.flags.freeze_frame = !debug.flags.freeze_frame,
         _ => {}
     }
 }
