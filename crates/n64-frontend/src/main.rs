@@ -13,6 +13,7 @@ use winit::window::{Window, WindowId};
 use n64_core::memory::pif::buttons as n64_buttons;
 use n64_frontend_common::blit::{self, N64_HEIGHT, N64_WIDTH};
 use n64_frontend_common::{audio, debug_overlay, gamepad, replay};
+
 const SCALE: u32 = 2;
 const SPEED_STEP_PERCENT: u32 = 25;
 const MIN_SPEED_PERCENT: u32 = 25;
@@ -81,13 +82,9 @@ impl App {
 
         let ctrl = &mut self.n64.bus.pif.controller;
         ctrl.buttons = self.keyboard_buttons | gp.buttons;
-        ctrl.stick_x = combine_axis(self.keyboard_stick_x, gp.stick_x);
-        ctrl.stick_y = combine_axis(self.keyboard_stick_y, gp.stick_y);
+        ctrl.stick_x = gamepad::combine_axis(self.keyboard_stick_x, gp.stick_x);
+        ctrl.stick_y = gamepad::combine_axis(self.keyboard_stick_y, gp.stick_y);
     }
-}
-
-fn combine_axis(kb: i8, gp: i8) -> i8 {
-    gamepad::combine_axis(kb, gp)
 }
 
 impl ApplicationHandler for App {
@@ -1403,7 +1400,7 @@ fn main() {
         {
             let mut entries: Vec<_> = nonidle_pc_hist.iter().collect();
             entries.sort_by(|a, b| b.1.cmp(a.1));
-            for (j, (pc, count)) in entries.iter().enumerate().take(30) {
+            for (_j, (pc, count)) in entries.iter().enumerate().take(30) {
                 let off = (**pc as usize) & 0x00FF_FFFF;
                 let opcode = if off + 3 < n64.rdram_data().len() {
                     let rd = n64.rdram_data();
