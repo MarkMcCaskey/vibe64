@@ -231,19 +231,29 @@ impl Rsp {
         }
 
         // Auto-complete: if the game just un-halted the RSP, pretend
-        // the task finished instantly. Set halt + broke (RSP stopped),
-        // signal 0 (task done) + signal 1 (used by some schedulers),
-        // and raise the SP interrupt. DP interrupt is raised separately
-        // by the bus only for GFX tasks (after display list processing),
-        // matching real hardware where DP fires when the RDP finishes.
+        // the task finished instantly.
+        //
+        // Signal2 (TASKDONE) is set because:
+        // - libultra (Zelda, Mario, etc.): checks Signal0 for yield.
+        //   Signal0 absent = task complete. Signal2 = TASKDONE (expected).
+        // - Midway OS (Gauntlet Legends): checks Signal1|Signal2 for yield.
+        //   Signal2 set → YIELD path taken. This is correct because the
+        //   Midway OS has NO handler for the COMPLETE path (dispatch table
+        //   entry at code 0x58 is NULL). The YIELD handler at code 0x20
+        //   processes both yields and completions for Midway games.
+        //
+        // DP interrupt is raised separately by the bus only for GFX
+        // tasks (after display list processing), matching real hardware
+        // where the RDP finishes after the RSP.
         if was_halted && (self.status & 0x01 == 0) {
-            log::debug!(
-                "RSP auto-complete #{}: write={:#010X} → status={:#010X}",
+            eprintln!(
+                "[RSP-AUTO] #{}: write={:#010X} status_before={:#010X} → status_after={:#010X}",
                 self.start_count + 1,
                 val,
-                self.status | 0x01 | 0x02 | (1 << 7) | (1 << 8)
+                self.status,
+                self.status | 0x01 | 0x02 | (1 << 9)
             );
-            self.status |= 0x01 | 0x02 | (1 << 7) | (1 << 8); // halt + broke + sig0 + sig1
+            self.status |= 0x01 | 0x02 | (1 << 9); // halt + broke + Signal2 (TASKDONE)
             mi.set_interrupt(super::mi::MiInterrupt::SP);
             self.start_count += 1;
             if self.status_log.len() < 100 {

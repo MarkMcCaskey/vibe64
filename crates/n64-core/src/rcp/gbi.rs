@@ -182,6 +182,7 @@ pub fn process_display_list(renderer: &mut Renderer, rdram: &mut [u8], addr: u32
     let mut stack: Vec<u32> = Vec::with_capacity(MAX_DL_STACK);
     let mut cmd_count = 0usize;
     let mut opcode_counts = [0u32; 256];
+    let trace_dl = std::env::var_os("N64_TRACE_DL").is_some();
 
     loop {
         if cmd_count >= MAX_COMMANDS {
@@ -194,6 +195,12 @@ pub fn process_display_list(renderer: &mut Renderer, rdram: &mut [u8], addr: u32
         let w0 = read_u32(rdram, pc);
         let w1 = read_u32(rdram, pc.wrapping_add(4));
         pc = pc.wrapping_add(8);
+
+        if trace_dl && cmd_count <= 500 {
+            let cmd = (w0 >> 24) as u8;
+            eprintln!("  DL[{:4}] pc={:#010X} depth={} cmd={:#04X} w0={:#010X} w1={:#010X} ({})",
+                cmd_count - 1, pc.wrapping_sub(8), stack.len(), cmd, w0, w1, opcode_name_f3dex2(cmd));
+        }
 
         let cmd = (w0 >> 24) as u8;
         opcode_counts[cmd as usize] += 1;
@@ -561,6 +568,7 @@ pub fn process_display_list_f3d(renderer: &mut Renderer, rdram: &mut [u8], addr:
                 renderer.cmd_texture_rect(w0, w1, extra0, extra1, rdram, cmd == G_TEXRECTFLIP);
             }
 
+            G_RDPSETOTHERMODE => renderer.cmd_rdp_set_other_mode(w0, w1),
             G_RDPFULLSYNC | G_RDPTILESYNC | G_RDPPIPESYNC | G_RDPLOADSYNC => {}
             G_SETCONVERT | G_SETKEYR | G_SETKEYGB => {}
 

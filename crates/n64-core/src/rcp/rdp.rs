@@ -12,6 +12,8 @@ pub struct Rdp {
     pub end: u32,
     pub current: u32,
     pub status: u32,
+    pub status_read_count: std::cell::Cell<u32>,
+    pub end_write_count: std::cell::Cell<u32>,
 }
 
 impl Rdp {
@@ -22,23 +24,34 @@ impl Rdp {
             current: 0,
             // cbuf_ready (bit 7) set in HLE mode
             status: 0x80,
+            status_read_count: std::cell::Cell::new(0),
+            end_write_count: std::cell::Cell::new(0),
         }
     }
 
     pub fn read_reg_u32(&self, addr: u32) -> u32 {
-        match addr & 0x0F_FFFF {
+        let reg = addr & 0x0F_FFFF;
+        let val = match reg {
             0x00 => self.start,
             0x04 => self.end,
             0x08 => self.current,
             0x0C => self.status,
             _ => 0,
+        };
+        if reg == 0x0C {
+            self.status_read_count.set(self.status_read_count.get() + 1);
         }
+        val
     }
 
     pub fn write_reg_u32(&mut self, addr: u32, val: u32) {
         match addr & 0x0F_FFFF {
             0x00 => self.start = val & 0x00FF_FFF8,
-            0x04 => self.end = val & 0x00FF_FFF8,
+            0x04 => {
+                self.end = val & 0x00FF_FFF8;
+                self.current = self.end;
+                self.end_write_count.set(self.end_write_count.get() + 1);
+            },
             0x0C => {
                 // DPC_STATUS write: set/clear pairs
                 if val & 0x01 != 0 {

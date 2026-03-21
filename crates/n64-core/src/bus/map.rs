@@ -3,16 +3,225 @@ use crate::cart::Cartridge;
 use crate::memory::pif::Pif;
 use crate::memory::rdram::Rdram;
 use crate::rcp::ai::Ai;
-use crate::rcp::audio_hle::AudioHle;
+use crate::rcp::audio_hle::{AudioHle, AudioSaveRangeEvent};
 use crate::rcp::flashram::FlashRam;
 use crate::rcp::mi::Mi;
 use crate::rcp::pi::Pi;
 use crate::rcp::rdp::Rdp;
-use crate::rcp::renderer::Renderer;
+use crate::rcp::renderer::{Renderer, TextureTaskSourceSummary};
 use crate::rcp::ri::Ri;
 use crate::rcp::rsp::Rsp;
 use crate::rcp::si::Si;
 use crate::rcp::vi::Vi;
+use std::collections::VecDeque;
+use std::fs::OpenOptions;
+use std::io::{BufWriter, Write};
+use std::path::PathBuf;
+
+#[derive(Debug, Clone)]
+pub struct AudioPipelineSnapshot {
+    pub dma_events: u64,
+    pub audio_rsp_tasks: u64,
+    pub total_samples: u64,
+    pub nonzero_samples: u64,
+    pub clipped_samples: u64,
+    pub silent_dma_events: u64,
+    pub max_abs_sample: u16,
+    pub abs_sum: u128,
+    pub rate_min: u32,
+    pub rate_max: u32,
+    pub rate_last: u32,
+    pub rate_change_events: u64,
+    pub max_dma_samples: u32,
+    pub min_dma_samples: u32,
+    pub callback_attached_dma_events: u64,
+}
+
+impl Default for AudioPipelineSnapshot {
+    fn default() -> Self {
+        Self {
+            dma_events: 0,
+            audio_rsp_tasks: 0,
+            total_samples: 0,
+            nonzero_samples: 0,
+            clipped_samples: 0,
+            silent_dma_events: 0,
+            max_abs_sample: 0,
+            abs_sum: 0,
+            rate_min: 0,
+            rate_max: 0,
+            rate_last: 0,
+            rate_change_events: 0,
+            max_dma_samples: 0,
+            min_dma_samples: 0,
+            callback_attached_dma_events: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AudioGfxTemporalOverlapSnapshot {
+    pub audio_save_events: u64,
+    pub gfx_tasks_with_textures: u64,
+    pub gfx_tasks_with_overlap: u64,
+    pub overlap_events: u64,
+    pub overlap_bytes: u64,
+    pub nearest_delta_min: u64,
+    pub nearest_delta_max: u64,
+    pub nearest_delta_sum: u128,
+    pub nearest_delta_le_1: u64,
+    pub nearest_delta_le_2: u64,
+    pub nearest_delta_le_4: u64,
+    pub nearest_delta_le_8: u64,
+    pub first_overlap_audio_task: u64,
+    pub first_overlap_gfx_task: u64,
+    pub first_overlap_start: u32,
+    pub first_overlap_end: u32,
+    pub first_overlap_valid: bool,
+    pub last_overlap_audio_task: u64,
+    pub last_overlap_gfx_task: u64,
+    pub last_overlap_start: u32,
+    pub last_overlap_end: u32,
+    pub last_overlap_valid: bool,
+}
+
+impl Default for AudioGfxTemporalOverlapSnapshot {
+    fn default() -> Self {
+        Self {
+            audio_save_events: 0,
+            gfx_tasks_with_textures: 0,
+            gfx_tasks_with_overlap: 0,
+            overlap_events: 0,
+            overlap_bytes: 0,
+            nearest_delta_min: u64::MAX,
+            nearest_delta_max: 0,
+            nearest_delta_sum: 0,
+            nearest_delta_le_1: 0,
+            nearest_delta_le_2: 0,
+            nearest_delta_le_4: 0,
+            nearest_delta_le_8: 0,
+            first_overlap_audio_task: 0,
+            first_overlap_gfx_task: 0,
+            first_overlap_start: 0,
+            first_overlap_end: 0,
+            first_overlap_valid: false,
+            last_overlap_audio_task: 0,
+            last_overlap_gfx_task: 0,
+            last_overlap_start: 0,
+            last_overlap_end: 0,
+            last_overlap_valid: false,
+        }
+    }
+}
+
+struct AudioDmaTrace {
+    csv: BufWriter<std::fs::File>,
+    pcm: BufWriter<std::fs::File>,
+    max_chunks: u64,
+    chunk_idx: u64,
+    pcm_offset_bytes: u64,
+}
+
+const AUDIO_GFX_EVENT_WINDOW_TASKS: u64 = 64;
+
+impl AudioDmaTrace {
+    fn from_env() -> Option<Self> {
+        let prefix = std::env::var_os("N64_AUDIO_DMA_TRACE_PREFIX")?;
+        let max_chunks = std::env::var("N64_AUDIO_DMA_TRACE_MAX_CHUNKS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        let prefix = PathBuf::from(prefix);
+        let csv_path = prefix.with_extension("csv");
+        let pcm_path = prefix.with_extension("pcm");
+        let csv_file = match OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&csv_path)
+        {
+            Ok(f) => f,
+            Err(e) => {
+                log::warn!("Audio DMA trace disabled ({}): {}", csv_path.display(), e);
+                return None;
+            }
+        };
+        let pcm_file = match OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&pcm_path)
+        {
+            Ok(f) => f,
+            Err(e) => {
+                log::warn!("Audio DMA trace disabled ({}): {}", pcm_path.display(), e);
+                return None;
+            }
+        };
+        let mut csv = BufWriter::new(csv_file);
+        let _ = writeln!(
+            csv,
+            "chunk,offset_bytes,n64_rate,samples,frames,nonzero,clipped,peak_abs,mean_abs,audio_rsp_tasks,audio_hle_tasks,audio_hle_cmds"
+        );
+        Some(Self {
+            csv,
+            pcm: BufWriter::new(pcm_file),
+            max_chunks,
+            chunk_idx: 0,
+            pcm_offset_bytes: 0,
+        })
+    }
+
+    fn record(
+        &mut self,
+        n64_rate: u32,
+        samples: &[i16],
+        nonzero: u64,
+        clipped: u64,
+        peak_abs: u16,
+        sum_abs: u64,
+        audio_rsp_tasks: u64,
+        audio_hle_tasks: u64,
+        audio_hle_cmds: u64,
+    ) {
+        if self.max_chunks != 0 && self.chunk_idx >= self.max_chunks {
+            return;
+        }
+        let sample_count = samples.len() as u64;
+        let frame_count = sample_count / 2;
+        let mean_abs = if sample_count == 0 {
+            0.0
+        } else {
+            (sum_abs as f64) / (sample_count as f64)
+        };
+        let _ = writeln!(
+            self.csv,
+            "{},{},{},{},{},{},{},{},{},{},{},{}",
+            self.chunk_idx,
+            self.pcm_offset_bytes,
+            n64_rate,
+            sample_count,
+            frame_count,
+            nonzero,
+            clipped,
+            peak_abs,
+            mean_abs,
+            audio_rsp_tasks,
+            audio_hle_tasks,
+            audio_hle_cmds
+        );
+        for &s in samples {
+            let b = s.to_le_bytes();
+            let _ = self.pcm.write_all(&b);
+        }
+        self.pcm_offset_bytes = self.pcm_offset_bytes.saturating_add(sample_count * 2);
+        self.chunk_idx = self.chunk_idx.saturating_add(1);
+        if self.chunk_idx % 64 == 0 {
+            let _ = self.csv.flush();
+            let _ = self.pcm.flush();
+        }
+    }
+}
 
 /// The concrete bus that wires all hardware components together.
 /// Physical address dispatch happens here.
@@ -49,8 +258,25 @@ pub struct Interconnect {
     pub audio_sample_count: u64,
     /// Debug counter: captured samples that are non-zero.
     pub audio_nonzero_sample_count: u64,
+    /// Runtime audio pipeline stats for debugging/tuning.
+    audio_pipeline: AudioPipelineSnapshot,
+    audio_gfx_temporal_enabled: bool,
+    /// Runtime temporal overlap stats between audio writes and texture reads.
+    audio_gfx_temporal_overlap: AudioGfxTemporalOverlapSnapshot,
+    /// Recent audio save ranges keyed by RSP task index.
+    recent_audio_save_events: VecDeque<AudioSaveRangeEvent>,
+    /// Optional raw AI DMA trace sink (CSV + PCM), enabled via env var.
+    audio_dma_trace: Option<AudioDmaTrace>,
     /// Guest physical ranges where code may have changed since the last CPU step.
     code_invalidations: Vec<(u32, u32)>,
+    /// Deferred DP interrupt: countdown in cycles. Set to a delay value when GFX task
+    /// finishes, delivered when countdown reaches 0. On real hardware, the RDP fires
+    /// DP interrupt asynchronously after rendering completes.
+    pub dp_interrupt_countdown: u64,
+    /// Deferred SP interrupt: countdown in cycles. For GFX tasks, we delay the
+    /// SP interrupt so the game's post-submit code can set up its wait state
+    /// before the completion event arrives (prevents lost wakeup).
+    pub sp_interrupt_countdown: u64,
 }
 
 impl Interconnect {
@@ -78,7 +304,234 @@ impl Interconnect {
             audio_callback: None,
             audio_sample_count: 0,
             audio_nonzero_sample_count: 0,
+            audio_pipeline: AudioPipelineSnapshot::default(),
+            audio_gfx_temporal_enabled: matches!(
+                std::env::var("N64_AUDIO_GFX_TEMPORAL_TRACE")
+                    .as_deref()
+                    .map(|s| s.to_ascii_lowercase()),
+                Ok(v) if matches!(v.as_str(), "1" | "true" | "yes" | "on")
+            ),
+            audio_gfx_temporal_overlap: AudioGfxTemporalOverlapSnapshot::default(),
+            recent_audio_save_events: VecDeque::new(),
+            audio_dma_trace: AudioDmaTrace::from_env(),
             code_invalidations: Vec::new(),
+            dp_interrupt_countdown: 0,
+            sp_interrupt_countdown: 0,
+        }
+    }
+
+    pub fn audio_pipeline_snapshot(&self) -> AudioPipelineSnapshot {
+        self.audio_pipeline.clone()
+    }
+
+    pub fn reset_audio_pipeline_stats(&mut self) {
+        self.audio_pipeline = AudioPipelineSnapshot::default();
+    }
+
+    pub fn audio_pipeline_stats_line(&self) -> String {
+        let avg_abs = if self.audio_pipeline.total_samples == 0 {
+            0.0
+        } else {
+            (self.audio_pipeline.abs_sum as f64) / (self.audio_pipeline.total_samples as f64)
+        };
+        format!(
+            "dma_events={} audio_rsp_tasks={} samples={} nonzero={} clipped={} silent_dma={} max_abs={} avg_abs={:.3} rate_min={} rate_max={} rate_last={} rate_changes={} max_dma_samples={} min_dma_samples={} callback_attached_dma={}",
+            self.audio_pipeline.dma_events,
+            self.audio_pipeline.audio_rsp_tasks,
+            self.audio_pipeline.total_samples,
+            self.audio_pipeline.nonzero_samples,
+            self.audio_pipeline.clipped_samples,
+            self.audio_pipeline.silent_dma_events,
+            self.audio_pipeline.max_abs_sample,
+            avg_abs,
+            self.audio_pipeline.rate_min,
+            self.audio_pipeline.rate_max,
+            self.audio_pipeline.rate_last,
+            self.audio_pipeline.rate_change_events,
+            self.audio_pipeline.max_dma_samples,
+            self.audio_pipeline.min_dma_samples,
+            self.audio_pipeline.callback_attached_dma_events,
+        )
+    }
+
+    pub fn reset_audio_gfx_temporal_overlap_stats(&mut self) {
+        self.audio_gfx_temporal_overlap = AudioGfxTemporalOverlapSnapshot::default();
+        self.recent_audio_save_events.clear();
+    }
+
+    pub fn audio_gfx_temporal_overlap_stats_line(&self) -> String {
+        if !self.audio_gfx_temporal_enabled {
+            return "enabled=0".to_string();
+        }
+        let avg_delta = if self.audio_gfx_temporal_overlap.gfx_tasks_with_overlap == 0 {
+            0.0
+        } else {
+            (self.audio_gfx_temporal_overlap.nearest_delta_sum as f64)
+                / (self.audio_gfx_temporal_overlap.gfx_tasks_with_overlap as f64)
+        };
+        let min_delta = if self.audio_gfx_temporal_overlap.nearest_delta_min == u64::MAX {
+            0
+        } else {
+            self.audio_gfx_temporal_overlap.nearest_delta_min
+        };
+        let first = if self.audio_gfx_temporal_overlap.first_overlap_valid {
+            format!(
+                "a{}->g{}@{:#08X}-{:#08X}",
+                self.audio_gfx_temporal_overlap.first_overlap_audio_task,
+                self.audio_gfx_temporal_overlap.first_overlap_gfx_task,
+                self.audio_gfx_temporal_overlap.first_overlap_start,
+                self.audio_gfx_temporal_overlap.first_overlap_end
+            )
+        } else {
+            "none".to_string()
+        };
+        let last = if self.audio_gfx_temporal_overlap.last_overlap_valid {
+            format!(
+                "a{}->g{}@{:#08X}-{:#08X}",
+                self.audio_gfx_temporal_overlap.last_overlap_audio_task,
+                self.audio_gfx_temporal_overlap.last_overlap_gfx_task,
+                self.audio_gfx_temporal_overlap.last_overlap_start,
+                self.audio_gfx_temporal_overlap.last_overlap_end
+            )
+        } else {
+            "none".to_string()
+        };
+        format!(
+            "audio_save_events={} gfx_tex_tasks={} gfx_tex_overlap_tasks={} overlap_events={} overlap_bytes={} nearest_delta_min={} nearest_delta_max={} nearest_delta_avg={:.2} nearest_delta_le1={} nearest_delta_le2={} nearest_delta_le4={} nearest_delta_le8={} first_overlap={} last_overlap={}",
+            self.audio_gfx_temporal_overlap.audio_save_events,
+            self.audio_gfx_temporal_overlap.gfx_tasks_with_textures,
+            self.audio_gfx_temporal_overlap.gfx_tasks_with_overlap,
+            self.audio_gfx_temporal_overlap.overlap_events,
+            self.audio_gfx_temporal_overlap.overlap_bytes,
+            min_delta,
+            self.audio_gfx_temporal_overlap.nearest_delta_max,
+            avg_delta,
+            self.audio_gfx_temporal_overlap.nearest_delta_le_1,
+            self.audio_gfx_temporal_overlap.nearest_delta_le_2,
+            self.audio_gfx_temporal_overlap.nearest_delta_le_4,
+            self.audio_gfx_temporal_overlap.nearest_delta_le_8,
+            first,
+            last,
+        )
+    }
+
+    fn overlap_range(a_start: u32, a_end: u32, b_start: u32, b_end: u32) -> Option<(u32, u32)> {
+        let start = a_start.max(b_start);
+        let end = a_end.min(b_end);
+        (start <= end).then_some((start, end))
+    }
+
+    fn prune_recent_audio_save_events(&mut self, rsp_task_index: u64) {
+        while let Some(front) = self.recent_audio_save_events.front() {
+            if rsp_task_index.saturating_sub(front.rsp_task_index) > AUDIO_GFX_EVENT_WINDOW_TASKS {
+                self.recent_audio_save_events.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn record_audio_save_event(&mut self, event: AudioSaveRangeEvent) {
+        if !self.audio_gfx_temporal_enabled {
+            return;
+        }
+        self.audio_gfx_temporal_overlap.audio_save_events = self
+            .audio_gfx_temporal_overlap
+            .audio_save_events
+            .saturating_add(1);
+        self.recent_audio_save_events.push_back(event);
+        self.prune_recent_audio_save_events(event.rsp_task_index);
+    }
+
+    fn record_gfx_texture_task(&mut self, summary: TextureTaskSourceSummary) {
+        if !self.audio_gfx_temporal_enabled {
+            return;
+        }
+        self.audio_gfx_temporal_overlap.gfx_tasks_with_textures = self
+            .audio_gfx_temporal_overlap
+            .gfx_tasks_with_textures
+            .saturating_add(1);
+        self.prune_recent_audio_save_events(summary.rsp_task_index);
+
+        let mut nearest_delta: Option<u64> = None;
+        for event in self.recent_audio_save_events.iter() {
+            if event.rsp_task_index > summary.rsp_task_index {
+                continue;
+            }
+            for &(span_start, span_end) in &summary.src_spans {
+                let Some((start, end)) =
+                    Self::overlap_range(event.start, event.end, span_start, span_end)
+                else {
+                    continue;
+                };
+
+                self.audio_gfx_temporal_overlap.overlap_events = self
+                    .audio_gfx_temporal_overlap
+                    .overlap_events
+                    .saturating_add(1);
+                self.audio_gfx_temporal_overlap.overlap_bytes = self
+                    .audio_gfx_temporal_overlap
+                    .overlap_bytes
+                    .saturating_add((end as u64).saturating_sub(start as u64).saturating_add(1));
+
+                if !self.audio_gfx_temporal_overlap.first_overlap_valid {
+                    self.audio_gfx_temporal_overlap.first_overlap_valid = true;
+                    self.audio_gfx_temporal_overlap.first_overlap_audio_task = event.rsp_task_index;
+                    self.audio_gfx_temporal_overlap.first_overlap_gfx_task = summary.rsp_task_index;
+                    self.audio_gfx_temporal_overlap.first_overlap_start = start;
+                    self.audio_gfx_temporal_overlap.first_overlap_end = end;
+                }
+                self.audio_gfx_temporal_overlap.last_overlap_valid = true;
+                self.audio_gfx_temporal_overlap.last_overlap_audio_task = event.rsp_task_index;
+                self.audio_gfx_temporal_overlap.last_overlap_gfx_task = summary.rsp_task_index;
+                self.audio_gfx_temporal_overlap.last_overlap_start = start;
+                self.audio_gfx_temporal_overlap.last_overlap_end = end;
+
+                let delta = summary.rsp_task_index.saturating_sub(event.rsp_task_index);
+                nearest_delta = Some(match nearest_delta {
+                    Some(cur) => cur.min(delta),
+                    None => delta,
+                });
+            }
+        }
+
+        if let Some(delta) = nearest_delta {
+            self.audio_gfx_temporal_overlap.gfx_tasks_with_overlap = self
+                .audio_gfx_temporal_overlap
+                .gfx_tasks_with_overlap
+                .saturating_add(1);
+            self.audio_gfx_temporal_overlap.nearest_delta_min =
+                self.audio_gfx_temporal_overlap.nearest_delta_min.min(delta);
+            self.audio_gfx_temporal_overlap.nearest_delta_max =
+                self.audio_gfx_temporal_overlap.nearest_delta_max.max(delta);
+            self.audio_gfx_temporal_overlap.nearest_delta_sum = self
+                .audio_gfx_temporal_overlap
+                .nearest_delta_sum
+                .saturating_add(delta as u128);
+            if delta <= 1 {
+                self.audio_gfx_temporal_overlap.nearest_delta_le_1 = self
+                    .audio_gfx_temporal_overlap
+                    .nearest_delta_le_1
+                    .saturating_add(1);
+            }
+            if delta <= 2 {
+                self.audio_gfx_temporal_overlap.nearest_delta_le_2 = self
+                    .audio_gfx_temporal_overlap
+                    .nearest_delta_le_2
+                    .saturating_add(1);
+            }
+            if delta <= 4 {
+                self.audio_gfx_temporal_overlap.nearest_delta_le_4 = self
+                    .audio_gfx_temporal_overlap
+                    .nearest_delta_le_4
+                    .saturating_add(1);
+            }
+            if delta <= 8 {
+                self.audio_gfx_temporal_overlap.nearest_delta_le_8 = self
+                    .audio_gfx_temporal_overlap
+                    .nearest_delta_le_8
+                    .saturating_add(1);
+            }
         }
     }
 
@@ -262,13 +715,22 @@ impl Interconnect {
         let rdram = self.rdram.data();
         let mut samples = Vec::with_capacity(sample_count);
         let mut nonzero = 0u64;
+        let mut clipped = 0u64;
+        let mut peak_abs = 0u16;
+        let mut sum_abs = 0u64;
         for i in 0..sample_count {
             let off = base + i * 2;
             if off + 1 < rdram.len() {
                 let sample = i16::from_be_bytes([rdram[off], rdram[off + 1]]);
+                let abs = sample.unsigned_abs();
                 if sample != 0 {
                     nonzero += 1;
                 }
+                if abs >= 0x7FFF {
+                    clipped += 1;
+                }
+                peak_abs = peak_abs.max(abs);
+                sum_abs = sum_abs.saturating_add(abs as u64);
                 samples.push(sample);
             }
         }
@@ -285,6 +747,63 @@ impl Interconnect {
             48_681_812 / (dacrate + 1)
         };
 
+        // Core-side pipeline metrics (before frontend callback/resampler).
+        self.audio_pipeline.dma_events = self.audio_pipeline.dma_events.saturating_add(1);
+        self.audio_pipeline.total_samples = self
+            .audio_pipeline
+            .total_samples
+            .saturating_add(samples.len() as u64);
+        self.audio_pipeline.nonzero_samples =
+            self.audio_pipeline.nonzero_samples.saturating_add(nonzero);
+        self.audio_pipeline.clipped_samples =
+            self.audio_pipeline.clipped_samples.saturating_add(clipped);
+        self.audio_pipeline.max_abs_sample = self.audio_pipeline.max_abs_sample.max(peak_abs);
+        self.audio_pipeline.abs_sum = self.audio_pipeline.abs_sum.saturating_add(sum_abs as u128);
+        if nonzero == 0 {
+            self.audio_pipeline.silent_dma_events =
+                self.audio_pipeline.silent_dma_events.saturating_add(1);
+        }
+        if self.audio_pipeline.rate_min == 0 || n64_rate < self.audio_pipeline.rate_min {
+            self.audio_pipeline.rate_min = n64_rate;
+        }
+        if n64_rate > self.audio_pipeline.rate_max {
+            self.audio_pipeline.rate_max = n64_rate;
+        }
+        if self.audio_pipeline.rate_last != 0 && self.audio_pipeline.rate_last != n64_rate {
+            self.audio_pipeline.rate_change_events =
+                self.audio_pipeline.rate_change_events.saturating_add(1);
+        }
+        self.audio_pipeline.rate_last = n64_rate;
+        if samples.len() as u32 > self.audio_pipeline.max_dma_samples {
+            self.audio_pipeline.max_dma_samples = samples.len() as u32;
+        }
+        if self.audio_pipeline.min_dma_samples == 0
+            || (samples.len() as u32) < self.audio_pipeline.min_dma_samples
+        {
+            self.audio_pipeline.min_dma_samples = samples.len() as u32;
+        }
+        if self.audio_callback.is_some() {
+            self.audio_pipeline.callback_attached_dma_events = self
+                .audio_pipeline
+                .callback_attached_dma_events
+                .saturating_add(1);
+        }
+
+        if let Some(trace) = self.audio_dma_trace.as_mut() {
+            let (audio_hle_tasks, audio_hle_cmds) = self.audio_hle.debug_counts();
+            trace.record(
+                n64_rate,
+                &samples,
+                nonzero,
+                clipped,
+                peak_abs,
+                sum_abs,
+                self.audio_pipeline.audio_rsp_tasks,
+                audio_hle_tasks,
+                audio_hle_cmds,
+            );
+        }
+
         if let Some(ref mut cb) = self.audio_callback {
             cb(&samples, n64_rate);
         }
@@ -296,23 +815,11 @@ impl Interconnect {
         use crate::rcp::gbi;
 
         // Read OSTask fields from DMEM
+        let rsp_task_index = self.rsp.start_count as u64;
         let task_type = self.rsp.read_dmem_u32(gbi::TASK_TYPE);
-        let data_ptr_raw = self.rsp.read_dmem_u32(gbi::TASK_DATA_PTR);
-        // Keep task logging quiet by default; use debug for diagnostics.
-        if task_type != gbi::M_AUDTASK
-            || self.rsp.start_count <= 5
-            || self.rsp.start_count % 200 == 0
-        {
-            log::debug!(
-                "RSP task #{}: type={} data_ptr={:#010X} flags={:#X}",
-                self.rsp.start_count,
-                task_type,
-                data_ptr_raw,
-                self.rsp.read_dmem_u32(gbi::TASK_FLAGS)
-            );
-        }
-
         if task_type == gbi::M_AUDTASK {
+            self.audio_pipeline.audio_rsp_tasks =
+                self.audio_pipeline.audio_rsp_tasks.saturating_add(1);
             let data_ptr = self.rsp.read_dmem_u32(gbi::TASK_DATA_PTR);
             let data_size = self.rsp.read_dmem_u32(gbi::TASK_DATA_SIZE);
 
@@ -322,13 +829,54 @@ impl Interconnect {
                 _ => data_ptr & 0x00FF_FFFF,
             };
 
+            // Dump full OSTask header for audio tasks (for debugging unknown audio engines)
+            if self.rsp.start_count <= 5 {
+                let ucode = self.rsp.read_dmem_u32(gbi::TASK_UCODE);
+                let ucode_size = self.rsp.read_dmem_u32(gbi::TASK_UCODE_SIZE);
+                let ucode_data = self.rsp.read_dmem_u32(gbi::TASK_UCODE_DATA);
+                let ucode_data_size = self.rsp.read_dmem_u32(gbi::TASK_UCODE_DATA_SIZE);
+                let output_buff = self.rsp.read_dmem_u32(gbi::TASK_OUTPUT_BUFF);
+                let output_buff_size = self.rsp.read_dmem_u32(gbi::TASK_OUTPUT_BUFF_SIZE);
+                let yield_data_ptr = self.rsp.read_dmem_u32(gbi::TASK_YIELD_DATA_PTR);
+                let yield_data_size = self.rsp.read_dmem_u32(gbi::TASK_YIELD_DATA_SIZE);
+                log::info!(
+                    "RSP audio OSTask: ucode={:#010X} ucode_sz={} ucode_data={:#010X} ucode_data_sz={} \
+                     out={:#010X} out_sz={} data={:#010X} data_sz={} yield={:#010X} yield_sz={}",
+                    ucode, ucode_size, ucode_data, ucode_data_size,
+                    output_buff, output_buff_size, phys, data_size,
+                    yield_data_ptr, yield_data_size
+                );
+                // Dump first 8 words at data_ptr in RDRAM
+                let rdram = self.rdram.data();
+                let base = phys as usize;
+                if base + 32 <= rdram.len() {
+                    let mut words = String::new();
+                    for j in 0..8 {
+                        let off = base + j * 4;
+                        let w = u32::from_be_bytes([rdram[off], rdram[off+1], rdram[off+2], rdram[off+3]]);
+                        words.push_str(&format!(" {:#010X}", w));
+                    }
+                    log::info!("  data @{:#010X}:{}", phys, words);
+                }
+            }
+
             log::debug!("RSP audio task: data={:#X} size={}", phys, data_size);
+            self.audio_hle.set_current_rsp_task_index(rsp_task_index);
             let rdram = self.rdram.data_mut();
             self.audio_hle.process_audio_list(rdram, phys, data_size);
+            for event in self.audio_hle.take_save_range_events() {
+                self.record_audio_save_event(event);
+            }
         }
 
         if task_type == gbi::M_GFXTASK {
             let data_ptr = self.rsp.read_dmem_u32(gbi::TASK_DATA_PTR);
+            let yield_ptr = self.rsp.read_dmem_u32(gbi::TASK_YIELD_DATA_PTR);
+            let yield_phys = match yield_ptr {
+                0x8000_0000..=0x9FFF_FFFF => yield_ptr - 0x8000_0000,
+                0xA000_0000..=0xBFFF_FFFF => yield_ptr - 0xA000_0000,
+                _ => yield_ptr & 0x00FF_FFFF,
+            } as usize;
 
             // Convert virtual address to physical
             let phys_addr = match data_ptr {
@@ -389,6 +937,7 @@ impl Interconnect {
             let tris_before = self.renderer.tri_count;
             self.renderer.task_nonblack_writes = 0;
             self.renderer.task_total_writes = 0;
+            self.renderer.begin_rsp_task(rsp_task_index);
             let cmd_count = match self.ucode {
                 gbi::UcodeType::F3dex2 => {
                     gbi::process_display_list(&mut self.renderer, rdram, phys_addr)
@@ -399,6 +948,9 @@ impl Interconnect {
                 }
             };
             let tris_this_dl = self.renderer.tri_count - tris_before;
+            if let Some(summary) = self.renderer.finish_rsp_task_texture_summary() {
+                self.record_gfx_texture_task(summary);
+            }
 
             if cmd_count >= gbi::MAX_COMMANDS {
                 log::warn!(
@@ -462,9 +1014,20 @@ impl Interconnect {
                     .push((ci as u32, tris_this_dl, nonblack, tw, tnb));
             }
 
-            // DP interrupt: RDP finished rendering this display list.
-            // Only raised for GFX tasks (audio tasks don't use the RDP).
-            self.mi.set_interrupt(crate::rcp::mi::MiInterrupt::DP);
+            // Write completion marker to yield buffer — on real hardware,
+            // F3DEX2 writes zero to yield_data[0] when finishing normally
+            // (vs non-zero yield state when yielding mid-task).
+            if yield_phys + 4 <= self.rdram.data().len() {
+                let rdram = self.rdram.data_mut();
+                rdram[yield_phys] = 0;
+                rdram[yield_phys + 1] = 0;
+                rdram[yield_phys + 2] = 0;
+                rdram[yield_phys + 3] = 0;
+            }
+
+            // DP interrupt deferred — fires after a cycle delay to avoid ring
+            // buffer contention with SP YIELD event in the scheduler.
+            self.dp_interrupt_countdown = 50_000;
         }
     }
 

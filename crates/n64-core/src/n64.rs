@@ -183,9 +183,78 @@ impl N64 {
         self.engine.dynarec_stats_line()
     }
 
+    /// Human-readable audio HLE stats summary for benchmarking/debugging.
+    pub fn audio_hle_stats_line(&self) -> String {
+        self.bus.audio_hle.debug_stats_line()
+    }
+
+    /// Human-readable core audio pipeline stats (AI DMA side).
+    pub fn audio_pipeline_stats_line(&self) -> String {
+        self.bus.audio_pipeline_stats_line()
+    }
+
+    /// Human-readable texture source range stats from the software renderer.
+    pub fn gfx_texture_stats_line(&self) -> String {
+        self.bus.renderer.texture_src_stats_line()
+    }
+
+    /// Compare audio SAVEBUFF writes vs. GFX texture source reads in RDRAM.
+    pub fn audio_gfx_overlap_stats_line(&self) -> String {
+        fn fmt_range(min_addr: u32, max_addr: u32) -> String {
+            if min_addr == u32::MAX {
+                "none".to_string()
+            } else {
+                format!("{:#08X}-{:#08X}", min_addr, max_addr)
+            }
+        }
+
+        let audio = self.bus.audio_hle.debug_snapshot();
+        let audio_min = audio.nead_savebuff_min_addr;
+        let audio_max = audio.nead_savebuff_max_addr;
+        let gfx_min = self.bus.renderer.texture_src_min_addr;
+        let gfx_max = self.bus.renderer.texture_src_max_addr;
+        let overlap_start = audio_min.max(gfx_min);
+        let overlap_end = audio_max.min(gfx_max);
+        let overlap = audio_min != u32::MAX && gfx_min != u32::MAX && overlap_start <= overlap_end;
+        let overlap_bytes = if overlap {
+            (overlap_end as u64)
+                .saturating_sub(overlap_start as u64)
+                .saturating_add(1)
+        } else {
+            0
+        };
+        format!(
+            "audio_save_range={} gfx_tex_range={} overlap={} overlap_bytes={}",
+            fmt_range(audio_min, audio_max),
+            fmt_range(gfx_min, gfx_max),
+            overlap as u8,
+            overlap_bytes
+        )
+    }
+
+    /// Temporal correlation stats between recent audio writes and texture loads.
+    pub fn audio_gfx_temporal_stats_line(&self) -> String {
+        self.bus.audio_gfx_temporal_overlap_stats_line()
+    }
+
     /// Reset execution-engine runtime stats (cache contents are preserved).
     pub fn reset_engine_stats(&mut self) {
         self.engine.reset_stats();
+    }
+
+    /// Reset audio HLE runtime stats.
+    pub fn reset_audio_hle_stats(&mut self) {
+        self.bus.audio_hle.reset_debug_stats();
+    }
+
+    /// Reset core audio pipeline runtime stats.
+    pub fn reset_audio_pipeline_stats(&mut self) {
+        self.bus.reset_audio_pipeline_stats();
+    }
+
+    /// Reset temporal overlap stats for audio writes vs. texture loads.
+    pub fn reset_audio_gfx_temporal_stats(&mut self) {
+        self.bus.reset_audio_gfx_temporal_overlap_stats();
     }
 
     /// Set a callback that receives audio samples immediately when AI DMA fires.
@@ -503,6 +572,15 @@ impl N64 {
 
     fn tick_peripherals_and_invalidate(&mut self, elapsed: u64) {
         self.bus.vi.tick(elapsed, &mut self.bus.mi);
+        // Deliver deferred DP interrupt after cycle countdown.
+        if self.bus.dp_interrupt_countdown > 0 {
+            self.bus.dp_interrupt_countdown = self.bus.dp_interrupt_countdown.saturating_sub(elapsed);
+            if self.bus.dp_interrupt_countdown == 0 {
+                self.bus
+                    .mi
+                    .set_interrupt(crate::rcp::mi::MiInterrupt::DP);
+            }
+        }
         self.bus.tick_pi_dma_batch(elapsed);
         self.bus.tick_si_dma_batch(elapsed);
         self.bus.tick_ai_dma(elapsed);
@@ -537,6 +615,7 @@ fn detect_eeprom(game_code: &[u8; 4]) -> crate::memory::pif::EepromType {
     const EEPROM_16K: &[&str] = &[
         "NCLB", "NCLE", "NCLJ", // Cruis'n World
         "NYBE", // Yoshi's Story
+        "NGXE", // Gauntlet Legends
     ];
 
     // 4Kbit EEPROM games (most games that use EEPROM)

@@ -24,6 +24,12 @@ pub struct Vi {
     cycles: u64,
     /// Debug: count of writes to each register
     pub write_counts: [u32; 14],
+    /// Debug: total cycles ticked
+    pub total_cycles_ticked: u64,
+    /// Debug: total scanline advances
+    pub total_scanlines: u64,
+    /// Debug: total interrupt fires
+    pub total_intr_fires: u64,
 }
 
 impl Vi {
@@ -45,6 +51,9 @@ impl Vi {
             y_scale: 0,
             cycles: 0,
             write_counts: [0; 14],
+            total_cycles_ticked: 0,
+            total_scanlines: 0,
+            total_intr_fires: 0,
         }
     }
 
@@ -75,7 +84,12 @@ impl Vi {
         }
         match addr & 0x0F_FFFF {
             0x00 => self.ctrl = val,
-            0x04 => self.origin = val & 0x00FF_FFFF,
+            0x04 => {
+                if self.origin != val & 0x00FF_FFFF {
+                    log::debug!("VI_ORIGIN: {:#010X} → {:#010X}", self.origin, val & 0x00FF_FFFF);
+                }
+                self.origin = val & 0x00FF_FFFF;
+            }
             0x08 => self.width = val & 0xFFF,
             0x0C => self.v_intr = val & 0x3FF,
             0x10 => {
@@ -102,12 +116,15 @@ impl Vi {
     pub fn tick(&mut self, cycles: u64, mi: &mut Mi) {
         const CYCLES_PER_SCANLINE: u64 = 2970;
 
+        self.total_cycles_ticked += cycles;
         self.cycles += cycles;
         while self.cycles >= CYCLES_PER_SCANLINE {
             self.cycles -= CYCLES_PER_SCANLINE;
+            self.total_scanlines += 1;
             self.v_current = (self.v_current + 1) % self.v_sync.max(1);
 
             if self.v_current == self.v_intr {
+                self.total_intr_fires += 1;
                 mi.set_interrupt(MiInterrupt::VI);
             }
         }

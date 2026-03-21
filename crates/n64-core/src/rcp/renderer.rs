@@ -48,6 +48,15 @@ pub struct Vertex {
     pub a: u8,
 }
 
+#[derive(Debug)]
+pub struct TextureTaskSourceSummary {
+    pub rsp_task_index: u64,
+    pub src_min: u32,
+    pub src_max: u32,
+    pub src_bytes: u64,
+    pub src_spans: Vec<(u32, u32)>,
+}
+
 /// The software renderer / RDP state machine.
 pub struct Renderer {
     // ─── Color image (framebuffer destination) ───
@@ -145,6 +154,21 @@ pub struct Renderer {
     /// Per-task non-black write count (reset at each GFX task start)
     pub task_nonblack_writes: u32,
     pub task_total_writes: u32,
+    /// Aggregate RDRAM source range read by texture DMA commands.
+    pub texture_src_bytes: u64,
+    pub texture_src_min_addr: u32,
+    pub texture_src_max_addr: u32,
+    pub texture_src_wrap_events: u64,
+    pub texrect_extra_mode_half: u64,
+    pub texrect_extra_mode_inline: u64,
+    pub texrect_extra_half_opcode_nonzero: u64,
+    pub texrect_extra_inline_with_half_opcode_nonzero: u64,
+    track_task_texture_spans: bool,
+    current_rsp_task_index: u64,
+    current_task_texture_src_bytes: u64,
+    current_task_texture_src_min_addr: u32,
+    current_task_texture_src_max_addr: u32,
+    current_task_texture_src_spans: Vec<(u32, u32)>,
 
     // ─── Debug overlay recording (mirrored from DebugFlags) ───
     pub debug_wireframe: bool,
@@ -219,6 +243,25 @@ impl Renderer {
             cull_count: 0,
             task_nonblack_writes: 0,
             task_total_writes: 0,
+            texture_src_bytes: 0,
+            texture_src_min_addr: u32::MAX,
+            texture_src_max_addr: 0,
+            texture_src_wrap_events: 0,
+            texrect_extra_mode_half: 0,
+            texrect_extra_mode_inline: 0,
+            texrect_extra_half_opcode_nonzero: 0,
+            texrect_extra_inline_with_half_opcode_nonzero: 0,
+            track_task_texture_spans: matches!(
+                std::env::var("N64_AUDIO_GFX_TEMPORAL_TRACE")
+                    .as_deref()
+                    .map(|s| s.to_ascii_lowercase()),
+                Ok(v) if matches!(v.as_str(), "1" | "true" | "yes" | "on")
+            ),
+            current_rsp_task_index: 0,
+            current_task_texture_src_bytes: 0,
+            current_task_texture_src_min_addr: u32::MAX,
+            current_task_texture_src_max_addr: 0,
+            current_task_texture_src_spans: Vec::new(),
             debug_wireframe: false,
             debug_dl_log: false,
             wire_edges: Vec::new(),
@@ -232,6 +275,113 @@ impl Renderer {
     /// Current cycle type from othermode_H bits 52-53.
     fn cycle_type(&self) -> u8 {
         ((self.othermode_h >> 20) & 0x3) as u8
+    }
+
+    fn record_texture_src_range(&mut self, start: u32, end: u32) {
+        self.texture_src_min_addr = self.texture_src_min_addr.min(start);
+        self.texture_src_max_addr = self.texture_src_max_addr.max(end);
+    }
+
+    fn record_texture_src_task_range(&mut self, start: u32, end: u32) {
+        self.current_task_texture_src_min_addr = self.current_task_texture_src_min_addr.min(start);
+        self.current_task_texture_src_max_addr = self.current_task_texture_src_max_addr.max(end);
+    }
+
+    fn record_texture_src_task_span(&mut self, start: u32, end: u32) {
+        if !self.track_task_texture_spans {
+            return;
+        }
+        self.record_texture_src_task_range(start, end);
+        if let Some((last_start, last_end)) = self.current_task_texture_src_spans.last_mut() {
+            if start <= last_end.saturating_add(1) && end >= *last_start {
+                *last_end = (*last_end).max(end);
+                *last_start = (*last_start).min(start);
+                return;
+            }
+        }
+        self.current_task_texture_src_spans.push((start, end));
+    }
+
+    fn record_texture_src_span(&mut self, start: usize, len: usize, rdram_len: usize) {
+        if len == 0 || rdram_len == 0 {
+            return;
+        }
+
+        self.texture_src_bytes = self.texture_src_bytes.saturating_add(len as u64);
+        if self.track_task_texture_spans {
+            self.current_task_texture_src_bytes = self
+                .current_task_texture_src_bytes
+                .saturating_add(len as u64);
+        }
+        let start = start % rdram_len;
+        let end_exclusive = start + len;
+        if end_exclusive <= rdram_len {
+            let start = start as u32;
+            let end = (end_exclusive - 1) as u32;
+            self.record_texture_src_range(start, end);
+            self.record_texture_src_task_span(start, end);
+            return;
+        }
+
+        self.texture_src_wrap_events = self.texture_src_wrap_events.saturating_add(1);
+        let start_hi = start as u32;
+        let end_hi = (rdram_len - 1) as u32;
+        self.record_texture_src_range(start_hi, end_hi);
+        self.record_texture_src_task_span(start_hi, end_hi);
+        let wrapped = end_exclusive - rdram_len;
+        let end_lo = (wrapped - 1) as u32;
+        self.record_texture_src_range(0, end_lo);
+        self.record_texture_src_task_span(0, end_lo);
+    }
+
+    pub fn texture_src_stats_line(&self) -> String {
+        let range = if self.texture_src_min_addr == u32::MAX {
+            "none".to_string()
+        } else {
+            format!(
+                "{:#08X}-{:#08X}",
+                self.texture_src_min_addr, self.texture_src_max_addr
+            )
+        };
+        format!(
+            "tex_src_bytes={} tex_src_range={} tex_src_wraps={} texrect_extra_half={} texrect_extra_inline={} texrect_half_opcode_nonzero={} texrect_inline_with_half_opcode_nonzero={}",
+            self.texture_src_bytes,
+            range,
+            self.texture_src_wrap_events,
+            self.texrect_extra_mode_half,
+            self.texrect_extra_mode_inline,
+            self.texrect_extra_half_opcode_nonzero,
+            self.texrect_extra_inline_with_half_opcode_nonzero
+        )
+    }
+
+    pub fn begin_rsp_task(&mut self, rsp_task_index: u64) {
+        self.current_rsp_task_index = rsp_task_index;
+        if !self.track_task_texture_spans {
+            return;
+        }
+        self.current_task_texture_src_bytes = 0;
+        self.current_task_texture_src_min_addr = u32::MAX;
+        self.current_task_texture_src_max_addr = 0;
+        self.current_task_texture_src_spans.clear();
+    }
+
+    pub fn finish_rsp_task_texture_summary(&mut self) -> Option<TextureTaskSourceSummary> {
+        if !self.track_task_texture_spans {
+            return None;
+        }
+        if self.current_task_texture_src_bytes == 0
+            || self.current_task_texture_src_min_addr == u32::MAX
+        {
+            return None;
+        }
+        Some(TextureTaskSourceSummary {
+            rsp_task_index: self.current_rsp_task_index,
+            src_min: self.current_task_texture_src_min_addr,
+            src_max: self.current_task_texture_src_max_addr,
+            src_bytes: self.current_task_texture_src_bytes,
+            src_spans: std::mem::take(&mut self.current_task_texture_src_spans),
+        })
     }
 
     /// Resolve a segment-relative address to a physical RDRAM address.
@@ -394,6 +544,9 @@ impl Renderer {
 
     /// G_LOADBLOCK: Copy texture data from RDRAM to TMEM as a contiguous block.
     pub fn cmd_load_block(&mut self, w0: u32, w1: u32, rdram: &[u8]) {
+        if rdram.is_empty() {
+            return;
+        }
         let sl = (w0 >> 12) & 0xFFF;
         let tl = w0 & 0xFFF;
         let tile_idx = ((w1 >> 24) & 0x7) as usize;
@@ -437,6 +590,7 @@ impl Renderer {
         let copy_len = byte_count
             .min(4096 - tmem_offset)
             .min(rdram.len().saturating_sub(src));
+        self.record_texture_src_span(src, copy_len, rdram.len());
 
         if dxt == 0 {
             // No interleaving — simple copy
@@ -479,6 +633,9 @@ impl Renderer {
 
     /// G_LOADTILE: Copy a rectangular region of texture data from RDRAM to TMEM.
     pub fn cmd_load_tile(&mut self, w0: u32, w1: u32, rdram: &[u8]) {
+        if rdram.is_empty() {
+            return;
+        }
         let sl = ((w0 >> 12) & 0xFFF) >> 2;
         let tl = (w0 & 0xFFF) >> 2;
         let tile_idx = ((w1 >> 24) & 0x7) as usize;
@@ -513,6 +670,10 @@ impl Renderer {
             // keep nibble packing intact.
             for t in tl..=th {
                 let dy = (t - tl) as usize;
+                let src_bit_idx = t as usize * src_width + sl as usize;
+                let src_row = src_base + (src_bit_idx >> 1);
+                let row_bytes = (row_texels + 1) / 2;
+                self.record_texture_src_span(src_row, row_bytes, rdram.len());
                 for s in sl..=sh {
                     let dx = (s - sl) as usize;
 
@@ -552,6 +713,8 @@ impl Renderer {
         if tile.size == 3 && self.texture_image_size == 3 {
             for t in tl..=th {
                 let dy = (t - tl) as usize;
+                let row_src = src_base + (t as usize * src_width + sl as usize) * 4;
+                self.record_texture_src_span(row_src, row_texels * 4, rdram.len());
                 for s in sl..=sh {
                     let dx = (s - sl) as usize;
                     let src_offset = (t as usize * src_width + s as usize) * 4;
@@ -575,6 +738,22 @@ impl Renderer {
 
         for t in tl..=th {
             let dy = (t - tl) as usize;
+            let row_src = src_base
+                + match self.texture_image_size {
+                    0 => (t as usize * src_width + sl as usize) >> 1,
+                    1 => t as usize * src_width + sl as usize,
+                    2 => (t as usize * src_width + sl as usize) * 2,
+                    3 => (t as usize * src_width + sl as usize) * 4,
+                    _ => t as usize * src_width + sl as usize,
+                };
+            let row_bytes = match self.texture_image_size {
+                0 => (row_texels + 1) / 2,
+                1 => row_texels,
+                2 => row_texels * 2,
+                3 => row_texels * 4,
+                _ => row_texels,
+            };
+            self.record_texture_src_span(row_src, row_bytes, rdram.len());
             for s in sl..=sh {
                 let dx = (s - sl) as usize;
                 let src_offset = match self.texture_image_size {
@@ -598,6 +777,9 @@ impl Renderer {
 
     /// G_LOADTLUT: Load texture lookup table (palette) into TMEM.
     pub fn cmd_load_tlut(&mut self, _w0: u32, w1: u32, rdram: &[u8]) {
+        if rdram.is_empty() {
+            return;
+        }
         let tile_idx = ((w1 >> 24) & 0x7) as usize;
         let count = (((w1 >> 14) & 0x3FF) + 1) as usize;
 
@@ -610,6 +792,7 @@ impl Renderer {
         let src = self.texture_image_addr as usize;
 
         let byte_count = count * 2; // 16-bit entries
+        self.record_texture_src_span(src, byte_count, rdram.len());
         for i in 0..byte_count {
             let src_idx = (src + i) & (rdram.len() - 1);
             let dst_idx = tmem_offset + i;
@@ -713,18 +896,29 @@ impl Renderer {
         let dsdx = (extra1 >> 16) as i16 as i32; // S5.10 fixed-point
         let dtdy = (extra1 & 0xFFFF) as i16 as i32;
 
-        // Convert 10.2 to pixels (lr coords are inclusive, +1 for half-open range)
+        let cycle = self.cycle_type();
+
+        // Convert 10.2 to pixels.  In non-copy modes the lr coordinates are
+        // inclusive, so +1 converts to a half-open range.  In copy mode the
+        // hardware internally subtracts 1 from XH, and games set lrx one
+        // pixel larger to compensate — so the coordinate is already exclusive.
         let x0 = (ulx >> 2).max(self.scissor_ulx as i32 >> 2);
         let y0 = (uly >> 2).max(self.scissor_uly as i32 >> 2);
-        let x1 = ((lrx >> 2) + 1).min(self.scissor_lrx as i32 >> 2);
-        let y1 = ((lry >> 2) + 1).min(self.scissor_lry as i32 >> 2);
+        let x1 = if cycle == 2 {
+            (lrx >> 2).min(self.scissor_lrx as i32 >> 2)
+        } else {
+            ((lrx >> 2) + 1).min(self.scissor_lrx as i32 >> 2)
+        };
+        let y1 = if cycle == 2 {
+            (lry >> 2).min(self.scissor_lry as i32 >> 2)
+        } else {
+            ((lry >> 2) + 1).min(self.scissor_lry as i32 >> 2)
+        };
 
         if x0 >= x1 || y0 >= y1 || self.color_image_addr == 0 {
             self.tex_rect_skip += 1;
             return;
         }
-
-        let cycle = self.cycle_type();
 
         // In copy mode (cycle=2), the RDP processes 4 texels per clock.
         // Games set dsdx=4.0 to account for this, but per-pixel advance is 1.0.
