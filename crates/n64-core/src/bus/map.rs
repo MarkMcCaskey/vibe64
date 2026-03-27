@@ -1235,6 +1235,8 @@ impl Bus for Interconnect {
             0x1000_0000..=0x1FBF_FFFF => self.cart.read_u32(addr),
             0x1FC0_0000..=0x1FC0_07BF => self.pif.read_boot_rom_u32(addr),
             0x1FC0_07C0..=0x1FC0_07FF => self.pif.read_ram_u32(addr),
+            // 64DD registers — return open-bus value (no disk drive present)
+            0x0500_0000..=0x050F_FFFF => 0xFFFF_FFFF,
             _ => {
                 log::warn!("Unhandled bus read32: {:#010X}", addr);
                 0
@@ -1333,6 +1335,8 @@ impl Bus for Interconnect {
             // ISViewer debug port (must be checked before cart range)
             0x13FF_0000..=0x13FF_0FFF => self.is_viewer_write(addr, val),
             0x1FC0_07C0..=0x1FC0_07FF => self.pif.write_ram_u32(addr, val),
+            // 64DD registers — silently ignore writes
+            0x0500_0000..=0x050F_FFFF => {}
             _ => {
                 log::warn!("Unhandled bus write32: {:#010X} = {:#010X}", addr, val);
             }

@@ -246,13 +246,6 @@ impl Rsp {
         // tasks (after display list processing), matching real hardware
         // where the RDP finishes after the RSP.
         if was_halted && (self.status & 0x01 == 0) {
-            eprintln!(
-                "[RSP-AUTO] #{}: write={:#010X} status_before={:#010X} → status_after={:#010X}",
-                self.start_count + 1,
-                val,
-                self.status,
-                self.status | 0x01 | 0x02 | (1 << 9)
-            );
             self.status |= 0x01 | 0x02 | (1 << 9); // halt + broke + Signal2 (TASKDONE)
             mi.set_interrupt(super::mi::MiInterrupt::SP);
             self.start_count += 1;

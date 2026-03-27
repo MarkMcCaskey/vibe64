@@ -65,7 +65,20 @@ impl N64 {
         let audio_abi = crate::rcp::audio_hle::AudioHle::detect_abi(&header.game_code);
         log::info!("Audio ABI: {:?}", audio_abi);
 
-        let entry_point = header.entry_point;
+        // CIC-6103 and CIC-6106 add a security offset to the entry point stored
+        // in the ROM header. The IPL3 subtracts this before copying/jumping.
+        let entry_point = match cic {
+            cart::cic::CicVariant::Cic6103 => header.entry_point.wrapping_sub(0x10_0000),
+            cart::cic::CicVariant::Cic6106 => header.entry_point.wrapping_sub(0x20_0000),
+            _ => header.entry_point,
+        };
+        if entry_point != header.entry_point {
+            log::info!(
+                "CIC entry point adjustment: {:#010X} → {:#010X}",
+                header.entry_point,
+                entry_point
+            );
+        }
         let game_code = header.game_code;
         let cart = Cartridge::new(rom_data, header);
         let mut bus = Interconnect::new(cart);
@@ -93,8 +106,9 @@ impl N64 {
         bus.rsp.load_to_dmem(0, &boot_code);
 
         // Copy game code: ROM[0x1000..] → RDRAM[entry_point physical]
-        // The IPL3 copies game code to the entry point's physical address.
-        // entry_point is virtual (e.g., 0x80000400 → physical 0x00000400)
+        // The IPL3 copies 1MB of game code starting at the entry point's
+        // physical address. For CIC-6103/6106, the entry point has already
+        // been adjusted above to undo the security offset.
         let game_start = 0x1000usize;
         let rdram_dest = (entry_point & 0x1FFF_FFFF) as usize;
         let copy_len = (bus.cart.data.len() - game_start).min(0x10_0000); // up to 1MB
@@ -129,6 +143,27 @@ impl N64 {
         );
         bus.rdram.write_u32(0x314, 0); // osVersion
         bus.rdram.write_u32(0x318, 0x0080_0000); // osMemSize: 8MB (expansion pak)
+
+        // PIF RAM boot seed initialization.
+        // The PIF writes CIC seed values to PIF RAM during boot so the OS
+        // can verify the CIC handshake completed. Without these, libultra's
+        // __osPifCheckStatus may not complete boot initialization properly.
+        let seed: u8 = match cic {
+            cart::cic::CicVariant::Cic6101 => 0x3F,
+            cart::cic::CicVariant::Cic6102 => 0x3F,
+            cart::cic::CicVariant::Cic6103 => 0x78,
+            cart::cic::CicVariant::Cic6105 => 0x91,
+            cart::cic::CicVariant::Cic6106 => 0x85,
+            cart::cic::CicVariant::Unknown => 0x3F,
+        };
+        // PIF RAM[0x24..0x27]: boot seed word (seed in bytes 1 and 2)
+        bus.pif.ram[0x24] = 0x00;
+        bus.pif.ram[0x25] = seed;
+        bus.pif.ram[0x26] = seed;
+        bus.pif.ram[0x27] = 0x00;
+        // PIF RAM[0x3F] bit 7: boot complete flag
+        bus.pif.ram[0x3F] = 0x80;
+        log::info!("PIF boot seed: {:#04X}", seed);
 
         let mut cpu = Vr4300::new();
         // Entry point from ROM header (typically 0x80000400)
@@ -623,7 +658,7 @@ fn detect_eeprom(game_code: &[u8; 4]) -> crate::memory::pif::EepromType {
         "NSME", "NSMJ", // Super Mario 64
         "NMKE", "NMKJ", // Mario Kart 64
         "NSSE", // Star Fox 64
-        "NFZE", "NFZJ", // F-Zero X
+        "NFZE", "NFZJ", "CFZE", "CFZJ", // F-Zero X
         "NWRE", // Wave Race 64
     ];
 
