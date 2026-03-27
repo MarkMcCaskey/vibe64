@@ -827,11 +827,25 @@ impl Renderer {
             return;
         }
 
-        // G_FILLRECT only performs a raw fill in fill mode (cycle_type=3).
-        // In 1-cycle/2-cycle mode, it runs through the full RDP pipeline,
-        // not a direct fill — skip these to avoid destroying rendered content.
-        if self.cycle_type() != 3 {
+        // In 1-cycle/2-cycle mode, FILLRECT runs through the combiner pipeline
+        // (used for colored rectangles via PRIM_COLOR, ENV_COLOR, etc.)
+        let cycle = self.cycle_type();
+        if cycle == 0 || cycle == 1 {
+            let texel0 = [0u8; 4];
+            let shade = [0u8; 4];
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let color = self.combine_pixel(texel0, shade);
+                    self.write_pixel(rdram, x, y, color, 0);
+                }
+            }
+            self.fill_rect_count += 1;
             return;
+        }
+
+        // Fill mode (cycle_type=3): raw fill with fill_color register
+        if cycle != 3 {
+            return; // Copy mode FILLRECT is undefined
         }
 
         let width = self.color_image_width as i32;
@@ -911,11 +925,8 @@ impl Renderer {
         } else {
             ((lrx >> 2) + 1).min(self.scissor_lrx as i32 >> 2)
         };
-        let y1 = if cycle == 2 {
-            (lry >> 2).min(self.scissor_lry as i32 >> 2)
-        } else {
-            ((lry >> 2) + 1).min(self.scissor_lry as i32 >> 2)
-        };
+        // Y always gets +1: hardware only subtracts 1 from XH in copy mode, not YH
+        let y1 = ((lry >> 2) + 1).min(self.scissor_lry as i32 >> 2);
 
         if x0 >= x1 || y0 >= y1 || self.color_image_addr == 0 {
             self.tex_rect_skip += 1;
@@ -956,7 +967,7 @@ impl Renderer {
     /// Sample a texel from TMEM at the given S/T coordinates.
     /// S and T are in 10.5 fixed-point.
     /// Checks othermode_h text_filt bits to select point or bilinear.
-    fn sample_texture(&self, tile_idx: usize, s: i32, t: i32, _cycle: u8) -> [u8; 4] {
+    fn sample_texture(&self, tile_idx: usize, s: i32, t: i32, cycle: u8) -> [u8; 4] {
         let tile = &self.tiles[tile_idx];
 
         // Tile origin is 10.2 fixed-point; convert to 10.5 so sub-texel
@@ -972,7 +983,8 @@ impl Renderer {
         // 0 = point, 2 = bilinear, 3 = average (treat as bilinear)
         let text_filt = (self.othermode_h >> 12) & 0x3;
 
-        if text_filt >= 2 {
+        // Copy mode (cycle 2) forces point sampling regardless of text_filt
+        if text_filt >= 2 && cycle != 2 {
             // Bilinear: sample 4 neighbors and blend by fractional position
             let frac_s = (s & 0x1F) as u16; // 5-bit fraction (0-31)
             let frac_t = (t & 0x1F) as u16;
@@ -1836,27 +1848,33 @@ impl Renderer {
         color: [u8; 4],
         shade_alpha: u8,
     ) -> bool {
-        // Fully transparent texels should not emit color/depth.
-        if color[3] == 0 {
-            return false;
-        }
+        // Copy mode bypasses alpha compare/coverage — pixels always written
+        let is_copy = self.cycle_type() == 2;
 
-        // CVG_X_ALPHA (bit 12): coverage × alpha — if alpha is 0, pixel is fully transparent
-        // This is how the N64 handles texture cutout (e.g., tree leaves, fences)
-        let cvg_x_alpha = self.othermode_l & (1 << 12) != 0;
-        if cvg_x_alpha && color[3] == 0 {
-            return false;
-        }
+        if !is_copy {
+            // Fully transparent texels should not emit color/depth.
+            if color[3] == 0 {
+                return false;
+            }
 
-        // Alpha compare: othermode_l bits 0-1
-        // 0 = none, 1 = threshold compare, 2/3 = dither
-        let alpha_compare = self.othermode_l & 0x3;
-        if alpha_compare == 1 && color[3] < self.blend_color[3] {
-            return false; // Fail alpha threshold test
+            // CVG_X_ALPHA (bit 12): coverage × alpha — if alpha is 0, pixel is fully transparent
+            // This is how the N64 handles texture cutout (e.g., tree leaves, fences)
+            let cvg_x_alpha = self.othermode_l & (1 << 12) != 0;
+            if cvg_x_alpha && color[3] == 0 {
+                return false;
+            }
+
+            // Alpha compare: othermode_l bits 0-1
+            // 0 = none, 1 = threshold compare, 2/3 = dither
+            let alpha_compare = self.othermode_l & 0x3;
+            if alpha_compare == 1 && color[3] < self.blend_color[3] {
+                return false; // Fail alpha threshold test
+            }
         }
 
         // Blender: FORCE_BL (bit 14) forces the blender to execute
-        let force_bl = self.othermode_l & (1 << 14) != 0;
+        // Copy mode bypasses the blender entirely
+        let force_bl = !is_copy && self.othermode_l & (1 << 14) != 0;
         let final_color = if force_bl {
             let memory = self.read_pixel(rdram, x, y);
             self.blend_pixel(color, memory, shade_alpha)

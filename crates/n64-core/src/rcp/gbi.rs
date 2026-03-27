@@ -135,9 +135,12 @@ fn parse_texrect_extras(
     rdram: &[u8],
     pc: &mut u32,
     half1_cmd: u8,
+    half2_cmd: u8,
 ) -> (u32, u32) {
     // Some microcode streams encode texrect extras as the next two raw words,
     // while others emit RDPHALF_1 / RDPHALF_2 commands (order can vary).
+    // F3DEX2: RDPHALF_1 (0xE1) + RDPHALF_2 (0xF1) before TEXRECT
+    // F3D: RDPHALF_2 (0xB3) + 0xB2 after TEXRECT
     // Keep previous latch values as fallback when only one half is updated.
     let mut extra0 = renderer.rdp_half[0];
     let mut extra1 = renderer.rdp_half[1];
@@ -155,7 +158,7 @@ fn parse_texrect_extras(
                 *pc = pc.wrapping_add(8);
                 consumed_half_cmd = true;
             }
-            G_RDPHALF_2 if is_pure_half_cmd => {
+            c if c == half2_cmd && is_pure_half_cmd => {
                 extra1 = w1;
                 renderer.rdp_half[1] = w1;
                 *pc = pc.wrapping_add(8);
@@ -263,7 +266,7 @@ pub fn process_display_list(renderer: &mut Renderer, rdram: &mut [u8], addr: u32
             G_FILLRECT => renderer.cmd_fill_rect(w0, w1, rdram),
 
             G_TEXRECT | G_TEXRECTFLIP => {
-                let (extra0, extra1) = parse_texrect_extras(renderer, rdram, &mut pc, G_RDPHALF_1);
+                let (extra0, extra1) = parse_texrect_extras(renderer, rdram, &mut pc, G_RDPHALF_1, G_RDPHALF_2);
                 renderer.cmd_texture_rect(w0, w1, extra0, extra1, rdram, cmd == G_TEXRECTFLIP);
             }
 
@@ -376,6 +379,8 @@ pub fn process_display_list_f3d(renderer: &mut Renderer, rdram: &mut [u8], addr:
     const F3D_VTX: u8 = 0x04;
     const F3D_DL: u8 = 0x06;
     const F3D_RDPHALF_1: u8 = 0xB4;
+    const F3D_RDPHALF_2: u8 = 0xB3;
+    const F3D_RDPHALF_CONT: u8 = 0xB2;
     const F3D_CLEARGEOMETRYMODE: u8 = 0xB6;
     const F3D_SETGEOMETRYMODE: u8 = 0xB7;
     const F3D_ENDDL: u8 = 0xB8;
@@ -563,8 +568,9 @@ pub fn process_display_list_f3d(renderer: &mut Renderer, rdram: &mut [u8], addr:
             G_FILLRECT => renderer.cmd_fill_rect(w0, w1, rdram),
 
             G_TEXRECT | G_TEXRECTFLIP => {
+                // F3D TEXRECT extras follow as RDPHALF_2 (0xB3) + 0xB2 commands
                 let (extra0, extra1) =
-                    parse_texrect_extras(renderer, rdram, &mut pc, F3D_RDPHALF_1);
+                    parse_texrect_extras(renderer, rdram, &mut pc, F3D_RDPHALF_2, F3D_RDPHALF_CONT);
                 renderer.cmd_texture_rect(w0, w1, extra0, extra1, rdram, cmd == G_TEXRECTFLIP);
             }
 
@@ -720,7 +726,7 @@ mod tests {
         write_u32_be(&mut rdram, 12, 0x3333_4444);
 
         let mut pc = 0u32;
-        let (extra0, extra1) = parse_texrect_extras(&mut renderer, &rdram, &mut pc, G_RDPHALF_1);
+        let (extra0, extra1) = parse_texrect_extras(&mut renderer, &rdram, &mut pc, G_RDPHALF_1, G_RDPHALF_2);
         assert_eq!(extra0, 0x3333_4444);
         assert_eq!(extra1, 0x1111_2222);
         assert_eq!(renderer.rdp_half[0], 0x3333_4444);
@@ -736,7 +742,7 @@ mod tests {
         write_u32_be(&mut rdram, 4, 0x0123_4567);
 
         let mut pc = 0u32;
-        let (extra0, extra1) = parse_texrect_extras(&mut renderer, &rdram, &mut pc, G_RDPHALF_1);
+        let (extra0, extra1) = parse_texrect_extras(&mut renderer, &rdram, &mut pc, G_RDPHALF_1, G_RDPHALF_2);
         assert_eq!(extra0, 0xDEAD_BEEF);
         assert_eq!(extra1, 0x0123_4567);
         assert_eq!(pc, 8);
@@ -753,7 +759,7 @@ mod tests {
         write_u32_be(&mut rdram, 4, 0x1234_5678);
 
         let mut pc = 0u32;
-        let (extra0, extra1) = parse_texrect_extras(&mut renderer, &rdram, &mut pc, G_RDPHALF_1);
+        let (extra0, extra1) = parse_texrect_extras(&mut renderer, &rdram, &mut pc, G_RDPHALF_1, G_RDPHALF_2);
         assert_eq!(extra0, ((G_RDPHALF_1 as u32) << 24) | 0x00AA_BB);
         assert_eq!(extra1, 0x1234_5678);
         assert_eq!(renderer.rdp_half[0], 0xAAAA_AAAA);
