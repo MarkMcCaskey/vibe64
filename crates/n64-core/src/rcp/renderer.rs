@@ -555,7 +555,8 @@ impl Renderer {
 
         let tile = &self.tiles[tile_idx];
         let tmem_offset = (tile.tmem as usize) * 8; // TMEM offset in bytes
-                                                    // Calculate bytes per texel
+
+        // Calculate bytes per texel
         let bytes_per_texel = match tile.size {
             0 => 1, // 4-bit (we'll handle as 1 byte per 2 texels)
             1 => 1, // 8-bit
@@ -569,10 +570,11 @@ impl Renderer {
             texels as usize * bytes_per_texel
         };
 
-        // LOADBLOCK can start from a sub-texel origin in the source image.
-        // sl/tl are 10.2 fixed-point texture coordinates.
-        let sl_i = (sl >> 2) as usize;
-        let tl_i = (tl >> 2) as usize;
+        // LOADBLOCK sl/tl are integer texel coordinates (NOT 10.2 fixed-point
+        // like LOADTILE/SETTILESIZE).  The game uses tl to select the starting
+        // row in the source image for strip-based loading.
+        let sl_i = sl as usize;
+        let tl_i = tl as usize;
         let src_pitch_texels = self.texture_image_width as usize;
         let src_bpp = match self.texture_image_size {
             0 => 1, // 4bpp (handled as packed nibbles)
@@ -587,30 +589,26 @@ impl Renderer {
             } else {
                 (tl_i * src_pitch_texels + sl_i) * src_bpp
             };
-        let copy_len = byte_count
-            .min(4096 - tmem_offset)
-            .min(rdram.len().saturating_sub(src));
+        // Real N64 TMEM wraps at 4KB — don't clamp copy_len to the remaining
+        // space; instead wrap the destination address during the copy.
+        let copy_len = byte_count.min(rdram.len().saturating_sub(src));
         self.record_texture_src_span(src, copy_len, rdram.len());
 
         if dxt == 0 {
-            // No interleaving — simple copy
+            // No interleaving — simple copy with TMEM address wrapping
             for i in 0..copy_len {
                 let src_idx = (src + i) & (rdram.len() - 1);
-                if tmem_offset + i < 4096 {
-                    self.tmem[tmem_offset + i] = rdram[src_idx];
-                }
+                self.tmem[(tmem_offset + i) & 0xFFF] = rdram[src_idx];
             }
         } else {
             // Copy with TMEM word interleaving.
             // dxt is 1.11 fixed-point: each 64-bit word advances a counter by dxt.
             // When the counter's bit 11 (integer part) is odd, swap the two 32-bit
             // halves of each 64-bit TMEM word.
-            // First, do a straight copy
+            // First, do a straight copy with TMEM wrapping
             for i in 0..copy_len {
                 let src_idx = (src + i) & (rdram.len() - 1);
-                if tmem_offset + i < 4096 {
-                    self.tmem[tmem_offset + i] = rdram[src_idx];
-                }
+                self.tmem[(tmem_offset + i) & 0xFFF] = rdram[src_idx];
             }
             // Then apply interleaving: swap 32-bit halves on odd rows
             let num_qwords = copy_len / 8;
@@ -619,16 +617,17 @@ impl Renderer {
                 let odd_row = (t >> 11) & 1;
                 if odd_row != 0 {
                     // Swap the two 32-bit halves of this 64-bit word in TMEM
-                    let base = tmem_offset + qw * 8;
-                    if base + 7 < 4096 {
-                        for k in 0..4 {
-                            self.tmem.swap(base + k, base + 4 + k);
-                        }
+                    let base = (tmem_offset + qw * 8) & 0xFFF;
+                    for k in 0..4 {
+                        let a = (base + k) & 0xFFF;
+                        let b = (base + 4 + k) & 0xFFF;
+                        self.tmem.swap(a, b);
                     }
                 }
                 t = t.wrapping_add(dxt);
             }
         }
+
     }
 
     /// G_LOADTILE: Copy a rectangular region of texture data from RDRAM to TMEM.
@@ -688,15 +687,13 @@ impl Renderer {
                     let dst = Self::swizzle_tmem_addr(
                         tmem_offset + dy * line_bytes + (dx >> 1),
                         dy as i32,
-                    );
-                    if dst < 4096 {
-                        let old = self.tmem[dst];
-                        self.tmem[dst] = if (dx & 1) == 0 {
-                            (src_nibble << 4) | (old & 0x0F)
-                        } else {
-                            (old & 0xF0) | src_nibble
-                        };
-                    }
+                    ) & 0xFFF;
+                    let old = self.tmem[dst];
+                    self.tmem[dst] = if (dx & 1) == 0 {
+                        (src_nibble << 4) | (old & 0x0F)
+                    } else {
+                        (old & 0xF0) | src_nibble
+                    };
                 }
             }
             return;
@@ -720,16 +717,21 @@ impl Renderer {
                     let src_offset = (t as usize * src_width + s as usize) * 4;
                     let src_addr = (src_base + src_offset) & (rdram.len() - 1);
 
-                    let mut dst_rg = tmem_offset + dy * line_bytes + dx * 2;
-                    let mut dst_ba = tmem_offset + 0x800 + dy * line_bytes + dx * 2;
-                    dst_rg = Self::swizzle_tmem_addr(dst_rg, dy as i32);
-                    dst_ba = Self::swizzle_tmem_addr(dst_ba, dy as i32);
+                    let dst_rg = Self::swizzle_tmem_addr(
+                        tmem_offset + dy * line_bytes + dx * 2,
+                        dy as i32,
+                    ) & 0x7FF; // wrap within low bank
+                    let dst_ba = 0x800
+                        | (Self::swizzle_tmem_addr(
+                            tmem_offset + 0x800 + dy * line_bytes + dx * 2,
+                            dy as i32,
+                        ) & 0x7FF); // wrap within high bank
 
-                    if dst_rg + 1 < 4096 && dst_ba + 1 < 4096 && src_addr + 3 < rdram.len() {
+                    if src_addr + 3 < rdram.len() {
                         self.tmem[dst_rg] = rdram[src_addr];
-                        self.tmem[dst_rg + 1] = rdram[src_addr + 1];
+                        self.tmem[(dst_rg + 1) & 0x7FF] = rdram[src_addr + 1];
                         self.tmem[dst_ba] = rdram[src_addr + 2];
-                        self.tmem[dst_ba + 1] = rdram[src_addr + 3];
+                        self.tmem[0x800 | ((dst_ba + 1) & 0x7FF)] = rdram[src_addr + 3];
                     }
                 }
             }
@@ -766,8 +768,8 @@ impl Renderer {
                 let src_addr = (src_base + src_offset) & (rdram.len() - 1);
                 let dst_base = tmem_offset + dy * line_bytes + dx * bpp;
                 for b in 0..bpp {
-                    let dst = Self::swizzle_tmem_addr(dst_base + b, dy as i32);
-                    if dst < 4096 && src_addr + b < rdram.len() {
+                    let dst = Self::swizzle_tmem_addr(dst_base + b, dy as i32) & 0xFFF;
+                    if src_addr + b < rdram.len() {
                         self.tmem[dst] = rdram[src_addr + b];
                     }
                 }
@@ -1029,91 +1031,89 @@ impl Renderer {
             }
         };
 
+        // Real N64 TMEM wraps at 4KB — use & 0xFFF on all byte addresses.
+        // For 32-bit banked textures, each 2KB bank wraps independently.
         match tile.size {
             0 => {
                 // 4-bit (CI4 or I4)
-                let mut byte_offset = tmem_base + ti as usize * line_bytes + (si as usize / 2);
-                byte_offset = Self::swizzle_tmem_addr(byte_offset, ti);
-                if byte_offset < 4096 {
-                    let byte = self.tmem[byte_offset];
-                    let nibble = if si & 1 == 0 { byte >> 4 } else { byte & 0x0F };
-                    if tile.format == 2 {
-                        // CI4: palette lookup
-                        self.lookup_tlut(tile.palette as usize * 16 + nibble as usize)
-                    } else if tile.format == 3 {
-                        // IA4: I[3:1] (3-bit intensity), A[0] (1-bit alpha)
-                        let i3 = (nibble >> 1) & 0x7;
-                        let i = (i3 << 5) | (i3 << 2) | (i3 >> 1); // expand 3-bit to 8-bit
-                        let a = if nibble & 1 != 0 { 0xFF } else { 0x00 };
-                        [i, i, i, a]
-                    } else {
-                        // I4: expand 4-bit to 8-bit; alpha = intensity
-                        let i = nibble | (nibble << 4);
-                        [i, i, i, i]
-                    }
+                let byte_offset = Self::swizzle_tmem_addr(
+                    tmem_base + ti as usize * line_bytes + (si as usize / 2),
+                    ti,
+                ) & 0xFFF;
+                let byte = self.tmem[byte_offset];
+                let nibble = if si & 1 == 0 { byte >> 4 } else { byte & 0x0F };
+                if tile.format == 2 {
+                    // CI4: palette lookup
+                    self.lookup_tlut(tile.palette as usize * 16 + nibble as usize)
+                } else if tile.format == 3 {
+                    // IA4: I[3:1] (3-bit intensity), A[0] (1-bit alpha)
+                    let i3 = (nibble >> 1) & 0x7;
+                    let i = (i3 << 5) | (i3 << 2) | (i3 >> 1); // expand 3-bit to 8-bit
+                    let a = if nibble & 1 != 0 { 0xFF } else { 0x00 };
+                    [i, i, i, a]
                 } else {
-                    [0, 0, 0, 0xFF]
+                    // I4: expand 4-bit to 8-bit; alpha = intensity
+                    let i = nibble | (nibble << 4);
+                    [i, i, i, i]
                 }
             }
             1 => {
                 // 8-bit
-                let mut byte_offset = tmem_base + ti as usize * line_bytes + si as usize;
-                byte_offset = Self::swizzle_tmem_addr(byte_offset, ti);
-                if byte_offset < 4096 {
-                    let val = self.tmem[byte_offset];
-                    match tile.format {
-                        2 => self.lookup_tlut(val as usize), // CI8
-                        3 => {
-                            // IA8: I[7:4], A[3:0]
-                            let hi = (val >> 4) & 0xF;
-                            let i = (hi << 4) | hi; // expand 4-bit to 8-bit: 0xF → 0xFF
-                            let lo = val & 0xF;
-                            let a = (lo << 4) | lo;
-                            [i, i, i, a]
-                        }
-                        4 | _ => [val, val, val, val], // I8: alpha = intensity
+                let byte_offset = Self::swizzle_tmem_addr(
+                    tmem_base + ti as usize * line_bytes + si as usize,
+                    ti,
+                ) & 0xFFF;
+                let val = self.tmem[byte_offset];
+                match tile.format {
+                    2 => self.lookup_tlut(val as usize), // CI8
+                    3 => {
+                        // IA8: I[7:4], A[3:0]
+                        let hi = (val >> 4) & 0xF;
+                        let i = (hi << 4) | hi; // expand 4-bit to 8-bit: 0xF → 0xFF
+                        let lo = val & 0xF;
+                        let a = (lo << 4) | lo;
+                        [i, i, i, a]
                     }
-                } else {
-                    [0, 0, 0, 0xFF]
+                    4 | _ => [val, val, val, val], // I8: alpha = intensity
                 }
             }
             2 => {
                 // 16-bit
-                let mut byte_offset = tmem_base + ti as usize * line_bytes + si as usize * 2;
-                byte_offset = Self::swizzle_tmem_addr(byte_offset, ti);
-                if byte_offset + 1 < 4096 {
-                    let hi = self.tmem[byte_offset];
-                    let lo = self.tmem[byte_offset + 1];
-                    let val = ((hi as u16) << 8) | lo as u16;
-                    match tile.format {
-                        0 => unpack_rgba5551(val), // RGBA16
-                        3 => {
-                            // IA16: I[15:8], A[7:0]
-                            let i = hi;
-                            [i, i, i, lo]
-                        }
-                        _ => unpack_rgba5551(val),
+                let byte_offset = Self::swizzle_tmem_addr(
+                    tmem_base + ti as usize * line_bytes + si as usize * 2,
+                    ti,
+                ) & 0xFFF;
+                let hi = self.tmem[byte_offset];
+                let lo = self.tmem[(byte_offset + 1) & 0xFFF];
+                let val = ((hi as u16) << 8) | lo as u16;
+                match tile.format {
+                    0 => unpack_rgba5551(val), // RGBA16
+                    3 => {
+                        // IA16: I[15:8], A[7:0]
+                        let i = hi;
+                        [i, i, i, lo]
                     }
-                } else {
-                    [0, 0, 0, 0xFF]
+                    _ => unpack_rgba5551(val),
                 }
             }
             3 => {
                 // 32-bit RGBA in banked TMEM layout: RG in low bank, BA in high bank.
-                let mut rg_offset = tmem_base + ti as usize * line_bytes + si as usize * 2;
-                let mut ba_offset = tmem_base + 0x800 + ti as usize * line_bytes + si as usize * 2;
-                rg_offset = Self::swizzle_tmem_addr(rg_offset, ti);
-                ba_offset = Self::swizzle_tmem_addr(ba_offset, ti);
-                if rg_offset + 1 < 4096 && ba_offset + 1 < 4096 {
-                    [
-                        self.tmem[rg_offset],
-                        self.tmem[rg_offset + 1],
-                        self.tmem[ba_offset],
-                        self.tmem[ba_offset + 1],
-                    ]
-                } else {
-                    [0, 0, 0, 0xFF]
-                }
+                // Each 2KB bank wraps independently.
+                let rg_offset = Self::swizzle_tmem_addr(
+                    tmem_base + ti as usize * line_bytes + si as usize * 2,
+                    ti,
+                ) & 0x7FF;
+                let ba_offset = 0x800
+                    | (Self::swizzle_tmem_addr(
+                        tmem_base + 0x800 + ti as usize * line_bytes + si as usize * 2,
+                        ti,
+                    ) & 0x7FF);
+                [
+                    self.tmem[rg_offset],
+                    self.tmem[(rg_offset + 1) & 0x7FF],
+                    self.tmem[ba_offset],
+                    self.tmem[0x800 | ((ba_offset + 1) & 0x7FF)],
+                ]
             }
             _ => [0, 0, 0, 0xFF],
         }
@@ -1167,20 +1167,18 @@ impl Renderer {
     /// Look up a color in the TLUT (texture lookup table) stored in upper TMEM.
     fn lookup_tlut(&self, index: usize) -> [u8; 4] {
         let offset = 0x800 + index * 2;
-        if offset + 1 < 4096 {
-            let hi = self.tmem[offset];
-            let lo = self.tmem[offset + 1];
-            let val = ((hi as u16) << 8) | lo as u16;
-            let textlut = (self.othermode_h >> 14) & 0x3;
-            if textlut == 0x3 {
-                // IA16 TLUT entry
-                [hi, hi, hi, lo]
-            } else {
-                // RGBA16 TLUT entry (default)
-                unpack_rgba5551(val)
-            }
+        // TLUT lives in upper TMEM half (0x800-0xFFF); wrap within it.
+        let offset = 0x800 | (offset & 0x7FF);
+        let hi = self.tmem[offset];
+        let lo = self.tmem[0x800 | ((offset + 1) & 0x7FF)];
+        let val = ((hi as u16) << 8) | lo as u16;
+        let textlut = (self.othermode_h >> 14) & 0x3;
+        if textlut == 0x3 {
+            // IA16 TLUT entry
+            [hi, hi, hi, lo]
         } else {
-            [0, 0, 0, 0xFF]
+            // RGBA16 TLUT entry (default)
+            unpack_rgba5551(val)
         }
     }
 
