@@ -30,8 +30,6 @@ pub fn detect_ucode(game_code: &[u8; 4]) -> UcodeType {
         "NSSE", "NSSJ", "NSSP", // Star Fox 64
         "NWRE", "NWRJ", "NWRP", // Wave Race 64
         "NPWE", "NPWJ", "NPWP", // Pilotwings 64
-        "NQKE", "NQKJ", "NQKP", // Quake 64
-        "NQ2E", "NQ2J", "NQ2P", // Quake II
     ];
     for &c in F3D_GAMES {
         if code == c {
@@ -42,6 +40,8 @@ pub fn detect_ucode(game_code: &[u8; 4]) -> UcodeType {
     const F3DEX_GAMES: &[&str] = &[
         "NGVE", "NGVP", "NGVJ", // Glover
         "NDME", "NDMJ", "NDMP", // Doom 64
+        "NQKE", "NQKJ", "NQKP", // Quake 64
+        "NQ2E", "NQ2J", "NQ2P", // Quake II
     ];
     for &c in F3DEX_GAMES {
         if code == c {
