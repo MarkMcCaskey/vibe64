@@ -973,13 +973,6 @@ impl Interconnect {
                 self.renderer.scissor_lry >> 2,
             );
 
-            log::debug!(
-                "GFX #{}: {} tris, ci={:#X}",
-                self.rsp.start_count,
-                tris_this_dl,
-                self.renderer.color_image_addr,
-            );
-
             // Save the best frame snapshot (most non-black pixels) for diagnostics.
             {
                 let ci = self.renderer.color_image_addr as usize;

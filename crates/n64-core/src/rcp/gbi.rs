@@ -30,16 +30,16 @@ pub fn detect_ucode(game_code: &[u8; 4]) -> UcodeType {
         "NSSE", "NSSJ", "NSSP", // Star Fox 64
         "NWRE", "NWRJ", "NWRP", // Wave Race 64
         "NPWE", "NPWJ", "NPWP", // Pilotwings 64
-        "NDME", "NDMJ", "NDMP", // Doom 64
     ];
     for &c in F3D_GAMES {
         if code == c {
             return UcodeType::F3d;
         }
     }
-    // F3DEX games (same opcodes as F3D, different VTX/TRI encoding)
+    // F3DEX games (same opcodes as F3D, different VTX/TRI encoding + TRI2)
     const F3DEX_GAMES: &[&str] = &[
         "NGVE", "NGVP", "NGVJ", // Glover
+        "NDME", "NDMJ", "NDMP", // Doom 64
     ];
     for &c in F3DEX_GAMES {
         if code == c {
@@ -182,8 +182,10 @@ fn parse_texrect_extras(
     }
 
     if consumed_half_cmd {
+        renderer.texrect_extra_mode_half += 1;
         (extra0, extra1)
     } else {
+        renderer.texrect_extra_mode_inline += 1;
         let extra0 = read_u32(rdram, *pc);
         let extra1 = read_u32(rdram, pc.wrapping_add(4));
         *pc = pc.wrapping_add(8);
@@ -397,6 +399,7 @@ pub fn process_display_list_f3d(renderer: &mut Renderer, rdram: &mut [u8], addr:
     const F3D_MOVEWORD: u8 = 0xBC;
     const F3D_POPMTX: u8 = 0xBD;
     const F3D_TRI1: u8 = 0xBF;
+    const F3D_TRI2: u8 = 0xB1;
 
     // F3D geometry mode bits differ from F3DEX2 — see translate_f3d_geom().
 
@@ -480,6 +483,26 @@ pub fn process_display_list_f3d(renderer: &mut Renderer, rdram: &mut [u8], addr:
                 let v2 = (w1 & 0xFF) as usize / divisor;
                 if v0 < 32 && v1 < 32 && v2 < 32 {
                     renderer.rasterize_triangle(v0, v1, v2, rdram);
+                    renderer.tri_count += 1;
+                }
+            }
+
+            // ─── F3DEX two-triangle command ───
+            // w0: [B1][v0a*D][v1a*D][v2a*D]  w1: [00][v0b*D][v1b*D][v2b*D]
+            F3D_TRI2 => {
+                let divisor = if is_f3dex { 2 } else { 10 };
+                let v0a = ((w0 >> 16) & 0xFF) as usize / divisor;
+                let v1a = ((w0 >> 8) & 0xFF) as usize / divisor;
+                let v2a = (w0 & 0xFF) as usize / divisor;
+                if v0a < 32 && v1a < 32 && v2a < 32 {
+                    renderer.rasterize_triangle(v0a, v1a, v2a, rdram);
+                    renderer.tri_count += 1;
+                }
+                let v0b = ((w1 >> 16) & 0xFF) as usize / divisor;
+                let v1b = ((w1 >> 8) & 0xFF) as usize / divisor;
+                let v2b = (w1 & 0xFF) as usize / divisor;
+                if v0b < 32 && v1b < 32 && v2b < 32 {
+                    renderer.rasterize_triangle(v0b, v1b, v2b, rdram);
                     renderer.tri_count += 1;
                 }
             }
@@ -608,11 +631,11 @@ pub fn process_display_list_f3d(renderer: &mut Renderer, rdram: &mut [u8], addr:
     }
 
     log::debug!(
-        "F3D DL done: {} cmds, {} tris, {} DL branches at addr={:#010X}",
+        "F3D DL done: {} cmds, {} tris, cull={} addr={:#010X}",
         cmd_count,
         renderer.tri_count,
-        stack.len(),
-        addr
+        renderer.cull_count,
+        addr,
     );
 
     cmd_count
