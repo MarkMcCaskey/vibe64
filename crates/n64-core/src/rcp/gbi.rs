@@ -30,6 +30,7 @@ pub fn detect_ucode(game_code: &[u8; 4]) -> UcodeType {
         "NSSE", "NSSJ", "NSSP", // Star Fox 64
         "NWRE", "NWRJ", "NWRP", // Wave Race 64
         "NPWE", "NPWJ", "NPWP", // Pilotwings 64
+        "NDME", "NDMJ", "NDMP", // Doom 64
     ];
     for &c in F3D_GAMES {
         if code == c {
@@ -558,8 +559,11 @@ pub fn process_display_list_f3d(renderer: &mut Renderer, rdram: &mut [u8], addr:
                 }
             }
 
-            F3D_RDPHALF_1 => {
-                renderer.rdp_half[0] = w1;
+            F3D_RDPHALF_1 | F3D_RDPHALF_2 | F3D_RDPHALF_CONT => {
+                // Store half-words for texture rect commands.
+                // Usually consumed inline by TEXRECT; standalone ones just latch.
+                let slot = if cmd == F3D_RDPHALF_1 { 0 } else { 1 };
+                renderer.rdp_half[slot] = w1;
             }
 
             // ─── RDP commands (same as F3DEX2) ───
@@ -581,9 +585,9 @@ pub fn process_display_list_f3d(renderer: &mut Renderer, rdram: &mut [u8], addr:
             G_FILLRECT => renderer.cmd_fill_rect(w0, w1, rdram),
 
             G_TEXRECT | G_TEXRECTFLIP => {
-                // F3D TEXRECT extras follow as RDPHALF_2 (0xB3) + 0xB2 commands
+                // F3D TEXRECT extras follow as RDPHALF_1 (0xB4) + RDPHALF_2 (0xB3)
                 let (extra0, extra1) =
-                    parse_texrect_extras(renderer, rdram, &mut pc, F3D_RDPHALF_2, F3D_RDPHALF_CONT);
+                    parse_texrect_extras(renderer, rdram, &mut pc, F3D_RDPHALF_1, F3D_RDPHALF_2);
                 renderer.cmd_texture_rect(w0, w1, extra0, extra1, rdram, cmd == G_TEXRECTFLIP);
             }
 

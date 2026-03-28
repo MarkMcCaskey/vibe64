@@ -864,8 +864,9 @@ fn main() {
             n64.cpu.pc as u32
         );
         eprintln!(
-            "  VI: ctrl={:#010X} origin={:#010X} width={} h_video={:#010X}",
-            n64.bus.vi.ctrl, n64.bus.vi.origin, n64.bus.vi.width, n64.bus.vi.h_video
+            "  VI: ctrl={:#010X} origin={:#010X} width={} v_video={:#010X} x_scale={:#010X} y_scale={:#010X}",
+            n64.bus.vi.ctrl, n64.bus.vi.origin, n64.bus.vi.width, n64.bus.vi.v_video,
+            n64.bus.vi.x_scale, n64.bus.vi.y_scale
         );
 
         let status = n64.cpu.cop0.regs[n64_core::cpu::cop0::Cop0::STATUS] as u32;
