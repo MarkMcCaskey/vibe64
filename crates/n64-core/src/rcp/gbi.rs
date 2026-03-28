@@ -15,6 +15,9 @@
 pub enum UcodeType {
     F3dex2,
     F3d,
+    /// F3DEX: same opcode table as F3D, but different VTX/TRI encoding.
+    /// VTX: n in bits 15:10, v0 in bits 23:17. TRI indices divided by 2.
+    F3dex,
 }
 
 /// Detect microcode variant from ROM game code.
@@ -31,6 +34,15 @@ pub fn detect_ucode(game_code: &[u8; 4]) -> UcodeType {
     for &c in F3D_GAMES {
         if code == c {
             return UcodeType::F3d;
+        }
+    }
+    // F3DEX games (same opcodes as F3D, different VTX/TRI encoding)
+    const F3DEX_GAMES: &[&str] = &[
+        "NGVE", "NGVP", "NGVJ", // Glover
+    ];
+    for &c in F3DEX_GAMES {
+        if code == c {
+            return UcodeType::F3dex;
         }
     }
     UcodeType::F3dex2
@@ -185,7 +197,6 @@ pub fn process_display_list(renderer: &mut Renderer, rdram: &mut [u8], addr: u32
     let mut stack: Vec<u32> = Vec::with_capacity(MAX_DL_STACK);
     let mut cmd_count = 0usize;
     let mut opcode_counts = [0u32; 256];
-    let trace_dl = std::env::var_os("N64_TRACE_DL").is_some();
 
     loop {
         if cmd_count >= MAX_COMMANDS {
@@ -198,12 +209,6 @@ pub fn process_display_list(renderer: &mut Renderer, rdram: &mut [u8], addr: u32
         let w0 = read_u32(rdram, pc);
         let w1 = read_u32(rdram, pc.wrapping_add(4));
         pc = pc.wrapping_add(8);
-
-        if trace_dl && cmd_count <= 500 {
-            let cmd = (w0 >> 24) as u8;
-            eprintln!("  DL[{:4}] pc={:#010X} depth={} cmd={:#04X} w0={:#010X} w1={:#010X} ({})",
-                cmd_count - 1, pc.wrapping_sub(8), stack.len(), cmd, w0, w1, opcode_name_f3dex2(cmd));
-        }
 
         let cmd = (w0 >> 24) as u8;
         opcode_counts[cmd as usize] += 1;
@@ -371,8 +376,9 @@ fn translate_f3d_geom(bits: u32) -> u32 {
 
 /// Walk a display list using F3D (original) opcode table.
 /// Used by earlier games: Super Mario 64, Mario Kart 64, etc.
-pub fn process_display_list_f3d(renderer: &mut Renderer, rdram: &mut [u8], addr: u32) {
-    log::debug!("ENTERING process_display_list_f3d addr={:#010X}", addr);
+pub fn process_display_list_f3d(renderer: &mut Renderer, rdram: &mut [u8], addr: u32, ucode: UcodeType) -> usize {
+    log::debug!("ENTERING process_display_list_f3d addr={:#010X} ucode={:?}", addr, ucode);
+    let is_f3dex = ucode == UcodeType::F3dex;
     // F3D opcode constants (differ from F3DEX2)
     const F3D_MTX: u8 = 0x01;
     const F3D_MOVEMEM: u8 = 0x03;
@@ -444,26 +450,33 @@ pub fn process_display_list_f3d(renderer: &mut Renderer, rdram: &mut [u8], addr:
                 pc = addr;
             }
 
-            // ─── F3D vertex load ───
-            // w0: [04][par:8][length:16] where par = ((n-1)<<4)|v0
-            // w1: DRAM address
+            // ─── F3D/F3DEX vertex load ───
             F3D_VTX => {
-                let par = (w0 >> 16) & 0xFF;
-                let n = ((par >> 4) & 0xF) as usize + 1;
-                let v0 = (par & 0xF) as usize;
+                let (n, v0) = if is_f3dex {
+                    // F3DEX: n in bits 15:10, v0 in bits 23:17
+                    let n = ((w0 >> 10) & 0x3F) as usize;
+                    let v0 = ((w0 >> 17) & 0x7F) as usize;
+                    (n, v0)
+                } else {
+                    // F3D: par = ((n-1)<<4)|v0 in bits 23:16
+                    let par = (w0 >> 16) & 0xFF;
+                    let n = ((par >> 4) & 0xF) as usize + 1;
+                    let v0 = (par & 0xF) as usize;
+                    (n, v0)
+                };
 
                 // Build a w0 compatible with F3DEX2's cmd_vertex()
-                // F3DEX2 format: [01][00][num:8][v0+num:7 << 1]
                 let compat_w0 = ((n as u32) << 12) | (((v0 + n) as u32 & 0x7F) << 1);
                 renderer.cmd_vertex(compat_w0, w1, rdram);
             }
 
-            // ─── F3D triangle ───
-            // w0: [BF][00][00][00]  w1: [00][v0*10:8][v1*10:8][v2*10:8]
+            // ─── F3D/F3DEX triangle ───
             F3D_TRI1 => {
-                let v0 = ((w1 >> 16) & 0xFF) as usize / 10;
-                let v1 = ((w1 >> 8) & 0xFF) as usize / 10;
-                let v2 = (w1 & 0xFF) as usize / 10;
+                // F3D: vertex indices * 10, F3DEX: vertex indices * 2
+                let divisor = if is_f3dex { 2 } else { 10 };
+                let v0 = ((w1 >> 16) & 0xFF) as usize / divisor;
+                let v1 = ((w1 >> 8) & 0xFF) as usize / divisor;
+                let v2 = (w1 & 0xFF) as usize / divisor;
                 if v0 < 32 && v1 < 32 && v2 < 32 {
                     renderer.rasterize_triangle(v0, v1, v2, rdram);
                     renderer.tri_count += 1;
@@ -597,6 +610,8 @@ pub fn process_display_list_f3d(renderer: &mut Renderer, rdram: &mut [u8], addr:
         stack.len(),
         addr
     );
+
+    cmd_count
 }
 
 /// Look up a human-readable name for an F3DEX2 GBI opcode.

@@ -942,9 +942,8 @@ impl Interconnect {
                 gbi::UcodeType::F3dex2 => {
                     gbi::process_display_list(&mut self.renderer, rdram, phys_addr)
                 }
-                gbi::UcodeType::F3d => {
-                    gbi::process_display_list_f3d(&mut self.renderer, rdram, phys_addr);
-                    0 // F3D doesn't return count yet
+                gbi::UcodeType::F3d | gbi::UcodeType::F3dex => {
+                    gbi::process_display_list_f3d(&mut self.renderer, rdram, phys_addr, self.ucode)
                 }
             };
             let tris_this_dl = self.renderer.tri_count - tris_before;
@@ -1028,6 +1027,15 @@ impl Interconnect {
             // DP interrupt deferred — fires after a cycle delay to avoid ring
             // buffer contention with SP YIELD event in the scheduler.
             self.dp_interrupt_countdown = 50_000;
+        }
+
+        if task_type != gbi::M_GFXTASK && task_type != gbi::M_AUDTASK {
+            log::warn!(
+                "RSP task #{}: unknown task_type={} (ucode={:#010X})",
+                self.rsp.start_count,
+                task_type,
+                self.rsp.read_dmem_u32(gbi::TASK_UCODE)
+            );
         }
     }
 

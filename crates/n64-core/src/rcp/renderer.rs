@@ -495,7 +495,7 @@ impl Renderer {
                 let shift = 32u32.saturating_sub(sft_field).saturating_sub(len);
                 (shift, len)
             }
-            crate::rcp::gbi::UcodeType::F3d => {
+            crate::rcp::gbi::UcodeType::F3d | crate::rcp::gbi::UcodeType::F3dex => {
                 let len = if len_field == 0 { 32 } else { len_field };
                 (sft_field, len)
             }
@@ -1522,9 +1522,11 @@ impl Renderer {
                 // Using unscaled depth collapses precision and causes z-fighting.
                 let z = (32.0 * (cz * inv_w * self.viewport_scale[2] + self.viewport_trans[2]))
                     .clamp(0.0, 0xFFFF as f32);
+                let sx = cx * inv_w * self.viewport_scale[0] + self.viewport_trans[0];
+                let sy = -cy * inv_w * self.viewport_scale[1] + self.viewport_trans[1];
                 self.vertex_buffer[idx] = Vertex {
-                    x: cx * inv_w * self.viewport_scale[0] + self.viewport_trans[0],
-                    y: -cy * inv_w * self.viewport_scale[1] + self.viewport_trans[1],
+                    x: sx,
+                    y: sy,
                     z,
                     w: inv_w,
                     clip_x: cx,
