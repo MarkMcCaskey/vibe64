@@ -204,6 +204,12 @@ impl N64 {
     pub fn vi_width(&self) -> u32 {
         self.bus.vi.width
     }
+    pub fn vi_x_scale(&self) -> u32 {
+        self.bus.vi.x_scale
+    }
+    pub fn vi_y_scale(&self) -> u32 {
+        self.bus.vi.y_scale
+    }
     pub fn rdram_data(&self) -> &[u8] {
         self.bus.rdram.data()
     }

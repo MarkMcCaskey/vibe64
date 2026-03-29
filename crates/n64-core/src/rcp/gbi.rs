@@ -153,9 +153,10 @@ fn parse_texrect_extras(
     half2_cmd: u8,
 ) -> (u32, u32) {
     // Some microcode streams encode texrect extras as the next two raw words,
-    // while others emit RDPHALF_1 / RDPHALF_2 commands (order can vary).
+    // while others emit RDPHALF commands (order varies by microcode).
     // F3DEX2: RDPHALF_1 (0xE1) + RDPHALF_2 (0xF1) before TEXRECT
-    // F3D: RDPHALF_2 (0xB3) + 0xB2 after TEXRECT
+    // F3D:    RDPHALF_2 (0xB3) + RDPHALF_CONT (0xB2) after TEXRECT
+    // F3DEX:  RDPHALF_1 (0xB4) + RDPHALF_2 (0xB3) after TEXRECT
     // Keep previous latch values as fallback when only one half is updated.
     let mut extra0 = renderer.rdp_half[0];
     let mut extra1 = renderer.rdp_half[1];
@@ -610,9 +611,15 @@ pub fn process_display_list_f3d(renderer: &mut Renderer, rdram: &mut [u8], addr:
             G_FILLRECT => renderer.cmd_fill_rect(w0, w1, rdram),
 
             G_TEXRECT | G_TEXRECTFLIP => {
-                // F3D TEXRECT extras follow as RDPHALF_1 (0xB4) + RDPHALF_2 (0xB3)
+                // F3D uses RDPHALF_2 (0xB3) + RDPHALF_CONT (0xB2) after TEXRECT
+                // F3DEX uses RDPHALF_1 (0xB4) + RDPHALF_2 (0xB3) after TEXRECT
+                let (h1, h2) = if is_f3dex {
+                    (F3D_RDPHALF_1, F3D_RDPHALF_2)
+                } else {
+                    (F3D_RDPHALF_2, F3D_RDPHALF_CONT)
+                };
                 let (extra0, extra1) =
-                    parse_texrect_extras(renderer, rdram, &mut pc, F3D_RDPHALF_1, F3D_RDPHALF_2);
+                    parse_texrect_extras(renderer, rdram, &mut pc, h1, h2);
                 renderer.cmd_texture_rect(w0, w1, extra0, extra1, rdram, cmd == G_TEXRECTFLIP);
             }
 
