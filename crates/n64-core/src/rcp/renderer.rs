@@ -1850,15 +1850,16 @@ impl Renderer {
         color: [u8; 4],
         shade_alpha: u8,
     ) -> bool {
-        // Copy mode bypasses alpha compare/coverage — pixels always written
+        // Copy mode bypasses alpha compare/coverage but still checks the
+        // alpha bit — texels with alpha=0 are not written (transparent).
         let is_copy = self.cycle_type() == 2;
 
-        if !is_copy {
-            // Fully transparent texels should not emit color/depth.
-            if color[3] == 0 {
-                return false;
-            }
+        // Fully transparent pixels are skipped in all modes.
+        if color[3] == 0 {
+            return false;
+        }
 
+        if !is_copy {
             // CVG_X_ALPHA (bit 12): coverage × alpha — if alpha is 0, pixel is fully transparent
             // This is how the N64 handles texture cutout (e.g., tree leaves, fences)
             let cvg_x_alpha = self.othermode_l & (1 << 12) != 0;
